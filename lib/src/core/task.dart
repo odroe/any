@@ -9,6 +9,7 @@ import 'scope.dart';
 ///
 /// Creating or composing a task does not execute it. Each [run] invokes the
 /// computation again with its own [Scope] and waits for resource cleanup.
+/// [runIn] uses an existing [Context] and leaves cleanup to the scope's owner.
 /// [TaskComposition.map] and [TaskComposition.flatMap] compose steps within
 /// that same scope.
 ///
@@ -40,10 +41,10 @@ import 'scope.dart';
 final class Task<T, E, R> {
   /// Creates a task that invokes [computation] when run.
   ///
-  /// The callback receives a [Context] containing the supplied dependencies and
-  /// the run's scope. It may return an [Exit] directly or a future of one.
-  /// Register resource cleanup with [Scope.addFinalizer]; [run] owns and closes
-  /// the scope. Await any work that uses those resources before returning.
+  /// The callback receives the [Context] created by [run] or supplied to [runIn].
+  /// It may return an [Exit] directly or a future of one. Register resource
+  /// cleanup with [Scope.addFinalizer]; the scope's owner closes it. Await any
+  /// work that uses those resources before returning.
   const Task(FutureOr<Exit<T, E>> Function(Context<R> context) computation)
     : _computation = computation;
 
@@ -75,10 +76,7 @@ final class Task<T, E, R> {
       dependencies: dependencies,
       cancellation: cancellation,
     );
-    final exit = _checkCancellation(
-      await _evaluate(context),
-      context.cancellation,
-    );
+    final exit = _checkCancellation(await runIn(context), context.cancellation);
 
     try {
       await scope.close(exit: exit);
@@ -88,20 +86,54 @@ final class Task<T, E, R> {
     return exit;
   }
 
-  // Schedule each step and use Future.then in compositions to avoid growing
-  // the call stack for long chains.
-  Future<Exit<T, E>> _evaluate(Context<R> context) =>
-      Future<Exit<T, E>>.microtask(() {
-        final cancellation = context.cancellation;
-        if (cancellation.isCancelled) {
-          return Exit.cancelled(reason: cancellation.reason);
-        }
-        return _computation(context);
-      }).then(
-        (exit) => _checkCancellation(exit, context.cancellation),
-        onError: (Object error, StackTrace stackTrace) =>
-            Exit<T, E>.defect(error, stackTrace),
-      );
+  /// Executes this task in [context], leaving cleanup to the scope's owner.
+  ///
+  /// Every call starts the computation in a microtask using the same context,
+  /// including its dependencies, scope, and cancellation token. Cancellation
+  /// follows the same rules as [run]. Thrown objects become [ExitDefect] values
+  /// with their original stack traces.
+  ///
+  /// Registered finalizers are left for the scope's owner to run. The owner
+  /// must await all runs using the scope before calling [Scope.close], regardless
+  /// of their outcomes. Finalizers receive the exit supplied by that owner.
+  ///
+  /// If [Scope.close] has been called before the computation starts, returns an
+  /// [ExitDefect] containing a [StateError] without invoking the computation,
+  /// even if cancellation has also been requested.
+  ///
+  /// Use this to call another task from a computation while sharing its resource
+  /// lifetime. [Context.withDependencies] can supply different dependencies:
+  ///
+  /// ```dart
+  /// final readLabel = Task<String, Never, ({String label})>(
+  ///   (context) => Exit.success(context.dependencies.label),
+  /// );
+  /// final workflow = Task<String, Never, ()>(
+  ///   (context) => readLabel.runIn(
+  ///     context.withDependencies((label: 'local',)),
+  ///   ),
+  /// );
+  ///
+  /// final exit = await workflow.run(());
+  /// ```
+  Future<Exit<T, E>> runIn(Context<R> context) {
+    // Schedule each step and use Future.then in compositions to avoid growing
+    // the call stack for long chains.
+    return Future<Exit<T, E>>.microtask(() {
+      if (context.scope.isClosed) {
+        throw StateError('Cannot run a task in a closed scope.');
+      }
+      final cancellation = context.cancellation;
+      if (cancellation.isCancelled) {
+        return Exit.cancelled(reason: cancellation.reason);
+      }
+      return _computation(context);
+    }).then(
+      (exit) => _checkCancellation(exit, context.cancellation),
+      onError: (Object error, StackTrace stackTrace) =>
+          Exit<T, E>.defect(error, stackTrace),
+    );
+  }
 }
 
 /// Composes tasks while preserving their dependency and expected error types.
@@ -117,7 +149,7 @@ extension TaskComposition<T, E, R> on Task<T, E, R> {
   /// The transformed value is used as-is, including when it is a [Future]. Use
   /// [flatMap] to sequence another task.
   Task<U, E, R> map<U>(U Function(T value) transform) => Task(
-    (context) => _evaluate(context).then(
+    (context) => runIn(context).then(
       (exit) => switch (_checkCancellation(exit, context.cancellation)) {
         ExitSuccess(:final value) => Exit.success(transform(value)),
         ExitFailure(:final error) => Exit.failure(error),
@@ -139,9 +171,9 @@ extension TaskComposition<T, E, R> on Task<T, E, R> {
   /// Other outcomes skip [next] and retain their error, stack trace, or
   /// cancellation reason. A thrown object becomes an [ExitDefect].
   Task<U, E, R> flatMap<U>(Task<U, E, R> Function(T value) next) => Task(
-    (context) => _evaluate(context).then(
+    (context) => runIn(context).then(
       (exit) => switch (_checkCancellation(exit, context.cancellation)) {
-        ExitSuccess(:final value) => next(value)._evaluate(context),
+        ExitSuccess(:final value) => next(value).runIn(context),
         ExitFailure(:final error) => Exit.failure(error),
         ExitDefect(:final error, :final stackTrace) => Exit.defect(
           error,
