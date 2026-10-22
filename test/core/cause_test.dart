@@ -89,6 +89,189 @@ void main() {
       expect(_describe(widenedCancellation), 'Cancelled: null');
     });
 
+    group('mapError', () {
+      test('maps an expected Error object without reclassifying it', () {
+        final error = StateError('expected');
+        final original = Cause<StateError>.failure(error);
+        var calls = 0;
+
+        final mapped = original.mapError((value) {
+          expect(value, same(error));
+          calls++;
+          return (operation: 'load', error: value);
+        });
+
+        final failure =
+            mapped as CauseFailure<({String operation, StateError error})>;
+        expect(failure.error.operation, 'load');
+        expect(failure.error.error, same(error));
+        expect(calls, 1);
+        expect((original as CauseFailure<StateError>).error, same(error));
+      });
+
+      test('supports nullable input and output errors', () {
+        const original = Cause<String?>.failure(null);
+        var calls = 0;
+
+        final mapped = original.mapError<int?>((error) {
+          expect(error, isNull);
+          calls++;
+          return null;
+        });
+
+        expect((mapped as CauseFailure<int?>).error, isNull);
+        expect(calls, 1);
+      });
+
+      test('retains a defect and its trace across unrelated error types', () {
+        final error = StateError('unexpected');
+        final trace = StackTrace.fromString('original trace');
+        final original = Cause<String>.defect(error, trace);
+        final mapped = original.mapError<int>(
+          (_) => fail('Unexpected mapping'),
+        );
+
+        final defect = mapped as CauseDefect<int>;
+        expect(defect.error, same(error));
+        expect(defect.stackTrace, same(trace));
+      });
+
+      for (final reason in [null, Object()]) {
+        test('retains a cancellation reason (null: ${reason == null})', () {
+          final original = Cause<int>.cancelled(reason: reason);
+          final mapped = original.mapError<String>(
+            (_) => fail('Unexpected mapping'),
+          );
+
+          expect((mapped as CauseCancelled<String>).reason, same(reason));
+        });
+      }
+
+      test(
+        'maps every failure in order while preserving flat group contents',
+        () {
+          const failure = Cause<int>.failure(2);
+          final error = StateError('unexpected');
+          final trace = StackTrace.fromString('original trace');
+          final reason = Object();
+          final original = Cause<int>.combine([
+            failure,
+            Cause.defect(error, trace),
+            Cause.combine([failure, Cause.cancelled(reason: reason)]),
+            const Cause.failure(1),
+          ]) as CauseGroup<int>;
+          final seen = <int>[];
+
+          final mapped = original.mapError((value) {
+            seen.add(value);
+            return (value: value, index: seen.length);
+          }) as CauseGroup<({int value, int index})>;
+
+          final causes = mapped.causes;
+          expect(seen, [2, 2, 1]);
+          expect(causes, hasLength(5));
+          expect((causes[0] as CauseFailure<({int value, int index})>).error, (
+            value: 2,
+            index: 1,
+          ));
+          final defect = causes[1] as CauseDefect<({int value, int index})>;
+          expect(defect.error, same(error));
+          expect(defect.stackTrace, same(trace));
+          expect((causes[2] as CauseFailure<({int value, int index})>).error, (
+            value: 2,
+            index: 2,
+          ));
+          expect(
+            (causes[3] as CauseCancelled<({int value, int index})>).reason,
+            same(reason),
+          );
+          expect((causes[4] as CauseFailure<({int value, int index})>).error, (
+            value: 1,
+            index: 3,
+          ));
+          expect(
+            causes.whereType<CauseGroup<({int value, int index})>>(),
+            isEmpty,
+          );
+          expect(() => causes.clear(), throwsUnsupportedError);
+          expect(original.causes[0], same(failure));
+          expect(original.causes[2], same(failure));
+        },
+      );
+
+      test('maps a group with error type Never without calling the mapper', () {
+        final error = Object();
+        final trace = StackTrace.fromString('original trace');
+        final reason = Object();
+        final original = Cause<Never>.combine([
+          Cause.defect(error, trace),
+          Cause.cancelled(reason: reason),
+        ]);
+
+        final mapped = original.mapError<String>(
+          (_) => fail('Unexpected mapping'),
+        ) as CauseGroup<String>;
+
+        expect(mapped.causes, hasLength(2));
+        final defect = mapped.causes[0] as CauseDefect<String>;
+        expect(defect.error, same(error));
+        expect(defect.stackTrace, same(trace));
+        expect(
+          (mapped.causes[1] as CauseCancelled<String>).reason,
+          same(reason),
+        );
+      });
+
+      test('supports widened causes and a different output error type', () {
+        final Cause<num> widened = Cause<int>.combine([
+          const Cause.failure(1),
+          const Cause.failure(3),
+        ]);
+
+        final mapped =
+            widened.mapError((num value) => value / 2) as CauseGroup<double>;
+
+        expect(
+          mapped.causes.map((cause) => (cause as CauseFailure<double>).error),
+          [0.5, 1.5],
+        );
+      });
+
+      test('retains a future returned by the mapper as the error value', () {
+        final value = Future<int>.value(42);
+        final mapped = const Cause<String>.failure('missing')
+            .mapError((_) => value);
+
+        expect((mapped as CauseFailure<Future<int>>).error, same(value));
+      });
+
+      for (final grouped in [false, true]) {
+        test('propagates mapper throws immediately (grouped: $grouped)', () {
+          const failure = Cause<int>.failure(1);
+          final original = grouped
+              ? Cause<int>.combine([failure, const Cause.failure(2)])
+              : failure;
+          final error = Object();
+          final trace = StackTrace.fromString('mapper trace');
+          final seen = <int>[];
+
+          try {
+            original.mapError<String>((value) {
+              seen.add(value);
+              Error.throwWithStackTrace(error, trace);
+            });
+            fail('Expected the mapper to throw.');
+          } catch (caught, stackTrace) {
+            expect(caught, same(error));
+            expect(stackTrace, same(trace));
+          }
+
+          expect(seen, [1]);
+          expect((failure as CauseFailure<int>).error, 1);
+        });
+      }
+    });
+
     group('combine', () {
       test('rejects an empty input', () {
         expect(() => Cause<Never>.combine([]), throwsArgumentError);

@@ -67,6 +67,37 @@ sealed class Cause<E> {
     return combined == null ? first : CauseGroup._(combined);
   }
 
+  /// Transforms expected errors with [transform], preserving other causes.
+  ///
+  /// Calls [transform] once for each [CauseFailure], in group order, including
+  /// duplicate entries. Defect errors, stack traces, and cancellation reasons
+  /// are retained by reference. Cause wrappers may be rebuilt for the new error
+  /// type. Groups remain flat and unmodifiable, with the same order and size.
+  ///
+  /// A thrown object from [transform] propagates immediately with its stack
+  /// trace, without mapping later entries or converting the throw to a defect.
+  /// The original cause is unchanged. Returned values are used as-is, including
+  /// when [F] is a future type.
+  ///
+  /// ```dart
+  /// final cause = Cause<String>.combine([
+  ///   const Cause.failure('missing'),
+  ///   const Cause.cancelled(reason: 'shutdown'),
+  /// ]);
+  /// final mapped = cause.mapError((code) => (operation: 'load', code: code));
+  /// ```
+  Cause<F> mapError<F>(F Function(E error) transform) => switch (this) {
+    CauseFailure(:final error) => Cause.failure(transform(error)),
+    CauseDefect(:final error, :final stackTrace) => Cause.defect(
+      error,
+      stackTrace,
+    ),
+    CauseCancelled(:final reason) => Cause.cancelled(reason: reason),
+    CauseGroup(:final causes) => CauseGroup<F>._(
+      causes.map((cause) => cause.mapError(transform)),
+    ),
+  };
+
   @override
   String toString() => switch (this) {
     CauseFailure(:final error) => 'Cause.failure($error)',
@@ -108,7 +139,7 @@ final class CauseCancelled<E> extends Cause<E> {
 
 /// Multiple individual causes, created by [Cause.combine].
 final class CauseGroup<E> extends Cause<E> {
-  CauseGroup._(List<Cause<E>> causes)
+  CauseGroup._(Iterable<Cause<E>> causes)
     : causes = List.unmodifiable(causes),
       super._();
 
