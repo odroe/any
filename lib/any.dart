@@ -1,1 +1,1 @@
-library;
+export 'src/core/version.dart';
