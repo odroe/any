@@ -125,6 +125,10 @@ final class Task<T, E, R> {
   ///
   /// final exit = await workflow.run(());
   /// ```
+  ///
+  /// When wrapping a task with a different expected error type, use
+  /// [Cause.mapError] on a failed exit's cause to translate its business errors.
+  /// Defects and cancellation reasons are preserved.
   Future<Exit<T, E>> runIn(Context<R> context) {
     // Schedule each step and use Future.then in compositions to avoid growing
     // the call stack for long chains.
