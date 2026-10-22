@@ -1,7 +1,6 @@
 import 'dart:async';
 
 import 'package:any/any.dart';
-import 'package:any/src/core/context.dart';
 import 'package:test/test.dart';
 
 void main() {
