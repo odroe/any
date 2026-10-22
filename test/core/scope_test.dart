@@ -281,6 +281,88 @@ void main() {
         expect(child.isClosed, isTrue);
       },
     );
+
+    for (final failureCount in [1, 2]) {
+      test(
+        'extracts $failureCount cleanup causes from a synchronous throw',
+        () async {
+          final child = Scope();
+          const childExit = Exit<void, String>.failure(Cause.failure('child'));
+          for (var index = 0; index < failureCount; index++) {
+            child.addFinalizer((_) => throw StateError('cleanup $index'));
+          }
+          final childError = await _closeError(child.close(exit: childExit));
+          final parent = Scope();
+          const parentExit = Exit<void, String>.failure(
+            Cause.failure('parent'),
+          );
+          parent.addFinalizer((_) => throw childError);
+
+          final error = await _closeError(parent.close(exit: parentExit));
+
+          expect(error.exit, same(parentExit));
+          expect(error.cause, same(childError.cause));
+          expect(childError.exit, same(childExit));
+          expect(await _closeError(parent.close()), same(error));
+        },
+      );
+    }
+
+    test('flattens multiple scope levels in cleanup execution order', () async {
+      final parent = Scope();
+      final child = Scope();
+      final grandchild = Scope();
+      final errors = List.generate(4, (index) => StateError('cleanup $index'));
+      final traces = List.generate(
+        4,
+        (index) => StackTrace.fromString('trace $index'),
+      );
+      final events = <int>[];
+      final cleanupStarted = Completer<void>();
+      final cleanupFinished = Completer<void>();
+      var finished = false;
+      const exit = Exit<void, String>.failure(Cause.failure('original'));
+      parent.addFinalizer((_) {
+        events.add(3);
+        Error.throwWithStackTrace(errors[3], traces[3]);
+      });
+      parent.addFinalizer((exit) => child.close(exit: exit));
+      parent.addFinalizer((_) {
+        events.add(0);
+        Error.throwWithStackTrace(errors[0], traces[0]);
+      });
+      child.addFinalizer((_) {
+        events.add(2);
+        Error.throwWithStackTrace(errors[2], traces[2]);
+      });
+      child.addFinalizer((exit) => grandchild.close(exit: exit));
+      grandchild.addFinalizer((_) async {
+        cleanupStarted.complete();
+        await cleanupFinished.future;
+        events.add(1);
+        Error.throwWithStackTrace(errors[1], traces[1]);
+      });
+
+      final closing = _closeError(parent.close(exit: exit)).then((error) {
+        finished = true;
+        return error;
+      });
+      await cleanupStarted.future;
+      expect(finished, isFalse);
+      expect(events, [0]);
+      cleanupFinished.complete();
+      final error = await closing;
+
+      expect(error.exit, same(exit));
+      expect(events, [0, 1, 2, 3]);
+      final causes = (error.cause as CauseGroup<Never>).causes;
+      expect(causes, hasLength(4));
+      for (var index = 0; index < causes.length; index++) {
+        final defect = causes[index] as CauseDefect<Never>;
+        expect(defect.error, same(errors[index]));
+        expect(defect.stackTrace, same(traces[index]));
+      }
+    });
   });
 }
 

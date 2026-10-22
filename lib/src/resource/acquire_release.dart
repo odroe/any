@@ -14,6 +14,8 @@ import 'package:any/any.dart';
 /// per successful acquisition, in reverse registration order alongside other
 /// finalizers. Its returned future is awaited. Thrown objects become cleanup
 /// defects and are combined with any existing failure by [Task.run].
+/// A [ScopeCloseException] thrown by [release] contributes its cleanup cause
+/// without its saved exit, including when the resource is released immediately.
 ///
 /// Use the resource within [TaskComposition.map] or [TaskComposition.flatMap].
 /// [Task.run] releases it before returning, even if the task returns the resource
@@ -27,8 +29,8 @@ import 'package:any/any.dart';
 /// The scope's owner must await running tasks before calling [Scope.close].
 /// If the scope closes during acquisition, the resource is released immediately
 /// with an [ExitFailure] containing a [CauseDefect] for the registration
-/// [StateError]. The task fails with that defect, combined with a cleanup defect
-/// if [release] also throws.
+/// [StateError]. The task fails with that defect, combined with any cleanup
+/// causes if [release] also throws.
 ///
 /// ```dart
 /// import 'dart:io';
@@ -66,9 +68,10 @@ Task<T, E, R> acquireRelease<T, E, R>({
       try {
         await release(value, failure);
       } catch (error, stackTrace) {
-        return Exit.failure(
-          Cause.combine([cause, Cause.defect(error, stackTrace)]),
-        );
+        final cleanup = error is ScopeCloseException
+            ? error.cause
+            : Cause<Never>.defect(error, stackTrace);
+        return Exit.failure(Cause.combine([cause, cleanup]));
       }
       return failure;
     }

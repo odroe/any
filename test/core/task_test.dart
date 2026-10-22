@@ -270,6 +270,47 @@ void main() {
     );
 
     test(
+      'combines nested cleanup causes without repeating the task failure',
+      () async {
+        const primary = Cause<String>.failure('original');
+        final cancelled = Cause<Never>.cancelled(reason: Object());
+        final original = Exit<void, String>.failure(
+          Cause.combine([primary, cancelled]),
+        );
+        final firstError = StateError('first');
+        final secondError = StateError('second');
+        final firstTrace = StackTrace.fromString('first trace');
+        final secondTrace = StackTrace.fromString('second trace');
+        final task = Task<void, String, ()>((context) {
+          final child = Scope();
+          context.scope.addFinalizer((exit) => child.close(exit: exit));
+          child.addFinalizer((exit) {
+            expect(exit, same(original));
+            Error.throwWithStackTrace(firstError, firstTrace);
+          });
+          child.addFinalizer((exit) {
+            expect(exit, same(original));
+            return Future<void>.error(secondError, secondTrace);
+          });
+          return original;
+        });
+
+        final exit = await task.run(()) as ExitFailure<void, String>;
+
+        final causes = (exit.cause as CauseGroup<String>).causes;
+        expect(causes, hasLength(4));
+        expect(causes[0], same(primary));
+        expect(causes[1], same(cancelled));
+        final second = causes[2] as CauseDefect<String>;
+        final first = causes[3] as CauseDefect<String>;
+        expect(second.error, same(secondError));
+        expect(second.stackTrace, same(secondTrace));
+        expect(first.error, same(firstError));
+        expect(first.stackTrace, same(firstTrace));
+      },
+    );
+
+    test(
       'runs concurrently with separate scopes and original dependencies',
       () async {
         final firstGate = Completer<void>();

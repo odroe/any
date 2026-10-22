@@ -567,5 +567,105 @@ void main() {
         },
       );
     }
+
+    for (final registered in [false, true]) {
+      for (final asynchronous in [false, true]) {
+        test(
+          'extracts nested cleanup failures (registered: $registered, async: $asynchronous)',
+          () async {
+            final child = Scope();
+            final firstError = StateError('first cleanup');
+            final secondError = StateError('second cleanup');
+            final firstTrace = StackTrace.fromString('first cleanup trace');
+            final secondTrace = StackTrace.fromString('second cleanup trace');
+            child.addFinalizer(
+              (_) => Error.throwWithStackTrace(firstError, firstTrace),
+            );
+            child.addFinalizer(
+              (_) => Future<void>.error(secondError, secondTrace),
+            );
+            const childExit = Exit<void, String>.failure(
+              Cause.failure('child exit'),
+            );
+            late ScopeCloseException childError;
+            try {
+              await child.close(exit: childExit);
+            } on ScopeCloseException catch (error) {
+              childError = error;
+            }
+            var releases = 0;
+            late Exit<void, Object?> cleanupExit;
+            const useExit = Exit<void, String>.failure(
+              Cause.failure('use failed'),
+            );
+            final task = acquireRelease<Scope, String, ()>(
+              acquire: (context) async {
+                if (!registered) await context.scope.close();
+                return Exit.success(child);
+              },
+              release: (resource, exit) {
+                expect(resource, same(child));
+                cleanupExit = exit;
+                releases++;
+                if (asynchronous) return resource.close(exit: exit);
+                throw childError;
+              },
+            ).flatMap((_) => Task<void, String, ()>((_) => useExit));
+
+            final exit = await task.run(()) as ExitFailure<void, String>;
+
+            final causes = (exit.cause as CauseGroup<String>).causes;
+            expect(causes, hasLength(3));
+            expect(
+              causes.first,
+              same((cleanupExit as ExitFailure<void, Object?>).cause),
+            );
+            if (registered) {
+              expect(cleanupExit, same(useExit));
+            } else {
+              expect(
+                (causes.first as CauseDefect<String>).error,
+                isA<StateError>(),
+              );
+            }
+            final second = causes[1] as CauseDefect<String>;
+            final first = causes[2] as CauseDefect<String>;
+            expect(second.error, same(secondError));
+            expect(second.stackTrace, same(secondTrace));
+            expect(first.error, same(firstError));
+            expect(first.stackTrace, same(firstTrace));
+            expect(childError.exit, same(childExit));
+            expect(releases, 1);
+          },
+        );
+      }
+    }
+
+    test(
+      'keeps a cleanup exception thrown by acquisition as a defect',
+      () async {
+        final child = Scope();
+        child.addFinalizer((_) => throw StateError('cleanup'));
+        late ScopeCloseException childError;
+        try {
+          await child.close();
+        } on ScopeCloseException catch (error) {
+          childError = error;
+        }
+        final trace = StackTrace.fromString('acquisition trace');
+        var released = false;
+        final task = acquireRelease<Object, Never, ()>(
+          acquire: (_) => Error.throwWithStackTrace(childError, trace),
+          release: (_, _) => released = true,
+        );
+
+        final exit = await task.run(()) as ExitFailure<Object, Never>;
+
+        final defect = exit.cause as CauseDefect<Never>;
+        expect(defect.error, same(childError));
+        expect(defect.stackTrace, same(trace));
+        expect(released, isFalse);
+      },
+    );
   });
 }

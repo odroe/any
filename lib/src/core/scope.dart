@@ -56,9 +56,12 @@ final class Scope {
   ///
   /// If any finalizer throws, the future completes with a [ScopeCloseException]
   /// after all remaining finalizers have been attempted. That exception retains
-  /// [exit] alongside a [CauseDefect] for each thrown object and its original
-  /// stack trace. Multiple cleanup failures form a [CauseGroup] in finalizer
-  /// execution order. The original exit is kept separate from the cleanup cause.
+  /// [exit] alongside a [CauseDefect] for each cleanup error and its original
+  /// stack trace. A finalizer that throws a [ScopeCloseException] contributes
+  /// only that exception's cleanup cause, without its saved exit. Multiple
+  /// cleanup failures form a flat [CauseGroup] in finalizer execution order,
+  /// including failures from nested scopes. The original exit is kept separate
+  /// from the cleanup cause.
   ///
   /// A finalizer must not await [close] on this scope, since closure waits for
   /// that finalizer to finish.
@@ -78,7 +81,9 @@ final class Scope {
         final result = finalizer(exit);
         if (result is Future<void>) await result;
       } catch (error, stackTrace) {
-        final cause = Cause<Never>.defect(error, stackTrace);
+        final cause = error is ScopeCloseException
+            ? error.cause
+            : Cause<Never>.defect(error, stackTrace);
         if (firstFailure == null) {
           firstFailure = cause;
         } else {
@@ -110,8 +115,10 @@ final class ScopeCloseException implements Exception {
   /// The cleanup failures, independent of the original [exit].
   ///
   /// A single failure is a [CauseDefect]. Multiple failures form a [CauseGroup]
-  /// of defects in finalizer execution order. Every original thrown object and
-  /// stack trace is retained. Cleanup does not introduce expected errors.
+  /// of defects in finalizer execution order, including failures from nested
+  /// scopes. Each defect retains the underlying thrown object and original
+  /// stack trace. Cleanup does not introduce expected errors or include the
+  /// exits saved by nested [ScopeCloseException] values.
   final Cause<Never> cause;
 
   @override
