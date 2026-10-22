@@ -12,7 +12,34 @@ void main() {
 
       expect(context.scope, same(scope));
       expect(context.dependencies, same(dependencies));
+      expect(context.cancellation, same(CancellationToken.none));
       expect(scope.isClosed, isFalse);
+    });
+
+    test('preserves cancellation through dependency and scope views', () {
+      final controller = CancellationController();
+      final reason = Object();
+      final context = Context(
+        scope: _scope(),
+        dependencies: 'original',
+        cancellation: controller.token,
+      );
+      final local = context.withDependencies((count: 42));
+      final child = local.withScope(_scope());
+
+      controller.cancel(reason: reason);
+
+      for (final token in [
+        context.cancellation,
+        local.cancellation,
+        child.cancellation,
+      ]) {
+        expect(token, same(controller.token));
+        expect(token.isCancelled, isTrue);
+        expect(token.reason, same(reason));
+      }
+      expect(context.scope.isClosed, isFalse);
+      expect(child.scope.isClosed, isFalse);
     });
 
     test('infers record fields and callable dependency types', () {

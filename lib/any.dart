@@ -1,3 +1,4 @@
+export 'src/core/cancellation.dart';
 export 'src/core/context.dart';
 export 'src/core/exit.dart';
 export 'src/core/result.dart';

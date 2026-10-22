@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'cancellation.dart';
 import 'context.dart';
 import 'exit.dart';
 import 'scope.dart';
@@ -15,6 +16,10 @@ import 'scope.dart';
 /// [ExitDefect] values with their original stack traces, even if they match [E].
 /// Returning an [ExitCancelled] stops the composition; it does not cancel
 /// work that the computation has started separately.
+///
+/// Pass a [CancellationToken] to [run] to request cancellation from outside the
+/// task. Running callbacks must cooperate through [Context.cancellation]; a run
+/// still waits for them to finish before releasing resources.
 ///
 /// ```dart
 /// final parse = Task<int, String, ({String input})>((context) {
@@ -50,13 +55,30 @@ final class Task<T, E, R> {
   /// Dependencies are passed by reference; concurrent runs can share mutable
   /// dependency objects.
   ///
+  /// [cancellation] is checked before each step and after successful completion.
+  /// A request skips unstarted steps and replaces success with [ExitCancelled].
+  /// Expected failures, defects, and explicit cancellation exits are preserved.
+  /// A running callback is awaited even after a request; it can observe
+  /// [Context.cancellation] to stop cooperatively.
+  ///
   /// Finalizers receive the task's exit and finish before the returned future
-  /// completes. If cleanup fails, the result is an [ExitDefect] containing a
+  /// completes. Once cleanup begins, later requests do not change that exit or
+  /// interrupt cleanup. If cleanup fails, the result is an [ExitDefect] containing a
   /// [ScopeCloseException], which retains the original exit and cleanup errors.
-  Future<Exit<T, E>> run(R dependencies) async {
+  Future<Exit<T, E>> run(
+    R dependencies, {
+    CancellationToken? cancellation,
+  }) async {
     final scope = Scope();
-    final context = Context(scope: scope, dependencies: dependencies);
-    final exit = await _evaluate(context);
+    final context = Context(
+      scope: scope,
+      dependencies: dependencies,
+      cancellation: cancellation,
+    );
+    final exit = _checkCancellation(
+      await _evaluate(context),
+      context.cancellation,
+    );
 
     try {
       await scope.close(exit: exit);
@@ -69,9 +91,17 @@ final class Task<T, E, R> {
   // Schedule each step and use Future.then in compositions to avoid growing
   // the call stack for long chains.
   Future<Exit<T, E>> _evaluate(Context<R> context) =>
-      Future<Exit<T, E>>.microtask(
-        () => _computation(context),
-      ).onError<Object>((error, stackTrace) => Exit.defect(error, stackTrace));
+      Future<Exit<T, E>>.microtask(() {
+        final cancellation = context.cancellation;
+        if (cancellation.isCancelled) {
+          return Exit.cancelled(reason: cancellation.reason);
+        }
+        return _computation(context);
+      }).then(
+        (exit) => _checkCancellation(exit, context.cancellation),
+        onError: (Object error, StackTrace stackTrace) =>
+            Exit<T, E>.defect(error, stackTrace),
+      );
 }
 
 /// Composes tasks while preserving their dependency and expected error types.
@@ -88,7 +118,7 @@ extension TaskComposition<T, E, R> on Task<T, E, R> {
   /// [flatMap] to sequence another task.
   Task<U, E, R> map<U>(U Function(T value) transform) => Task(
     (context) => _evaluate(context).then(
-      (exit) => switch (exit) {
+      (exit) => switch (_checkCancellation(exit, context.cancellation)) {
         ExitSuccess(:final value) => Exit.success(transform(value)),
         ExitFailure(:final error) => Exit.failure(error),
         ExitDefect(:final error, :final stackTrace) => Exit.defect(
@@ -110,7 +140,7 @@ extension TaskComposition<T, E, R> on Task<T, E, R> {
   /// cancellation reason. A thrown object becomes an [ExitDefect].
   Task<U, E, R> flatMap<U>(Task<U, E, R> Function(T value) next) => Task(
     (context) => _evaluate(context).then(
-      (exit) => switch (exit) {
+      (exit) => switch (_checkCancellation(exit, context.cancellation)) {
         ExitSuccess(:final value) => next(value)._evaluate(context),
         ExitFailure(:final error) => Exit.failure(error),
         ExitDefect(:final error, :final stackTrace) => Exit.defect(
@@ -122,3 +152,8 @@ extension TaskComposition<T, E, R> on Task<T, E, R> {
     ),
   );
 }
+
+Exit<T, E> _checkCancellation<T, E>(Exit<T, E> exit, CancellationToken token) =>
+    exit is ExitSuccess<T, E> && token.isCancelled
+    ? Exit.cancelled(reason: token.reason)
+    : exit;
