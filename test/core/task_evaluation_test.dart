@@ -5,6 +5,111 @@ import 'package:test/test.dart';
 
 void main() {
   group('Task evaluation', () {
+    for (final operation in ['map', 'flatMap']) {
+      for (final failed in [false, true]) {
+        test(
+          'keeps $operation scheduling constant (failed: $failed)',
+          () async {
+            Task<int, String, ()> build(int length) {
+              var task = Task<int, String, ()>(
+                (_) => failed
+                    ? const Exit.failure(Cause.failure('original'))
+                    : const Exit.success(0),
+              );
+              for (var i = 0; i < length; i++) {
+                task = operation == 'map'
+                    ? task.map((value) => value + 1)
+                    : task.flatMap(
+                        (value) => Task((_) => Exit.success(value + 1)),
+                      );
+              }
+              return task;
+            }
+
+            final shallow = await _countMicrotasks(build(1));
+            final deep = await _countMicrotasks(build(10000));
+
+            expect(deep, shallow);
+          },
+        );
+      }
+    }
+
+    test(
+      'observes queued cancellation after reaching an asynchronous step',
+      () async {
+        final controller = CancellationController();
+        final cancelled = Completer<void>();
+        final body = Completer<Exit<int, Never>>();
+        final events = <String>[];
+        final task =
+            Task<int, Never, ()>((context) {
+                  context.scope.addFinalizer((_) => events.add('cleanup'));
+                  scheduleMicrotask(() {
+                    events.add('cancel');
+                    controller.cancel(reason: 'queued request');
+                    cancelled.complete();
+                  });
+                  return const Exit.success(1);
+                })
+                .map((value) {
+                  events.add('map');
+                  return value + 1;
+                })
+                .flatMap((value) {
+                  events.add('select');
+                  return Task((_) {
+                    events.add('body');
+                    return body.future;
+                  });
+                })
+                .map((value) {
+                  events.add('unexpected');
+                  return value;
+                });
+
+        final running = task.run((), cancellation: controller.token);
+        expect(events, isEmpty);
+        await cancelled.future;
+        expect(events, ['map', 'select', 'body', 'cancel']);
+
+        body.complete(const Exit.success(42));
+        _expectCancelled(await running, 'queued request');
+        expect(events, ['map', 'select', 'body', 'cancel', 'cleanup']);
+      },
+    );
+
+    for (final cancelled in [false, true]) {
+      test(
+        'checks a selected task scope before cancellation ($cancelled)',
+        () async {
+          final scope = Scope();
+          final controller = CancellationController();
+          final context = Context(
+            scope: scope,
+            dependencies: (),
+            cancellation: controller.token,
+          );
+          var called = false;
+          final task = Task<int, Never, ()>((_) => const Exit.success(1))
+              .flatMap((value) {
+                unawaited(scope.close());
+                if (cancelled) controller.cancel();
+                return Task<int, Never, ()>((_) {
+                  called = true;
+                  return Exit.success(value);
+                }).map((value) => value + 1);
+              });
+
+          final exit = await task.runIn(context) as ExitFailure<int, Never>;
+
+          expect((exit.cause as CauseDefect<Never>).error, isA<StateError>());
+          expect(called, isFalse);
+          await scope.close();
+        },
+      );
+    }
+
     test('resumes a deep mixed chain across futures and value types', () async {
       var task = Task<int, Never, ()>((_) => const Exit.success(0));
       for (var i = 0; i < 10000; i++) {
@@ -316,6 +421,20 @@ void main() {
       },
     );
   });
+}
+
+Future<int> _countMicrotasks(Task<int, String, ()> task) async {
+  var count = 0;
+  await runZoned(
+    () => task.run(()),
+    zoneSpecification: ZoneSpecification(
+      scheduleMicrotask: (self, parent, zone, callback) {
+        count++;
+        parent.scheduleMicrotask(zone, callback);
+      },
+    ),
+  );
+  return count;
 }
 
 void _expectCancelled<T, E>(Exit<T, E> exit, Object? reason) {
