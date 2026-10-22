@@ -1,6 +1,6 @@
 import 'dart:async';
 
-import '../../any.dart';
+import 'package:any/any.dart';
 
 /// A task that acquires a resource and releases it when its scope closes.
 ///
