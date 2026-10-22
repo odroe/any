@@ -49,7 +49,9 @@ void main() {
         });
         return Exit.success(label);
       });
-      const parentExit = Exit<String, String>.failure('parent failed');
+      const parentExit = Exit<String, String>.failure(
+        Cause.failure('parent failed'),
+      );
       final workflow = Task<String, String, ()>((context) async {
         scope = context.scope;
         context.scope.addFinalizer((exit) {
@@ -91,11 +93,24 @@ void main() {
     final reason = Object();
     final outcomes = [
       (name: 'success', exit: const Exit<int, Object?>.success(42)),
-      (name: 'failure', exit: Exit<int, Object?>.failure(error)),
-      (name: 'defect', exit: Exit<int, Object?>.defect(error, trace)),
+      (name: 'failure', exit: Exit<int, Object?>.failure(Cause.failure(error))),
+      (
+        name: 'defect',
+        exit: Exit<int, Object?>.failure(Cause.defect(error, trace)),
+      ),
       (
         name: 'cancellation',
-        exit: Exit<int, Object?>.cancelled(reason: reason),
+        exit: Exit<int, Object?>.failure(Cause.cancelled(reason: reason)),
+      ),
+      (
+        name: 'combined failure',
+        exit: Exit<int, Object?>.failure(
+          Cause.combine([
+            Cause.failure(error),
+            Cause.defect(error, trace),
+            Cause.cancelled(reason: reason),
+          ]),
+        ),
       ),
     ];
 
@@ -113,7 +128,9 @@ void main() {
         expect(scope.isClosed, isFalse);
         expect(cleanupExits, isEmpty);
 
-        const ownerExit = Exit<void, Object?>.failure('owner outcome');
+        const ownerExit = Exit<void, Object?>.failure(
+          Cause.failure('owner outcome'),
+        );
         await scope.close(exit: ownerExit);
         expect(cleanupExits.single, same(ownerExit));
       });
@@ -132,8 +149,8 @@ void main() {
 
         final exit = await task.runIn(context);
 
-        expect(exit, isA<ExitDefect<int, StateError>>());
-        final defect = exit as ExitDefect<int, StateError>;
+        final cause = (exit as ExitFailure<int, StateError>).cause;
+        final defect = cause as CauseDefect<StateError>;
         expect(defect.error, same(error));
         expect(defect.stackTrace, same(trace));
         expect(scope.isClosed, isFalse);
@@ -161,7 +178,8 @@ void main() {
         if (!beforeRun) controller.cancel(reason: reason);
         final exit = await running;
 
-        expect((exit as ExitCancelled<int, Never>).reason, same(reason));
+        final cause = (exit as ExitFailure<int, Never>).cause;
+        expect((cause as CauseCancelled<Never>).reason, same(reason));
         expect(called, isFalse);
         expect(scope.isClosed, isFalse);
         await scope.close(exit: exit);
@@ -199,7 +217,8 @@ void main() {
 
       body.complete(const Exit.success(42));
       final exit = await running;
-      expect((exit as ExitCancelled<int, Never>).reason, same(reason));
+      final cause = (exit as ExitFailure<int, Never>).cause;
+      expect((cause as CauseCancelled<Never>).reason, same(reason));
       expect(scope.isClosed, isFalse);
       expect(cleanupExits, isEmpty);
 
@@ -292,12 +311,12 @@ void main() {
           isA<ScopeCloseException>()
               .having((failure) => failure.exit, 'exit', same(exit))
               .having(
-                (failure) => failure.errors.single.error,
+                (failure) => (failure.cause as CauseDefect<Never>).error,
                 'cleanup error',
                 same(error),
               )
               .having(
-                (failure) => failure.errors.single.stackTrace,
+                (failure) => (failure.cause as CauseDefect<Never>).stackTrace,
                 'cleanup trace',
                 same(trace),
               ),
@@ -310,10 +329,14 @@ void main() {
 void _expectClosedScope<T, E>(Exit<T, E> exit) {
   expect(
     exit,
-    isA<ExitDefect<T, E>>().having(
-      (exit) => exit.error,
-      'error',
-      isA<StateError>(),
+    isA<ExitFailure<T, E>>().having(
+      (exit) => exit.cause,
+      'cause',
+      isA<CauseDefect<E>>().having(
+        (cause) => cause.error,
+        'error',
+        isA<StateError>(),
+      ),
     ),
   );
 }

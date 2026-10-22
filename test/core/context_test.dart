@@ -156,7 +156,9 @@ void main() {
           dependencies: (traceId: 'request-1'),
         );
         final child = context.withScope(childScope);
-        const exit = Exit<Never, Never>.cancelled(reason: 'shutdown');
+        const exit = Exit<Never, Never>.failure(
+          Cause.cancelled(reason: 'shutdown'),
+        );
         child.scope.addFinalizer((childExit) {
           expect(child.dependencies.traceId, 'request-1');
           expect(childExit, same(exit));

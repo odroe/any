@@ -1,24 +1,27 @@
+import 'cause.dart';
 import 'result.dart';
 
 /// The terminal outcome of a task with value type [T] and expected error type [E].
 ///
-/// An exit is an [ExitSuccess], [ExitFailure], [ExitDefect], or [ExitCancelled].
-/// Only [ExitFailure] contains an expected error of type [E]. Unexpected errors
-/// retain their original stack traces, and cancellation is a separate outcome.
+/// An exit is either an [ExitSuccess] containing a value or an [ExitFailure]
+/// containing a [Cause]. The cause distinguishes expected failures, unexpected
+/// errors, cancellation, and combinations of these reasons.
 ///
-/// An exit describes an outcome. Creating one does not execute a task, catch
-/// exceptions, or request cancellation.
+/// An exit is data. Creating one does not execute a task, catch exceptions, or
+/// request cancellation.
 ///
-/// Use an exhaustive `switch` to handle all four cases:
+/// Use an exhaustive `switch` to inspect the outcome and its cause:
 ///
 /// ```dart
-/// const Exit<int, String> exit = Exit.success(42);
+/// const Exit<int, String> exit = Exit.failure(Cause.failure('Invalid input.'));
 ///
 /// final message = switch (exit) {
 ///   ExitSuccess(:final value) => 'Completed: $value',
-///   ExitFailure(:final error) => 'Failed: $error',
-///   ExitDefect(:final error) => 'Unexpected: $error',
-///   ExitCancelled(:final reason) => 'Cancelled: $reason',
+///   ExitFailure(cause: CauseFailure(:final error)) => 'Failed: $error',
+///   ExitFailure(cause: CauseDefect(:final error)) => 'Unexpected: $error',
+///   ExitFailure(cause: CauseCancelled(:final reason)) => 'Cancelled: $reason',
+///   ExitFailure(cause: CauseGroup(:final causes)) =>
+///     '${causes.length} failure reasons.',
 /// };
 /// ```
 sealed class Exit<T, E> {
@@ -27,26 +30,17 @@ sealed class Exit<T, E> {
   /// Records successful completion with [value].
   const factory Exit.success(T value) = ExitSuccess<T, E>;
 
-  /// Records an expected failure with [error].
-  const factory Exit.failure(E error) = ExitFailure<T, E>;
-
-  /// Records an unexpected [error] with its original [stackTrace].
-  ///
-  /// Pass the stack trace received by `catch (error, stackTrace)` to preserve
-  /// the location of the failure.
-  const factory Exit.defect(Object error, StackTrace stackTrace) =
-      ExitDefect<T, E>;
-
-  /// Records cancellation with an optional [reason].
-  const factory Exit.cancelled({Object? reason}) = ExitCancelled<T, E>;
+  /// Records unsuccessful completion with [cause].
+  const factory Exit.failure(Cause<E> cause) = ExitFailure<T, E>;
 
   /// Converts [result] to a successful or expected-failure exit.
   ///
-  /// A [Success] becomes an [ExitSuccess]; a [Failure] becomes an [ExitFailure].
-  /// The value or error is preserved without copying.
+  /// A [Success] becomes an [ExitSuccess]. A [Failure] becomes an [ExitFailure]
+  /// with a [CauseFailure], even when its error is an [Exception] or [Error].
+  /// The original value or error is preserved without copying.
   factory Exit.fromResult(Result<T, E> result) => switch (result) {
     Success(:final value) => Exit.success(value),
-    Failure(:final error) => Exit.failure(error),
+    Failure(:final error) => Exit.failure(Cause.failure(error)),
   };
 }
 
@@ -59,37 +53,11 @@ final class ExitSuccess<T, E> extends Exit<T, E> {
   final T value;
 }
 
-/// A task that ended with an expected [error] of type [E].
+/// A task that ended with one or more reasons in [cause].
 final class ExitFailure<T, E> extends Exit<T, E> {
-  /// Records an expected failure with [error].
-  const ExitFailure(this.error) : super._();
+  /// Records unsuccessful completion with [cause].
+  const ExitFailure(this.cause) : super._();
 
-  /// The expected error, which may be null if [E] allows it.
-  final E error;
-}
-
-/// A task that ended with an unexpected [error] and its original [stackTrace].
-///
-/// The error can be any non-null object, regardless of the expected error type
-/// [E].
-final class ExitDefect<T, E> extends Exit<T, E> {
-  /// Records an unexpected [error] with its original [stackTrace].
-  const ExitDefect(this.error, this.stackTrace) : super._();
-
-  /// The original object thrown by the task.
-  final Object error;
-
-  /// The original stack trace associated with [error].
-  final StackTrace stackTrace;
-}
-
-/// A task that ended in response to cancellation.
-///
-/// The optional [reason] is independent of the expected error type [E].
-final class ExitCancelled<T, E> extends Exit<T, E> {
-  /// Records cancellation with an optional [reason].
-  const ExitCancelled({this.reason}) : super._();
-
-  /// The reason for cancellation, or null when none was supplied.
-  final Object? reason;
+  /// The complete failure cause, including any defects or cancellation.
+  final Cause<E> cause;
 }

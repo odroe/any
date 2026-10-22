@@ -36,24 +36,23 @@ void main() {
       final parse = Task<int, String, ({String input})>((context) {
         final value = int.tryParse(context.dependencies.input);
         return value == null
-            ? const Exit.failure('Expected an integer.')
+            ? const Exit.failure(Cause.failure('Expected an integer.'))
             : Exit.success(value);
       });
 
       final exit = await parse.map((value) => value * 2).run((input: '21'));
       final message = switch (exit) {
         ExitSuccess(:final value) => 'Parsed $value.',
-        ExitFailure(:final error) => error,
-        ExitDefect(:final error) => 'Unexpected: $error',
-        ExitCancelled() => 'Cancelled.',
+        ExitFailure(cause: CauseFailure(:final error)) => error,
+        ExitFailure(cause: CauseDefect(:final error)) => 'Unexpected: $error',
+        ExitFailure(cause: CauseCancelled()) => 'Cancelled.',
+        ExitFailure(cause: CauseGroup(:final causes)) =>
+          '${causes.length} failure reasons.',
       };
 
       expect(message, 'Parsed 42.');
       final failure = await parse.run((input: 'invalid'));
-      expect(
-        (failure as ExitFailure<int, String>).error,
-        'Expected an integer.',
-      );
+      expect(_expectedError(failure), 'Expected an integer.');
     });
 
     test(
@@ -130,11 +129,27 @@ void main() {
     final reason = Object();
     final outcomes = [
       (name: 'success', exit: const Exit<int, Object?>.success(42)),
-      (name: 'failure', exit: Exit<int, Object?>.failure(expectedError)),
-      (name: 'defect', exit: Exit<int, Object?>.defect(defect, defectTrace)),
+      (
+        name: 'failure',
+        exit: Exit<int, Object?>.failure(Cause.failure(expectedError)),
+      ),
+      (
+        name: 'defect',
+        exit: Exit<int, Object?>.failure(Cause.defect(defect, defectTrace)),
+      ),
       (
         name: 'cancellation',
-        exit: Exit<int, Object?>.cancelled(reason: reason),
+        exit: Exit<int, Object?>.failure(Cause.cancelled(reason: reason)),
+      ),
+      (
+        name: 'combined failure',
+        exit: Exit<int, Object?>.failure(
+          Cause.combine([
+            Cause.failure(expectedError),
+            Cause.defect(defect, defectTrace),
+            Cause.cancelled(reason: reason),
+          ]),
+        ),
       ),
     ];
 
@@ -169,17 +184,90 @@ void main() {
 
         final exit = await task.run(());
 
-        expect(exit, isA<ExitDefect<int, Object?>>());
-        final error = (exit as ExitDefect<int, Object?>).error;
-        expect(error, isA<ScopeCloseException>());
-        final failure = error as ScopeCloseException;
-        expect(failure.exit, same(outcome.exit));
-        expect(failure.errors, hasLength(1));
-        expect(failure.errors.single.error, same(cleanupError));
-        expect(failure.errors.single.stackTrace, same(cleanupTrace));
+        final cause = (exit as ExitFailure<int, Object?>).cause;
+        final originalCauses = switch (outcome.exit) {
+          ExitSuccess() => <Cause<Object?>>[],
+          ExitFailure(cause: CauseGroup(:final causes)) => causes,
+          ExitFailure(:final cause) => [cause],
+        };
+        final CauseDefect<Object?> cleanup;
+        if (originalCauses.isEmpty) {
+          cleanup = cause as CauseDefect<Object?>;
+        } else {
+          final causes = (cause as CauseGroup<Object?>).causes;
+          expect(causes, hasLength(originalCauses.length + 1));
+          expect(causes.take(originalCauses.length), originalCauses);
+          cleanup = causes.last as CauseDefect<Object?>;
+        }
+        expect(cleanup.error, same(cleanupError));
+        expect(cleanup.stackTrace, same(cleanupTrace));
         expect(events, ['failing', 'remaining']);
       });
     }
+
+    test('combines typed causes and all cleanup defects in order', () async {
+      const primary = Cause<({String code})>.failure((code: 'invalid'));
+      final cancelled = Cause<Never>.cancelled(reason: Object());
+      final original = Exit<int, ({String code})>.failure(
+        Cause.combine([primary, cancelled]),
+      );
+      final syncError = StateError('synchronous cleanup failed');
+      final asyncError = Object();
+      final syncTrace = StackTrace.fromString('synchronous cleanup trace');
+      final asyncTrace = StackTrace.fromString('asynchronous cleanup trace');
+      final cleanupExits = <Exit<void, Object?>>[];
+      final task = Task<int, ({String code}), ()>((context) {
+        context.scope.addFinalizer((exit) {
+          cleanupExits.add(exit);
+          Error.throwWithStackTrace(syncError, syncTrace);
+        });
+        context.scope.addFinalizer((exit) {
+          cleanupExits.add(exit);
+          return Future<void>.error(asyncError, asyncTrace);
+        });
+        return original;
+      });
+
+      final exit = await task.run(()) as ExitFailure<int, ({String code})>;
+      final causes = (exit.cause as CauseGroup<({String code})>).causes;
+
+      expect(causes, hasLength(4));
+      expect(causes[0], same(primary));
+      expect(
+        (causes[0] as CauseFailure<({String code})>).error.code,
+        'invalid',
+      );
+      expect(causes[1], same(cancelled));
+      final asyncFailure = causes[2] as CauseDefect<({String code})>;
+      final syncFailure = causes[3] as CauseDefect<({String code})>;
+      expect(asyncFailure.error, same(asyncError));
+      expect(asyncFailure.stackTrace, same(asyncTrace));
+      expect(syncFailure.error, same(syncError));
+      expect(syncFailure.stackTrace, same(syncTrace));
+      expect(cleanupExits, [same(original), same(original)]);
+    });
+
+    test(
+      'keeps a cleanup exception thrown by the computation as a defect',
+      () async {
+        final otherScope = Scope();
+        otherScope.addFinalizer(
+          (_) => throw StateError('other cleanup failed'),
+        );
+        late ScopeCloseException error;
+        try {
+          await otherScope.close();
+        } on ScopeCloseException catch (failure) {
+          error = failure;
+        }
+        final trace = StackTrace.fromString('computation trace');
+        final task = Task<int, Never, ()>(
+          (_) => Error.throwWithStackTrace(error, trace),
+        );
+
+        _expectDefect(await task.run(()), error, trace);
+      },
+    );
 
     test(
       'runs concurrently with separate scopes and original dependencies',
@@ -226,17 +314,16 @@ void main() {
       'supports nullable values, nullable failures, and void tasks',
       () async {
         final success = Task<int?, Never, ()>((_) => const Exit.success(null));
-        final failure = Task<int, String?, ()>((_) => const Exit.failure(null));
+        final failure = Task<int, String?, ()>(
+          (_) => const Exit.failure(Cause.failure(null)),
+        );
         final empty = Task<void, Never, ()>((_) => const Exit.success(null));
 
         expect(
           (await success.run(()) as ExitSuccess<int?, Never>).value,
           isNull,
         );
-        expect(
-          (await failure.run(()) as ExitFailure<int, String?>).error,
-          isNull,
-        );
+        expect(_expectedError(await failure.run(())), isNull);
         expect(await empty.run(()), isA<ExitSuccess<void, Never>>());
       },
     );
@@ -248,10 +335,7 @@ void main() {
         final result = Result<int, StateError>.failure(error);
         final task = Task<int, StateError, ()>((_) => Exit.fromResult(result));
 
-        expect(
-          (await task.run(()) as ExitFailure<int, StateError>).error,
-          same(error),
-        );
+        expect(_expectedError(await task.run(())), same(error));
       },
     );
 
@@ -412,50 +496,23 @@ void main() {
           );
           final task = first.flatMap(
             (value) => Task<double, String, ()>(
-              (_) => Exit.failure('Cannot use $value'),
+              (_) => Exit.failure(Cause.failure('Cannot use $value')),
             ),
           );
 
           final exit = await task.run(());
 
-          expect((exit as ExitFailure<double, String>).error, 'Cannot use 1');
+          expect(_expectedError(exit), 'Cannot use 1');
         },
       );
     });
 
-    final terminalOutcomes = [
-      (
-        exit: Exit<int, Object?>.failure(expectedError),
-        name: 'failure',
-        matcher: isA<ExitFailure<String, Object?>>().having(
-          (exit) => exit.error,
-          'error',
-          same(expectedError),
-        ),
-      ),
-      (
-        exit: Exit<int, Object?>.defect(defect, defectTrace),
-        name: 'defect',
-        matcher: isA<ExitDefect<String, Object?>>()
-            .having((exit) => exit.error, 'error', same(defect))
-            .having(
-              (exit) => exit.stackTrace,
-              'stack trace',
-              same(defectTrace),
-            ),
-      ),
-      (
-        exit: Exit<int, Object?>.cancelled(reason: reason),
-        name: 'cancellation',
-        matcher: isA<ExitCancelled<String, Object?>>().having(
-          (exit) => exit.reason,
-          'reason',
-          same(reason),
-        ),
-      ),
-    ];
+    final terminalOutcomes = outcomes.where(
+      (outcome) => outcome.exit is ExitFailure,
+    );
 
     for (final outcome in terminalOutcomes) {
+      final cause = (outcome.exit as ExitFailure<int, Object?>).cause;
       test('map and flatMap skip callbacks after ${outcome.name}', () async {
         final task = Task<int, Object?, ()>((_) => outcome.exit);
         var called = false;
@@ -470,8 +527,14 @@ void main() {
           );
         });
 
-        expect(await mapped.run(()), outcome.matcher);
-        expect(await chained.run(()), outcome.matcher);
+        expect(
+          (await mapped.run(()) as ExitFailure<String, Object?>).cause,
+          same(cause),
+        );
+        expect(
+          (await chained.run(()) as ExitFailure<String, Object?>).cause,
+          same(cause),
+        );
         expect(called, isFalse);
       });
 
@@ -480,15 +543,21 @@ void main() {
             .flatMap((_) => Task<int, Object?, ()>((_) => outcome.exit))
             .map((value) => 'unexpected:$value');
 
-        expect(await task.run(()), outcome.matcher);
+        expect(
+          (await task.run(()) as ExitFailure<String, Object?>).cause,
+          same(cause),
+        );
       });
     }
   });
 }
 
 void _expectDefect<T, E>(Exit<T, E> exit, Object error, StackTrace trace) {
-  expect(exit, isA<ExitDefect<T, E>>());
-  final defect = exit as ExitDefect<T, E>;
+  final cause = (exit as ExitFailure<T, E>).cause;
+  final defect = cause as CauseDefect<E>;
   expect(defect.error, same(error));
   expect(defect.stackTrace, same(trace));
 }
+
+E _expectedError<T, E>(Exit<T, E> exit) =>
+    ((exit as ExitFailure<T, E>).cause as CauseFailure<E>).error;

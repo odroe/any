@@ -118,7 +118,9 @@ void main() {
           try {
             started.complete();
             await stopped.future;
-            return Exit.cancelled(reason: context.cancellation.reason);
+            return Exit.failure(
+              Cause.cancelled(reason: context.cancellation.reason),
+            );
           } finally {
             removeListener();
           }
@@ -215,11 +217,26 @@ void main() {
     final trace = StackTrace.fromString('original trace');
     final explicitReason = Object();
     final terminalOutcomes = [
-      (name: 'failure', exit: Exit<int, Object?>.failure(error)),
-      (name: 'defect', exit: Exit<int, Object?>.defect(error, trace)),
+      (name: 'failure', exit: Exit<int, Object?>.failure(Cause.failure(error))),
+      (
+        name: 'defect',
+        exit: Exit<int, Object?>.failure(Cause.defect(error, trace)),
+      ),
       (
         name: 'explicit cancellation',
-        exit: Exit<int, Object?>.cancelled(reason: explicitReason),
+        exit: Exit<int, Object?>.failure(
+          Cause.cancelled(reason: explicitReason),
+        ),
+      ),
+      (
+        name: 'combined failure',
+        exit: Exit<int, Object?>.failure(
+          Cause.combine([
+            Cause.failure(error),
+            Cause.defect(error, trace),
+            Cause.cancelled(reason: explicitReason),
+          ]),
+        ),
       ),
     ];
 
@@ -262,8 +279,8 @@ void main() {
 
           final exit = await task.run((), cancellation: controller.token);
 
-          expect(exit, isA<ExitDefect<int, StateError>>());
-          final defect = exit as ExitDefect<int, StateError>;
+          final cause = (exit as ExitFailure<int, StateError>).cause;
+          final defect = cause as CauseDefect<StateError>;
           expect(defect.error, same(error));
           expect(defect.stackTrace, same(trace));
           expect(cleanupExit, same(exit));
@@ -327,12 +344,16 @@ void main() {
 
         final exit = await task.run((), cancellation: controller.token);
 
-        expect(exit, isA<ExitDefect<int, Never>>());
-        final failure =
-            (exit as ExitDefect<int, Never>).error as ScopeCloseException;
-        _expectCancelled(failure.exit, reason);
-        expect(failure.errors.single.error, same(error));
-        expect(failure.errors.single.stackTrace, same(trace));
+        final cause =
+            (exit as ExitFailure<int, Never>).cause as CauseGroup<Never>;
+        expect(cause.causes, hasLength(2));
+        expect(
+          (cause.causes.first as CauseCancelled<Never>).reason,
+          same(reason),
+        );
+        final cleanup = cause.causes.last as CauseDefect<Never>;
+        expect(cleanup.error, same(error));
+        expect(cleanup.stackTrace, same(trace));
         expect(remainingCleanupRan, isTrue);
       },
     );
@@ -394,6 +415,7 @@ void main() {
 }
 
 void _expectCancelled<T, E>(Exit<T, E> exit, Object? reason) {
-  expect(exit, isA<ExitCancelled<T, E>>());
-  expect((exit as ExitCancelled<T, E>).reason, same(reason));
+  final cause = (exit as ExitFailure<T, E>).cause;
+  expect(cause, isA<CauseCancelled<E>>());
+  expect((cause as CauseCancelled<E>).reason, same(reason));
 }

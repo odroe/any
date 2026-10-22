@@ -48,13 +48,17 @@ void main() {
       () async {
         final scope = Scope();
         final seen = <Exit<void, Object?>>[];
-        const exit = Exit<int, String>.failure('original failure');
+        const exit = Exit<int, String>.failure(
+          Cause.failure('original failure'),
+        );
         scope.addFinalizer(seen.add);
         scope.addFinalizer(seen.add);
 
         final closing = scope.close(exit: exit);
         expect(
-          scope.close(exit: const Exit.cancelled(reason: 'too late')),
+          scope.close(
+            exit: const Exit.failure(Cause.cancelled(reason: 'too late')),
+          ),
           same(closing),
         );
         await closing;
@@ -100,15 +104,21 @@ void main() {
       scope.addFinalizer((exit) {
         expect(
           exit,
-          isA<ExitCancelled<void, Object?>>().having(
-            (exit) => exit.reason,
-            'reason',
-            same(reason),
+          isA<ExitFailure<void, Object?>>().having(
+            (exit) => exit.cause,
+            'cause',
+            isA<CauseCancelled<Object?>>().having(
+              (cause) => cause.reason,
+              'reason',
+              same(reason),
+            ),
           ),
         );
       });
 
-      await scope.close(exit: Exit<Never, Never>.cancelled(reason: reason));
+      await scope.close(
+        exit: Exit<Never, Never>.failure(Cause.cancelled(reason: reason)),
+      );
     });
 
     test('a reentrant close sees the same completion', () async {
@@ -158,28 +168,42 @@ void main() {
       final error = await _closeError(scope.close());
 
       expect(events, ['third', 'second', 'first']);
-      expect(error.errors, hasLength(2));
-      expect(error.errors[0].error, same(asyncError));
-      expect(error.errors[0].stackTrace.toString(), asyncTrace.toString());
-      expect(error.errors[1].error, same(syncError));
-      expect(error.errors[1].stackTrace.toString(), syncTrace.toString());
+      final causes = (error.cause as CauseGroup<Never>).causes;
+      expect(causes, hasLength(2));
+      final first = causes[0] as CauseDefect<Never>;
+      final second = causes[1] as CauseDefect<Never>;
+      expect(first.error, same(asyncError));
+      expect(first.stackTrace, same(asyncTrace));
+      expect(second.error, same(syncError));
+      expect(second.stackTrace, same(syncTrace));
       expect(error.toString(), contains(asyncError));
       expect(error.toString(), contains('synchronous cleanup failed'));
-      expect(() => error.errors.clear(), throwsUnsupportedError);
+      expect(() => causes.clear(), throwsUnsupportedError);
     });
 
     for (final (name, exit) in <(String, Exit<void, Object?>)>[
       ('success', const Exit<int, String>.success(42)),
-      ('failure', const Exit<int, String>.failure('original failure')),
-      ('nullable failure', const Exit<int, String?>.failure(null)),
+      (
+        'failure',
+        const Exit<int, String>.failure(Cause.failure('original failure')),
+      ),
+      (
+        'nullable failure',
+        const Exit<int, String?>.failure(Cause.failure(null)),
+      ),
       (
         'defect',
-        Exit<Never, Never>.defect(
-          StateError('original defect'),
-          StackTrace.fromString('original task trace'),
+        Exit<Never, Never>.failure(
+          Cause.defect(
+            StateError('original defect'),
+            StackTrace.fromString('original task trace'),
+          ),
         ),
       ),
-      ('cancellation', const Exit<Never, Never>.cancelled(reason: 'shutdown')),
+      (
+        'cancellation',
+        const Exit<Never, Never>.failure(Cause.cancelled(reason: 'shutdown')),
+      ),
     ]) {
       test('retains the original $name alongside cleanup failures', () async {
         final scope = Scope();
@@ -189,7 +213,7 @@ void main() {
         final error = await _closeError(scope.close(exit: exit));
 
         expect(error.exit, same(exit));
-        expect(error.errors.single.error, same(cleanupError));
+        expect((error.cause as CauseDefect<Never>).error, same(cleanupError));
       });
     }
 
@@ -242,7 +266,9 @@ void main() {
         final parent = Scope();
         final child = Scope();
         final events = <String>[];
-        const exit = Exit<Never, Never>.cancelled(reason: 'shutdown');
+        const exit = Exit<Never, Never>.failure(
+          Cause.cancelled(reason: 'shutdown'),
+        );
         parent.addFinalizer((_) => events.add('parent'));
         parent.addFinalizer((exit) => child.close(exit: exit));
         child.addFinalizer((childExit) {

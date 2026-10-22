@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'cause.dart';
 import 'exit.dart';
 
 /// A lifetime for resources with synchronous or asynchronous cleanup.
@@ -9,8 +10,8 @@ import 'exit.dart';
 /// finalizer is attempted, even when an earlier finalizer throws.
 ///
 /// The first call to [close] fixes the [Exit] passed to every finalizer. A
-/// [ScopeCloseException] preserves this exit and all cleanup errors if cleanup
-/// fails.
+/// [ScopeCloseException] preserves this exit alongside a [Cause] describing
+/// cleanup failures, if any.
 ///
 /// ```dart
 /// final scope = Scope();
@@ -55,7 +56,9 @@ final class Scope {
   ///
   /// If any finalizer throws, the future completes with a [ScopeCloseException]
   /// after all remaining finalizers have been attempted. That exception retains
-  /// [exit] alongside every cleanup error and its original stack trace.
+  /// [exit] alongside a [CauseDefect] for each thrown object and its original
+  /// stack trace. Multiple cleanup failures form a [CauseGroup] in finalizer
+  /// execution order. The original exit is kept separate from the cleanup cause.
   ///
   /// A finalizer must not await [close] on this scope, since closure waits for
   /// that finalizer to finish.
@@ -67,41 +70,50 @@ final class Scope {
     _finalizers = null;
     if (finalizers == null) return;
 
-    List<AsyncError>? errors;
+    Cause<Never>? firstFailure;
+    List<Cause<Never>>? failures;
     while (finalizers.isNotEmpty) {
       final finalizer = finalizers.removeLast();
       try {
         final result = finalizer(exit);
         if (result is Future<void>) await result;
       } catch (error, stackTrace) {
-        (errors ??= []).add(AsyncError(error, stackTrace));
+        final cause = Cause<Never>.defect(error, stackTrace);
+        if (firstFailure == null) {
+          firstFailure = cause;
+        } else {
+          (failures ??= [firstFailure]).add(cause);
+        }
       }
     }
 
-    if (errors != null) {
-      throw ScopeCloseException._(exit, errors);
+    if (firstFailure != null) {
+      throw ScopeCloseException._(
+        exit,
+        failures == null ? firstFailure : Cause.combine(failures),
+      );
     }
   }
 }
 
-/// Errors encountered while closing a [Scope], together with its original exit.
+/// A cleanup [cause] encountered while closing a [Scope], with its original exit.
 ///
 /// Every finalizer has been attempted before this exception is reported. The
 /// original task outcome remains available through [exit], even when it was
 /// already a failure or cancellation.
 final class ScopeCloseException implements Exception {
-  ScopeCloseException._(this.exit, List<AsyncError> errors)
-    : errors = List.unmodifiable(errors);
+  ScopeCloseException._(this.exit, this.cause);
 
   /// The outcome supplied to the first call to [Scope.close].
   final Exit<void, Object?> exit;
 
-  /// Cleanup errors and their original stack traces, in execution order.
+  /// The cleanup failures, independent of the original [exit].
   ///
-  /// This list is nonempty and unmodifiable.
-  final List<AsyncError> errors;
+  /// A single failure is a [CauseDefect]. Multiple failures form a [CauseGroup]
+  /// of defects in finalizer execution order. Every original thrown object and
+  /// stack trace is retained. Cleanup does not introduce expected errors.
+  final Cause<Never> cause;
 
   @override
-  String toString() =>
-      'ScopeCloseException: ${errors.map((error) => error.error).join('; ')}';
+  String toString() => 'ScopeCloseException: $cause';
 }

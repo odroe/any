@@ -3,94 +3,71 @@ import 'package:test/test.dart';
 
 void main() {
   group('Exit', () {
-    test('supports exhaustive matching across all four terminal outcomes', () {
+    test('supports exhaustive matching of outcomes and their causes', () {
       expect(_describe(const Exit<int, String>.success(42)), 'Completed: 42');
       expect(
-        _describe(const Exit<int, String>.failure('invalid')),
+        _describe(const Exit<int, String>.failure(Cause.failure('invalid'))),
         'Failed: invalid',
       );
       expect(
         _describe(
-          const Exit<int, String>.defect('unexpected', StackTrace.empty),
+          const Exit<int, String>.failure(
+            Cause.defect('unexpected', StackTrace.empty),
+          ),
         ),
         'Unexpected: unexpected',
       );
       expect(
-        _describe(const Exit<int, String>.cancelled(reason: 'shutdown')),
+        _describe(
+          const Exit<int, String>.failure(Cause.cancelled(reason: 'shutdown')),
+        ),
         'Cancelled: shutdown',
       );
+      final cause = Cause<String>.combine([
+        const Cause.failure('invalid'),
+        const Cause.defect('cleanup failed', StackTrace.empty),
+      ]);
+      expect(_describe(Exit<int, String>.failure(cause)), '2 failure reasons.');
     });
 
-    test('named constructors support const values for all four cases', () {
+    test('supports const successful and unsuccessful exits', () {
       const Exit<int, String> success = Exit.success(42);
-      const Exit<int, String> failure = Exit.failure('invalid');
-      const Exit<int, String> defect = Exit.defect(
-        'unexpected',
-        StackTrace.empty,
-      );
-      const Exit<int, String> cancelled = Exit.cancelled();
+      const Exit<int, String> failure = Exit.failure(Cause.failure('invalid'));
 
       expect(success, same(const ExitSuccess<int, String>(42)));
-      expect(failure, same(const ExitFailure<int, String>('invalid')));
       expect(
-        defect,
-        same(const ExitDefect<int, String>('unexpected', StackTrace.empty)),
+        failure,
+        same(const ExitFailure<int, String>(Cause.failure('invalid'))),
       );
-      expect(cancelled, same(const ExitCancelled<int, String>()));
     });
 
-    for (final originalError in <Object>[
-      StateError('unexpected state'),
-      'a thrown value that is not an Exception',
-    ]) {
-      test('preserves a caught ${originalError.runtimeType} and its trace', () {
-        try {
-          throw originalError;
-        } catch (error, stackTrace) {
-          final Exit<int, String> exit = Exit.defect(error, stackTrace);
-
-          expect(
-            exit,
-            isA<ExitDefect<int, String>>()
-                .having((exit) => exit.error, 'error', same(originalError))
-                .having(
-                  (exit) => exit.stackTrace,
-                  'stackTrace',
-                  same(stackTrace),
-                ),
-          );
-        }
-      });
-    }
+    test('preserves every cause by reference', () {
+      final causes = <Cause<String>>[
+        const Cause.failure('invalid'),
+        Cause.defect(StateError('unexpected'), StackTrace.current),
+        Cause.cancelled(reason: Object()),
+      ];
+      for (final cause in [...causes, Cause<String>.combine(causes)]) {
+        final exit =
+            Exit<int, String>.failure(cause) as ExitFailure<int, String>;
+        expect(exit.cause, same(cause));
+      }
+    });
 
     test('converts a successful Result without copying its value', () {
       final value = Object();
       final Result<Object, String> result = Result.success(value);
       final Exit<Object, String> exit = Exit.fromResult(result);
 
-      expect(
-        exit,
-        isA<ExitSuccess<Object, String>>().having(
-          (exit) => exit.value,
-          'value',
-          same(value),
-        ),
-      );
+      expect((exit as ExitSuccess<Object, String>).value, same(value));
     });
 
     test('converts a failed Result without reclassifying its error', () {
       final error = StateError('an explicitly expected failure');
       final Result<int, StateError> result = Result.failure(error);
-      final Exit<int, StateError> exit = Exit.fromResult(result);
+      final exit = Exit.fromResult(result) as ExitFailure<int, StateError>;
 
-      expect(
-        exit,
-        isA<ExitFailure<int, StateError>>().having(
-          (exit) => exit.error,
-          'error',
-          same(error),
-        ),
-      );
+      expect((exit.cause as CauseFailure<StateError>).error, same(error));
     });
 
     test('preserves structured expected errors through Result conversion', () {
@@ -100,9 +77,9 @@ void main() {
 
       expect(switch (exit) {
         ExitSuccess(:final value) => '$value',
-        ExitFailure(:final error) => '${error.field}: ${error.message}',
-        ExitDefect() => 'unexpected failure',
-        ExitCancelled() => 'cancelled',
+        ExitFailure(cause: CauseFailure(:final error)) =>
+          '${error.field}: ${error.message}',
+        ExitFailure() => 'unexpected outcome',
       }, 'count: Expected an integer.');
     });
 
@@ -112,14 +89,6 @@ void main() {
 
       expect(_describe(Exit.fromResult(success)), 'Completed: null');
       expect(_describe(Exit.fromResult(failure)), 'Failed: null');
-      expect(
-        _describe(const Exit<int?, String?>.success(null)),
-        'Completed: null',
-      );
-      expect(
-        _describe(const Exit<int?, String?>.failure(null)),
-        'Failed: null',
-      );
     });
 
     test('supports successful operations without a return value', () {
@@ -129,45 +98,23 @@ void main() {
       expect(exit, isA<ExitSuccess<void, Never>>());
     });
 
-    test(
-      'keeps cancellation reasons separate from the expected error type',
-      () {
-        final reason = Object();
-        final Exit<Never, Never> cancelled = Exit.cancelled(reason: reason);
-
-        expect(
-          cancelled,
-          isA<ExitCancelled<Never, Never>>().having(
-            (exit) => exit.reason,
-            'reason',
-            same(reason),
-          ),
-        );
-        expect(
-          const Exit<Never, Never>.cancelled(),
-          isA<ExitCancelled<Never, Never>>().having(
-            (exit) => exit.reason,
-            'reason',
-            isNull,
-          ),
-        );
-      },
-    );
-
-    test('supports defects even when no expected failure is possible', () {
-      const Exit<Never, Never> exit = Exit.defect(
-        'unexpected',
-        StackTrace.empty,
+    test('supports defects and cancellation with no expected error type', () {
+      const Exit<Never, Never> defect = Exit.failure(
+        Cause.defect('unexpected', StackTrace.empty),
       );
+      const Exit<Never, Never> cancelled = Exit.failure(Cause.cancelled());
 
-      expect(_describe(exit), 'Unexpected: unexpected');
+      expect(_describe(defect), 'Unexpected: unexpected');
+      expect(_describe(cancelled), 'Cancelled: null');
     });
 
     test('preserves all cases when generic types are widened', () {
       const success = ExitSuccess<int, Never>(42);
-      const failure = ExitFailure<Never, String>('invalid');
-      const defect = ExitDefect<Never, Never>('unexpected', StackTrace.empty);
-      const cancelled = ExitCancelled<Never, Never>();
+      const failure = ExitFailure<Never, String>(Cause.failure('invalid'));
+      const defect = ExitFailure<Never, Never>(
+        Cause.defect('unexpected', StackTrace.empty),
+      );
+      const cancelled = ExitFailure<Never, Never>(Cause.cancelled());
       const Exit<num, Object> widenedSuccess = success;
       const Exit<int, Object> widenedFailure = failure;
       const Exit<int, String> widenedDefect = defect;
@@ -181,13 +128,22 @@ void main() {
       expect(_describe(widenedFailure), 'Failed: invalid');
       expect(_describe(widenedDefect), 'Unexpected: unexpected');
       expect(_describe(widenedCancellation), 'Cancelled: null');
+      final cause = Cause<Never>.combine([
+        const Cause.defect('cleanup', StackTrace.empty),
+        const Cause.cancelled(),
+      ]);
+      final Exit<int, String> widenedGroup = Exit<Never, Never>.failure(cause);
+      expect((widenedGroup as ExitFailure<int, String>).cause, same(cause));
+      expect(_describe(widenedGroup), '2 failure reasons.');
     });
   });
 }
 
 String _describe<T, E>(Exit<T, E> exit) => switch (exit) {
   ExitSuccess(:final value) => 'Completed: $value',
-  ExitFailure(:final error) => 'Failed: $error',
-  ExitDefect(:final error) => 'Unexpected: $error',
-  ExitCancelled(:final reason) => 'Cancelled: $reason',
+  ExitFailure(cause: CauseFailure(:final error)) => 'Failed: $error',
+  ExitFailure(cause: CauseDefect(:final error)) => 'Unexpected: $error',
+  ExitFailure(cause: CauseCancelled(:final reason)) => 'Cancelled: $reason',
+  ExitFailure(cause: CauseGroup(:final causes)) =>
+    '${causes.length} failure reasons.',
 };
