@@ -39,7 +39,7 @@ Future<void> main(List<String> arguments) async {
   }
 }
 
-enum _Chain { map, flatMap, mixed }
+enum _Chain { map, flatMap, mixed, mapError, recover }
 
 Task<int, String, ()> _build(int length, _Chain chain, bool failed) {
   var task = Task<int, String, ()>(
@@ -48,7 +48,13 @@ Task<int, String, ()> _build(int length, _Chain chain, bool failed) {
         : const Exit.success(0),
   );
   for (var i = 0; i < length; i++) {
-    if (chain == _Chain.map || chain == _Chain.mixed && i.isEven) {
+    if (chain == _Chain.mapError) {
+      task = task.mapError((error) => error);
+    } else if (chain == _Chain.recover) {
+      task = task.recover(
+        (error) => Task((_) => Exit.failure(Cause.failure(error))),
+      );
+    } else if (chain == _Chain.map || chain == _Chain.mixed && i.isEven) {
       task = task.map((value) => value + 1);
     } else {
       final asynchronous = chain == _Chain.mixed && i % 100 == 99;
@@ -74,9 +80,12 @@ Future<void> _measure(
 ) async {
   final iterations = math.max(20, 200000 ~/ math.max(20, length));
   final task = _build(length, chain, failed);
+  final expectedValue = chain == _Chain.mapError || chain == _Chain.recover
+      ? 0
+      : length;
   for (var i = 0; i < iterations; i++) {
     _built = _build(length, chain, failed);
-    _check(await task.run(()), length, failed);
+    _check(await task.run(()), expectedValue, failed);
   }
 
   final construction = <double>[];
@@ -91,13 +100,13 @@ Future<void> _measure(
     }
     timer.stop();
     construction.add(timer.elapsedMicroseconds / iterations);
-    _check(await _built.run(()), length, failed);
+    _check(await _built.run(()), expectedValue, failed);
 
     timer
       ..reset()
       ..start();
     for (var i = 0; i < iterations; i++) {
-      _check(await task.run(()), length, failed);
+      _check(await task.run(()), expectedValue, failed);
     }
     timer.stop();
     execution.add(timer.elapsedMicroseconds / iterations);
@@ -105,7 +114,7 @@ Future<void> _measure(
 
   var microtasks = 0;
   await runZoned(
-    () async => _check(await task.run(()), length, failed),
+    () async => _check(await task.run(()), expectedValue, failed),
     zoneSpecification: ZoneSpecification(
       scheduleMicrotask: (self, parent, zone, callback) {
         microtasks++;

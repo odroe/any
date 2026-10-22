@@ -53,22 +53,41 @@ final class Task<T, E, R> {
     : _computation = computation,
       _source = null,
       _transform = null,
-      _next = null;
+      _next = null,
+      _failure = null,
+      _recover = null;
 
   const Task._map(this._source, this._transform)
     : _computation = null,
-      _next = null;
+      _next = null,
+      _failure = null,
+      _recover = null;
 
   const Task._flatMap(this._source, this._next)
     : _computation = null,
-      _transform = null;
+      _transform = null,
+      _failure = null,
+      _recover = null;
+
+  const Task._mapError(this._source, this._transform, this._failure)
+    : _computation = null,
+      _next = null,
+      _recover = null;
+
+  const Task._recover(this._source, this._recover)
+    : _computation = null,
+      _transform = null,
+      _next = null,
+      _failure = null;
 
   // A leaf stores a computation; a composition stores a source and one callback.
   // These immutable nodes can be shared without copying the existing chain.
   final FutureOr<Exit<T, E>> Function(Context<R>)? _computation;
-  final Task<Object?, E, R>? _source;
+  final Task<Object?, Object?, R>? _source;
   final Exit<T, E> Function(Object?)? _transform;
   final Task<T, E, R> Function(Object?)? _next;
+  final Exit<T, E> Function(Cause<Object?>)? _failure;
+  final Task<T, E, R> Function(Object?)? _recover;
 
   /// Executes this task with [dependencies] and awaits its resource cleanup.
   ///
@@ -152,8 +171,9 @@ final class Task<T, E, R> {
   Future<Exit<T, E>> runIn(Context<R> context) async {
     // Defer entry once. Only computations returning a Future suspend the loop.
     await Future<void>.value();
-    Task<Object?, E, R> current = this;
-    List<Task<Object?, E, R>>? pending;
+    Task<Object?, Object?, R> current = this;
+    List<Task<Object?, Object?, R>>? pending;
+    var errorHandlers = 0;
     final cancellation = context.cancellation;
 
     try {
@@ -167,29 +187,56 @@ final class Task<T, E, R> {
 
         while (current._source != null) {
           (pending ??= []).add(current);
+          if (current._failure != null || current._recover != null) {
+            errorHandlers++;
+          }
           current = current._source;
         }
         final result = current._computation!(context);
-        var exit = result is Future<Exit<Object?, E>> ? await result : result;
+        var exit = result is Future<Exit<Object?, Object?>>
+            ? await result
+            : result;
 
         while (true) {
-          if (pending == null || pending.isEmpty) {
-            return _checkCancellation(exit as Exit<T, E>, cancellation);
+          if (pending == null ||
+              pending.isEmpty ||
+              exit is ExitFailure<Object?, Object?> && errorHandlers == 0) {
+            // A skipped success step can leave a different value type on a
+            // failure. Preserve already compatible exits, including leaf exits.
+            final typed = exit is Exit<T, E>
+                ? exit
+                : switch (exit) {
+                    ExitSuccess(:final value) => Exit<T, E>.success(value as T),
+                    ExitFailure(:final cause) => Exit<T, E>.failure(
+                      cause as Cause<E>,
+                    ),
+                  };
+            return _checkCancellation(typed, cancellation);
           }
-          if (exit is ExitFailure<Object?, E>) {
-            // Failure skips all pending steps, whose value types may differ.
-            return Exit.failure(exit.cause);
+          final step = pending.removeLast();
+          if (step._failure != null || step._recover != null) errorHandlers--;
+          if (exit is ExitFailure<Object?, Object?>) {
+            final failure = step._failure;
+            final recover = step._recover;
+            if (failure != null) {
+              exit = failure(exit.cause);
+            } else if (recover != null && !cancellation.isCancelled) {
+              if (exit.cause case CauseFailure(:final error)) {
+                current = recover(error);
+                break;
+              }
+            }
+            continue;
           }
           if (cancellation.isCancelled) {
             return Exit.failure(Cause.cancelled(reason: cancellation.reason));
           }
-          final step = pending.removeLast();
-          final value = (exit as ExitSuccess<Object?, E>).value;
+          final value = (exit as ExitSuccess<Object?, Object?>).value;
           final transform = step._transform;
           if (transform != null) {
             exit = transform(value);
-          } else {
-            current = step._next!(value);
+          } else if (step._next != null) {
+            current = step._next(value);
             break;
           }
         }
@@ -225,6 +272,37 @@ extension TaskComposition<T, E, R> on Task<T, E, R> {
   /// groups. A thrown object becomes a [CauseDefect] in the resulting exit.
   Task<U, E, R> flatMap<U>(Task<U, E, R> Function(T value) next) =>
       Task._flatMap(this, (value) => next(value as T));
+
+  /// A task that translates expected errors with [transform].
+  ///
+  /// Applies [Cause.mapError] to failed outcomes, including groups. Defect
+  /// objects, stack traces, cancellation reasons, and cause order are retained.
+  /// Successful values are unchanged. A thrown object from [transform] becomes
+  /// a defect. Resource cleanup happens later, when the shared scope closes.
+  ///
+  /// ```dart
+  /// final task = Task<int, String, ()>(
+  ///   (_) => const Exit.failure(Cause.failure('missing')),
+  /// ).mapError((error) => (operation: 'load', error: error));
+  /// ```
+  Task<T, F, R> mapError<F>(F Function(E error) transform) => Task._mapError(
+    this,
+    (value) => Exit.success(value as T),
+    (cause) => Exit.failure((cause as Cause<E>).mapError(transform)),
+  );
+
+  /// A task that runs [recover] for a single expected failure.
+  ///
+  /// Only a [CauseFailure] invokes [recover]. Success, defects, cancellation,
+  /// and groups pass through unchanged. Groups are not partially recovered:
+  /// doing so could hide other failures. The replacement task shares the same
+  /// context and scope; resources stay alive until the entire workflow ends.
+  ///
+  /// A pending cancellation request skips recovery and preserves the original
+  /// failure. A thrown object from [recover] becomes a defect. The error type
+  /// remains [E] because groups and replacement tasks can still fail.
+  Task<T, E, R> recover(Task<T, E, R> Function(E error) recover) =>
+      Task._recover(this, (error) => recover(error as E));
 }
 
 Exit<T, E> _checkCancellation<T, E>(Exit<T, E> exit, CancellationToken token) =>
