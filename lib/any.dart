@@ -59,3 +59,8 @@ export 'src/core/circuit_breaker.dart'
 export 'src/core/cache.dart' show Cache, CacheOperations;
 export 'src/core/logger.dart'
     show Logger, LogLevel, LogRecord, TaskLoggingOperations;
+export 'src/core/subscription_ref.dart'
+    show
+        SubscriptionRef,
+        SubscriptionRefOperations,
+        SubscriptionOverflowStrategy;
