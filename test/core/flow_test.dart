@@ -769,11 +769,13 @@ void main() {
           });
       final actual = _cause(await runtime.run(flow.drain()));
       expect(
-        _reasons(actual).map((reason) => switch (reason) {
-          CauseFailure(:final error) => error,
-          CauseCancelled(:final reason) => reason,
-          _ => fail('Unexpected cause: $reason'),
-        }),
+        _reasons(actual).map(
+          (reason) => switch (reason) {
+            CauseFailure(:final error) => error,
+            CauseCancelled(:final reason) => reason,
+            _ => fail('Unexpected cause: $reason'),
+          },
+        ),
         cause is CauseGroup ? ['a', 'b'] : ['explicit'],
       );
     }
