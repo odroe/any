@@ -13,7 +13,7 @@ import 'race_tasks.dart';
 /// Cleanup errors are never discarded. They follow the winning failure, if
 /// any, in input order; a winning success becomes a failure if cleanup fails.
 /// Finalizers receive their own child's outcome. Parent cancellation is
-/// forwarded to every child, and the parent's scope remains caller-owned.
+/// forwarded to unfinished children, and the parent's scope remains caller-owned.
 ///
 /// The finite input is enumerated once per run, before any child body starts.
 /// Creating the task does not access the input. An empty input or a thrown

@@ -7,7 +7,7 @@ import 'race_tasks.dart';
 /// An expected error, defect, or child cancellation does not stop the other
 /// candidates. The first successful body requests cancellation of the remaining
 /// children. All started bodies and cleanup are awaited, so noncooperative work
-/// can delay completion. Parent cancellation is forwarded to every child.
+/// can delay completion. Parent cancellation is forwarded to unfinished children.
 ///
 /// Each child owns a fresh [Scope] and shares dependencies by reference. After
 /// a success, unsuccessful body outcomes are discarded, but cleanup failures

@@ -7,10 +7,10 @@ Task<T, E, R> raceTasks<T, E, R>(
   Iterable<Task<T, E, R>> tasks, {
   required bool successOnly,
 }) => Task((context) async {
-  final controllers = <CancellationController>[];
+  final controllers = <CancellationController?>[];
   final removeListener = context.cancellation.onCancel((reason) {
     for (final controller in controllers) {
-      controller.cancel(reason: reason);
+      controller?.cancel(reason: reason);
     }
   });
   Exit<T, E>? winner;
@@ -22,7 +22,7 @@ Task<T, E, R> raceTasks<T, E, R>(
     if (winner != null) return;
     winner = exit;
     for (var index = 0; index < controllers.length; index++) {
-      if (index != winnerIndex) controllers[index].cancel();
+      if (index != winnerIndex) controllers[index]?.cancel();
     }
   }
 
@@ -32,7 +32,7 @@ Task<T, E, R> raceTasks<T, E, R>(
       Context(
         scope: scope,
         dependencies: context.dependencies,
-        cancellation: controllers[index].token,
+        cancellation: controllers[index]!.token,
         yieldEvery: context.yieldEvery,
       ),
     );
@@ -47,6 +47,8 @@ Task<T, E, R> raceTasks<T, E, R>(
       cleanup[index] = error.cause;
     } catch (error, stackTrace) {
       cleanup[index] = Cause.defect(error, stackTrace);
+    } finally {
+      controllers[index] = null;
     }
   }
 

@@ -6,6 +6,29 @@ import 'package:test/test.dart';
 
 void main() {
   test(
+    'finished candidates do not receive later winner cancellation',
+    () async {
+      CancellationToken? finishedToken;
+      var cleaned = false;
+      final task = firstSuccess([
+        Task<int, String, ()>((context) {
+          finishedToken = context.cancellation;
+          context.cancellation.onCancel((_) => fail('Already finished.'));
+          context.scope.addFinalizer((_) => cleaned = true);
+          return const Exit.failure(Cause.failure('earlier'));
+        }),
+        Task<int, String, ()>((_) async {
+          await Future<void>.delayed(Duration.zero);
+          expect(cleaned, isTrue);
+          return const Exit.success(1);
+        }),
+      ]);
+      expect((await task.run(()) as ExitSuccess).value, 1);
+      expect(finishedToken!.isCancelled, isFalse);
+    },
+  );
+
+  test(
     'expected errors, defects, and child cancellations allow later success',
     () async {
       final task = firstSuccess<int, String, ()>([
