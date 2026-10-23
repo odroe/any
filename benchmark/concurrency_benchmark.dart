@@ -37,7 +37,20 @@ Future<void> main(List<String> arguments) async {
       _check(await all(List.filled(count, task), concurrency: 8).run(()));
     },
     'all_settled_8': () async {
-      _check(await allSettled(List.filled(count, task), concurrency: 8).run(()));
+      _check(
+        await allSettled(List.filled(count, task), concurrency: 8).run(()),
+      );
+    },
+    'fork_join': () async {
+      _check(
+        await taskGroup<void, Never, ()>((group) async {
+          final children = [for (var i = 0; i < count; i++) group.fork(task)];
+          for (final child in children) {
+            _check(await child.join());
+          }
+          return const Exit.success(null);
+        }).run(()),
+      );
     },
   };
   print(
