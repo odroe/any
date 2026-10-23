@@ -9,6 +9,43 @@ List<Cause<Object?>> reasons(Cause<Object?> cause) => switch (cause) {
 };
 
 void main() {
+  for (final duringFactory in [false, true]) {
+    test(
+      'application finalizers cannot await their own runtime (factory: $duringFactory)',
+      () async {
+        late Runtime owner;
+        Exit<void, Never>? attempted;
+        final key = ServiceKey<Object>('resource');
+        final built = await Runtime.create(
+          key.layer(
+            Task.acquireRelease(
+              Task.sync(Object.new),
+              release: (_, _) {
+                final early = duringFactory ? owner.close() : null;
+                return Task.fromFuture<Exit<void, Never>, Never>(
+                  () => early ?? owner.close(),
+                  onError: Error.throwWithStackTrace,
+                ).map((exit) {
+                  attempted = exit;
+                });
+              },
+            ),
+          ),
+        );
+        owner = (built as ExitSuccess<Runtime, Never>).value;
+        expect(await owner.close(), isA<ExitSuccess<void, Never>>());
+        expect(attempted, isA<ExitFailure<void, Never>>());
+        expect(
+          reasons((attempted as ExitFailure).cause)
+              .whereType<CauseDefect>()
+              .single
+              .error,
+          isA<StateError>(),
+        );
+      },
+    );
+  }
+
   test(
     'scope cancellation forwards its original reason to owned fibers',
     () async {

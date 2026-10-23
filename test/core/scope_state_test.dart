@@ -36,6 +36,39 @@ void main() {
     expect(await runtime.close(), isA<ExitSuccess<void, Never>>());
   });
 
+  test(
+    'close dependencies detect waits without taking resource ownership',
+    () async {
+      final owner = scopes.createScope();
+      final leased = scopes.createScope();
+      final unrelated = scopes.createScope();
+      var released = false;
+      add(leased, (_) => Task.sync(() => released = true));
+      final first = scopes.addScopeCloseDependency(owner, leased);
+      final second = scopes.addScopeCloseDependency(owner, leased);
+      final cycle = scopes.addScopeCloseDependency(leased, owner);
+      expect(scopes.scopeCloseWouldDeadlock(owner, leased), isTrue);
+      expect(scopes.scopeCloseWouldDeadlock(owner, unrelated), isFalse);
+      first();
+      first();
+      expect(scopes.scopeCloseWouldDeadlock(owner, leased), isTrue);
+      second();
+      expect(scopes.scopeCloseWouldDeadlock(owner, leased), isFalse);
+      cycle();
+      final detach = scopes.addScopeCloseDependency(owner, leased);
+      await scopes.closeScope(owner, const Exit.success(null));
+      expect(released, isFalse);
+      expect(
+        () => scopes.addScopeCloseDependency(owner, leased),
+        throwsStateError,
+      );
+      detach();
+      await scopes.closeScope(leased, const Exit.success(null));
+      expect(released, isTrue);
+      await scopes.closeScope(unrelated, const Exit.success(null));
+    },
+  );
+
   test('finalizers run in LIFO order and all are attempted', () async {
     final scope = scopes.createScope();
     final events = <int>[];

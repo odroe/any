@@ -163,12 +163,16 @@ final class Runtime {
   /// included in the closing result, including resource cleanup failures.
   /// Non-cancellable Futures must settle before closing can finish.
   ///
-  /// A task owned by this runtime cannot wait for the runtime to close itself.
+  /// A task or finalizer whose completion this runtime must await cannot close
+  /// it, including a task holding a scoped resource lease from another runtime.
   /// Such a call returns a [StateError] defect instead of starting a deadlock.
   Future<Exit<void, Never>> close() {
     if (currentFibers().any(
-      (fiber) => fiberIsActive(fiber) && scopeOwnsFiber(_scope, fiber),
-    )) {
+          (fiber) => fiberIsActive(fiber) && scopeWaitsForFiber(_scope, fiber),
+        ) ||
+        currentFinalizingScopes().any(
+          (scope) => scopeCloseWouldDeadlock(_scope, scope),
+        )) {
       return Future.value(
         Exit.failure(
           Cause.defect(

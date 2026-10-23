@@ -31,6 +31,7 @@ final class Scope {
   Scope? _parent;
   final _children = <Scope>{};
   final _fibers = <Fiber<Object?, Object?>>{};
+  final _closeDependencies = <Object, Scope>{};
   final _finalizers = <_Finalizer>[];
   _Closing? _closing;
 }
@@ -48,15 +49,31 @@ void detachScopeFiber(Scope scope, Fiber<Object?, Object?> fiber) {
   scope._fibers.remove(fiber);
 }
 
-// Fiber root scopes are separate cleanup trees but remain part of the owner's
-// lifetime. Follow both edge kinds when checking whether a wait owns its caller.
-bool scopeOwnsFiber(Scope scope, Fiber<Object?, Object?> target) {
+// Fiber roots and leased resources are separate cleanup trees. Their lifetime
+// dependencies still participate in self-wait detection without transferring
+// cancellation or resource ownership.
+void Function() addScopeCloseDependency(Scope owner, Scope dependency) {
+  if (owner._closing != null) {
+    throw StateError('Cannot add a dependency to a closing or closed scope.');
+  }
+  final token = Object();
+  owner._closeDependencies[token] = dependency;
+  return () => owner._closeDependencies.remove(token);
+}
+
+bool scopeWaitsForFiber(Scope scope, Fiber<Object?, Object?> target) {
   final pending = <Scope>[scope];
+  final visited = <Scope>{};
   while (pending.isNotEmpty) {
     final current = pending.removeLast();
+    if (!visited.add(current)) continue;
     if (current._fibers.contains(target)) return true;
     pending.addAll(current._children);
     pending.addAll(current._fibers.map(fiberScope));
+    for (final dependency in current._closeDependencies.values) {
+      if (scopeContains(fiberScope(target), dependency)) return true;
+      pending.add(dependency);
+    }
   }
   return false;
 }
@@ -113,14 +130,39 @@ bool scopeContains(Scope ancestor, Scope descendant) {
 // A finalizer also cannot await a sibling queued behind it by the same driver.
 bool scopeCloseWouldDeadlock(Scope target, Scope current) {
   if (target._closing?.completion.isCompleted ?? false) return false;
-  if (scopeContains(target, current)) return true;
-  final targetOwner = target._closing?.owner;
-  if (targetOwner == null) return false;
-  for (Scope? scope = current; scope != null; scope = scope._parent) {
-    if (identical(scope._closing?.owner, targetOwner)) return true;
+  final pending = <Scope>[target];
+  final visited = <Scope>{};
+  while (pending.isNotEmpty) {
+    final candidate = pending.removeLast();
+    if (!visited.add(candidate)) continue;
+    if (scopeContains(candidate, current)) return true;
+    final owner = candidate._closing?.owner;
+    if (owner != null) {
+      for (Scope? scope = current; scope != null; scope = scope._parent) {
+        if (identical(scope._closing?.owner, owner)) return true;
+      }
+    }
+    pending.addAll(candidate._children);
+    pending.addAll(candidate._fibers.map(fiberScope));
+    pending.addAll(candidate._closeDependencies.values);
   }
   return false;
 }
+
+final _finalizingScopes = Object();
+
+List<Scope> currentFinalizingScopes() =>
+    Zone.current[_finalizingScopes] as List<Scope>? ?? const [];
+
+T inScopeFinalizer<T>(Scope scope, T Function() run) => runZoned(
+  run,
+  zoneValues: {
+    _finalizingScopes: List<Scope>.unmodifiable([
+      ...currentFinalizingScopes(),
+      scope,
+    ]),
+  },
+);
 
 /// Registers [finalizer], or runs it immediately if [scope] has closed.
 ///

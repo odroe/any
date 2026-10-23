@@ -823,7 +823,7 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
             if (fiberIsActive(target) &&
                 fiber != null &&
                 (identical(target, fiber) ||
-                    scopeOwnsFiber(fiberScope(target), fiber) ||
+                    scopeWaitsForFiber(fiberScope(target), fiber) ||
                     currentFibers().contains(target))) {
               throw StateError(
                 'A fiber cannot wait for itself or an active ancestor.',
@@ -928,16 +928,23 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
             final zone = Zone.current;
             final services = currentContext;
             final localValues = currentLocals;
+            final registrationScope = currentScope;
             final pending = addScopeFinalizer(
               currentScope,
-              (exit) => zone.run(() => finalizer(exit)),
+              (exit) => zone.run(
+                () =>
+                    inScopeFinalizer(registrationScope, () => finalizer(exit)),
+              ),
               runFinalizer: (task, scope) => zone.run(
-                () => evaluateTask(
-                  task,
-                  closingScopes: [...closingScopes, scope],
-                  fiber: fiber,
-                  context: services,
-                  locals: localValues,
+                () => inScopeFinalizer(
+                  scope,
+                  () => evaluateTask(
+                    task,
+                    closingScopes: [...closingScopes, scope],
+                    fiber: fiber,
+                    context: services,
+                    locals: localValues,
+                  ),
                 ),
               ),
             );
@@ -1001,7 +1008,7 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
                     [fiber, ...currentFibers()].any(
                       (member) =>
                           fiberIsActive(member) &&
-                          scopeOwnsFiber(scope, member),
+                          scopeWaitsForFiber(scope, member),
                     )) ||
                 closingScopes.any(
                   (owner) => scopeCloseWouldDeadlock(scope, owner),
