@@ -43,3 +43,5 @@ export 'src/core/layer.dart'
         InfallibleLayerOperations,
         ServiceLayerOperations,
         TaskLayerOperations;
+export 'src/core/metric.dart'
+    show Metric, Counter, Gauge, Histogram, MetricRegistry, MetricSnapshot;
