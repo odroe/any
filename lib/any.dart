@@ -18,3 +18,4 @@ export 'src/core/context.dart'
 export 'src/core/task.dart' show Task, TaskOperations, InfallibleTaskOperations;
 export 'src/core/runtime.dart' show Runtime, RuntimeClosed, TaskException;
 export 'src/core/random_source.dart' show RandomSource;
+export 'src/core/redacted.dart' show Redacted;
