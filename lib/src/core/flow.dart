@@ -150,7 +150,9 @@ extension FlowOperations<T, E> on Flow<T, E> {
   /// By default, results retain input order. Set [preserveOrder] to false to
   /// emit them in completion order. Input is always pulled sequentially. The
   /// limit includes running tasks, completed results awaiting delivery, and the
-  /// element being consumed. With the default limit of one there is no prefetch.
+  /// last delivered element until downstream requests another. With the default
+  /// limit of one there is no prefetch. Downstream buffering retains its own
+  /// resource leases without continuing to occupy this mapping's limit.
   ///
   /// Each result has a scope for resources acquired by its mapping task and
   /// downstream callbacks. They are released after that element is consumed,
@@ -248,7 +250,7 @@ extension FlowOperations<T, E> on Flow<T, E> {
       return _Cursor(
         next(),
         () => inner?.scope ?? source.scope,
-        source.close,
+        source.finish,
         () => [...source._producers(), ...?inner?._producers()],
       );
     }),
@@ -270,6 +272,28 @@ extension FlowOperations<T, E> on Flow<T, E> {
         );
       });
 
+  /// Collects consecutive elements into immutable lists of at most [size].
+  ///
+  /// A normal end emits the last partial group. Failure discards a partial group
+  /// and releases its resources. Each group's input resources remain alive until
+  /// that group is consumed, including when upstream mapping or recovery moves
+  /// to another producer. This operation retains at most [size] input elements
+  /// per group under construction, in addition to groups retained downstream.
+  ///
+  /// [size] must be positive; invalid values become [RangeError] defects before
+  /// opening the source.
+  Flow<List<T>, E> grouped(int size) => Flow._(
+    Task.defer(() {
+      if (size < 1) throw RangeError.range(size, 1, null, 'size');
+      return Scope.open().withError<E>().flatMap(
+        (owner) => inTaskScope(
+          _open,
+          owner,
+        ).map((source) => _Grouped(source, owner, size).cursor),
+      );
+    }),
+  );
+
   /// Emits at most [count] elements, then closes the upstream producer.
   ///
   /// Zero does not open the upstream flow. Negative counts become [RangeError]
@@ -284,14 +308,14 @@ extension FlowOperations<T, E> on Flow<T, E> {
         final pull = Task.defer(() {
           if (remaining == 0) {
             return source
-                .close(const Exit.success(null))
+                .finish(const Exit.success(null))
                 .withError<E>()
                 .map((_) => const Option<Never>.none());
           }
           remaining--;
           return source.pull();
         });
-        return _Cursor(pull, source._scope, source.close, source._producers);
+        return _Cursor(pull, source._scope, source.finish, source._producers);
       });
     }),
   );
@@ -313,7 +337,7 @@ extension FlowOperations<T, E> on Flow<T, E> {
             return next();
           }),
         );
-        return _Cursor(next(), source._scope, source.close, source._producers);
+        return _Cursor(next(), source._scope, source.finish, source._producers);
       });
     }),
   );
@@ -325,7 +349,7 @@ extension FlowOperations<T, E> on Flow<T, E> {
       if (item case OptionSome(:final value)) {
         if (!test(value)) {
           return source
-              .close(const Exit.success(null))
+              .finish(const Exit.success(null))
               .withError<E>()
               .map((_) => const Option<Never>.none());
         }
@@ -341,7 +365,7 @@ extension FlowOperations<T, E> on Flow<T, E> {
         return Task.defer(() {
           if (stopped) {
             return source
-                .close(const Exit.success(null))
+                .finish(const Exit.success(null))
                 .withError<E>()
                 .map((_) => const Option<Never>.none());
           }
@@ -376,7 +400,7 @@ extension FlowOperations<T, E> on Flow<T, E> {
         return _Cursor(
           pull,
           () => current.scope,
-          (exit) => Task.defer(() => current.close(exit)),
+          (exit) => Task.defer(() => current.finish(exit)),
           () => current._producers(),
         );
       }),
@@ -393,7 +417,7 @@ extension FlowOperations<T, E> on Flow<T, E> {
           (source) => _Cursor(
             source.pull().mapError(transform),
             source._scope,
-            source.close,
+            source.finish,
             source._producers,
           ),
         ),
@@ -401,10 +425,15 @@ extension FlowOperations<T, E> on Flow<T, E> {
 
   /// Replaces one single business failure with the flow returned by [recover].
   ///
-  /// The failed producer finishes cleanup before recovery is considered.
-  /// Defects, cancellation, and grouped causes bypass recovery, including a
-  /// business failure combined with a cleanup defect. Errors from the replacement
-  /// flow are not recovered again. Already delivered elements remain delivered.
+  /// The failed producer is retired before recovery is considered. Resources
+  /// still used by elements retained downstream remain alive until those
+  /// elements are released. Their later cleanup failures propagate to consumption
+  /// and cannot be handled by this recovery. Other cleanup finishes before the
+  /// replacement starts; a cleanup defect then prevents recovery.
+  ///
+  /// Defects, cancellation, and grouped causes bypass recovery. Errors from the
+  /// replacement flow are not recovered again. Already delivered elements remain
+  /// delivered.
   Flow<T, E> recover(Flow<T, E> Function(E error) recover) => Flow._(
     accessTaskEnvironment(
       (owner, _) => _open.map((opened) {
@@ -414,10 +443,10 @@ extension FlowOperations<T, E> on Flow<T, E> {
           () => current.pull().recover((error) {
             if (replaced) return Task.fail(error);
             final failed = Exit<Object?, E>.failure(Cause.failure(error));
-            // Lease waits remain cancellable; Scope.close itself waits for all
-            // cleanup. Add the body failure before considering recovery.
+            // Retire production without waiting on values held downstream.
+            // Immediate cleanup failures join the body before recovery.
             return current
-                .close(failed)
+                .finish(failed)
                 .withError<E>()
                 .mapCause(
                   (cause) => Cause.combine([Cause.failure(error), cause]),
@@ -437,7 +466,7 @@ extension FlowOperations<T, E> on Flow<T, E> {
         return _Cursor(
           pull,
           () => current.scope,
-          (exit) => Task.defer(() => current.close(exit)),
+          (exit) => Task.defer(() => current.finish(exit)),
           () => current._producers(),
         );
       }),
@@ -554,7 +583,7 @@ Flow<U, E> _transform<T, U, E>(
     (source) => _Cursor(
       transform(source),
       source._scope,
-      source.close,
+      source.finish,
       source._producers,
     ),
   ),
@@ -565,9 +594,9 @@ Task<_Cursor<T, E>, E> _openCursor<T, E>(Task<Task<Option<T>, E>, E> open) =>
       final producer = _Producer(scope);
       Task<Option<T>, E>? next;
       var closed = false;
-      Task<void, Never> close(Exit<Object?, Object?> exit) => Task.defer(() {
+      Task<void, Never> finish(Exit<Object?, Object?> exit) => Task.defer(() {
         closed = true;
-        return producer.close(exit);
+        return producer.finish(exit);
       });
       final pull = Task.defer(() {
         if (closed) return Task.succeed(const Option<Never>.none());
@@ -588,17 +617,18 @@ Task<_Cursor<T, E>, E> _openCursor<T, E>(Task<Task<Option<T>, E>, E> open) =>
               .map((_) => item);
         });
       });
-      return _Cursor(pull, () => scope, close, () => [producer]);
+      return _Cursor(pull, () => scope, finish, () => [producer]);
     });
 
-// Transformations share their producer's lifetime. Composite flows expose the
-// currently active producer so downstream acquisitions release before its inputs.
+// A pull acknowledges the preceding delivery; its transport slot can be reused.
+// Operators retaining values must retain this resource snapshot before pulling
+// again. Finishing production retires scopes without waiting on downstream leases.
 final class _Cursor<T, E> {
-  _Cursor(this._pull, this._scope, this.close, this._producers);
+  _Cursor(this._pull, this._scope, this.finish, this._producers);
 
   final Task<Option<T>, E> _pull;
   final Scope Function() _scope;
-  final Task<void, Never> Function(Exit<Object?, Object?> exit) close;
+  final Task<void, Never> Function(Exit<Object?, Object?> exit) finish;
   final List<_Producer> Function() _producers;
 
   Scope get scope => _scope();
@@ -880,7 +910,6 @@ final class _Producer {
   afterClose;
   var _leases = 0;
   Exit<Object?, Object?>? _exit;
-  Completer<void>? _released;
   Future<TaskEvaluation<void, Never>>? _closing;
 
   void retain() {
@@ -890,25 +919,10 @@ final class _Producer {
 
   Task<void, Never> finish(Exit<Object?, Object?> exit) => Task.defer(() {
     _exit ??= exit;
+    // An enclosing Scope close already owns this cleanup. Waiting from one of
+    // its finalizers could wait on a sibling queued behind that same finalizer.
+    if (_closing == null && scopeIsClosing(scope)) return Task.succeed(null);
     return _leases == 0 ? _closeTask() : Task.succeed(null);
-  });
-
-  Task<void, Never> close(Exit<Object?, Object?> exit) => Task.defer(() {
-    _exit ??= exit;
-    return waitForLeases().flatMap((_) => _closeTask());
-  });
-
-  Task<void, Never> waitForLeases() => Task.defer(() {
-    if (_leases == 0) return Task.succeed(null);
-    return Task.fromCallback<void, Never>((complete) {
-      var active = true;
-      (_released ??= Completer<void>()).future.then((_) {
-        if (active) complete(const Exit.success(null));
-      });
-      return () {
-        active = false;
-      };
-    });
   });
 
   Task<void, Never> _closeTask() => Task.uninterruptibleMask(
@@ -927,9 +941,7 @@ final class _Producer {
     if (_leases != 0) {
       return Future.value(const TaskEvaluation(Exit.success(null), []));
     }
-    _released?.complete();
-    _released = null;
-    return _exit == null
+    return _exit == null || (_closing == null && scopeIsClosing(scope))
         ? Future.value(const TaskEvaluation(Exit.success(null), []))
         : _closeNow();
   }
@@ -967,7 +979,9 @@ final class _ConcurrentMap<T, U, E> {
   final int concurrency;
   final bool preserveOrder;
   final _stopReason = Object();
-  final _entries = <_MapEntry<U, E>>{};
+  final _admitted = <_MapEntry<U, E>>{};
+  final _resources = <_MapEntry<U, E>>{};
+  late final _lifetime = _Producer(owner);
   final _ordered = Queue<_MapEntry<U, E>>();
   final _ready = Queue<_MapEntry<U, E>>();
   final _failures = <TaskEvaluation<Object?, E>>[];
@@ -984,7 +998,7 @@ final class _ConcurrentMap<T, U, E> {
   late final cursor = _Cursor<U, E>(
     _pull(),
     () => _current?.producer.scope ?? owner,
-    _close,
+    _finish,
     () => [if (_current case final current?) current.producer],
   );
 
@@ -992,10 +1006,14 @@ final class _ConcurrentMap<T, U, E> {
     final previous = _current;
     if (previous != null) {
       _current = null;
+      _admitted.remove(previous);
       return previous.producer
           .finish(const Exit.success(null))
           .withError<E>()
-          .flatMap((_) => _pull());
+          .flatMap((_) {
+            _notify();
+            return _pull();
+          });
     }
     if (!_started) {
       _started = true;
@@ -1037,9 +1055,9 @@ final class _ConcurrentMap<T, U, E> {
         Option.some((entry.result!.exit as ExitSuccess<U, E>).value),
       );
     }
-    if (_ended && _entries.isEmpty && _driverDone) {
-      return owner
-          .close(const Exit.success(null))
+    if (_ended && _admitted.isEmpty && _driverDone) {
+      return _lifetime
+          .finish(const Exit.success(null))
           .withError<E>()
           .map((_) => const Option.none());
     }
@@ -1048,7 +1066,7 @@ final class _ConcurrentMap<T, U, E> {
 
   Task<void, E> _produce() => Task.defer(() {
     if (_stopping || _ended) return Task.succeed(null);
-    if (_entries.length >= concurrency) {
+    if (_admitted.length >= concurrency) {
       return Task.fromCallback<void, Never>((complete) {
         void notify() {
           _driverWake = null;
@@ -1056,7 +1074,7 @@ final class _ConcurrentMap<T, U, E> {
         }
 
         _driverWake = notify;
-        if (_stopping || _entries.length < concurrency) notify();
+        if (_stopping || _admitted.length < concurrency) notify();
         return () {
           if (identical(_driverWake, notify)) _driverWake = null;
         };
@@ -1075,6 +1093,7 @@ final class _ConcurrentMap<T, U, E> {
         for (final input in inputs) {
           input.retain();
         }
+        _lifetime.retain();
         late final _MapEntry<U, E> entry;
         final producer = _Producer(
           scope,
@@ -1083,13 +1102,14 @@ final class _ConcurrentMap<T, U, E> {
             for (final input in inputs.reversed) {
               results.add(await input.release());
             }
-            _entries.remove(entry);
-            _notify();
+            _resources.remove(entry);
+            results.add(await _lifetime.release());
             return _mergeEvaluations(results);
           },
         );
         entry = _MapEntry(producer);
-        _entries.add(entry);
+        _admitted.add(entry);
+        _resources.add(entry);
         _ordered.addLast(entry);
         return entry;
       }).withError<E>().flatMap(
@@ -1126,7 +1146,7 @@ final class _ConcurrentMap<T, U, E> {
     if (_stopping) return _driverDone && _active.isEmpty;
     final ready = preserveOrder ? _ordered : _ready;
     return (ready.isNotEmpty && ready.first.result != null) ||
-        (_ended && _entries.isEmpty && _driverDone);
+        (_ended && _admitted.isEmpty && _driverDone);
   }
 
   Task<void, Never> _wait() => Task.fromCallback((complete) {
@@ -1157,27 +1177,30 @@ final class _ConcurrentMap<T, U, E> {
     _notify();
   }
 
-  Task<void, Never> _close(Exit<Object?, Object?> exit) => Task.defer(() {
+  Task<void, Never> _finish(Exit<Object?, Object?> exit) => Task.defer(() {
     _stop();
     if (_started && (!_driverDone || _active.isNotEmpty)) {
-      return _wait().flatMap((_) => _close(exit));
+      return _wait().flatMap((_) => _finish(exit));
     }
-    final entries = _entries.toList().reversed.toList();
-    Task<void, Never> closeAt(int index) => Task.defer(
+    final entries = _resources.toList().reversed.toList();
+    _admitted.clear();
+    _ordered.clear();
+    _ready.clear();
+    _current = null;
+    Task<void, Never> finishAt(int index) => Task.defer(
       () => index == entries.length
-          ? owner.close(exit)
-          : entries[index].producer.waitForLeases().flatMap(
-              (_) => closeAt(index + 1),
-            ),
+          ? _lifetime.finish(exit)
+          : entries[index].producer.finish(exit).ensuring(finishAt(index + 1)),
     );
-    return closeAt(0);
+    return finishAt(0);
   });
 
   Task<void, Never> cleanup(Exit<Object?, Object?> exit) => Task.defer(() {
     // Scope has already stopped every worker and closed the producer tree.
     // Waiting for leases here would wait on resources this same scope owns.
     _stop();
-    _entries.clear();
+    _admitted.clear();
+    _resources.clear();
     _ordered.clear();
     _ready.clear();
     _current = null;
@@ -1259,4 +1282,112 @@ TaskEvaluation<void, Never> _mergeEvaluations(
         : Exit.failure(Cause.combine(causes)),
     List.unmodifiable(events),
   );
+}
+
+final class _Grouped<T, E> {
+  _Grouped(this.source, this.owner, this.size);
+
+  final _Cursor<T, E> source;
+  final Scope owner;
+  final int size;
+  late final _lifetime = _Producer(owner);
+  final _values = <T>[];
+  final _inputs = <_Producer>[];
+  _Producer? _current;
+  var _ended = false;
+
+  late final cursor = _Cursor<List<T>, E>(
+    _pull(),
+    () => _current?.scope ?? owner,
+    _finish,
+    () => [?_current],
+  );
+
+  Task<Option<List<T>>, E> _pull() => Task.defer(() {
+    final previous = _current;
+    if (previous != null) {
+      _current = null;
+      return previous
+          .finish(const Exit.success(null))
+          .withError<E>()
+          .flatMap((_) => _pull());
+    }
+    if (_ended) {
+      return _lifetime
+          .finish(const Exit.success(null))
+          .withError<E>()
+          .map((_) => const Option.none());
+    }
+    return _collect().onExit(
+      (exit) => exit is ExitFailure ? _finish(exit) : Task.succeed(null),
+    );
+  });
+
+  Task<Option<List<T>>, E> _collect() => Task.defer(
+    () => source.pull().flatMap((item) {
+      if (item case OptionSome(:final value)) {
+        final inputs = source._producers().toSet();
+        for (final producer in inputs) {
+          producer.retain();
+          _inputs.add(producer);
+        }
+        _values.add(value);
+        if (_values.length < size) return _collect();
+        return Task.succeed(Option.some(_emit()));
+      }
+      _ended = true;
+      if (_values.isNotEmpty) return Task.succeed(Option.some(_emit()));
+      return _lifetime
+          .finish(const Exit.success(null))
+          .withError<E>()
+          .map((_) => const Option.none());
+    }),
+  );
+
+  List<T> _emit() {
+    final values = List<T>.unmodifiable(_values);
+    final inputs = _inputs.toList();
+    _values.clear();
+    _inputs.clear();
+    final scope = createScope(parent: owner);
+    _lifetime.retain();
+    _current = _Producer(
+      scope,
+      afterClose: (_) async {
+        final released = await _releaseProducers(inputs);
+        return _mergeEvaluations([released, await _lifetime.release()]);
+      },
+    );
+    return values;
+  }
+
+  Task<void, Never> _finish(Exit<Object?, Object?> exit) => Task.defer(() {
+    _ended = true;
+    final current = _current;
+    _current = null;
+    final inputs = _inputs.toList();
+    _inputs.clear();
+    _values.clear();
+    final release = Task.uninterruptibleMask<void, Never>(
+      (_) => Task.fromFuture(
+        () => _releaseProducers(inputs),
+        onError: Error.throwWithStackTrace,
+      ).flatMap(taskFromEvaluation),
+    );
+    return source
+        .finish(exit)
+        .ensuring(current?.finish(exit) ?? Task.succeed(null))
+        .ensuring(release)
+        .ensuring(_lifetime.finish(exit));
+  });
+}
+
+Future<TaskEvaluation<void, Never>> _releaseProducers(
+  List<_Producer> producers,
+) async {
+  final results = <TaskEvaluation<void, Never>>[];
+  for (final producer in producers.reversed) {
+    results.add(await producer.release());
+  }
+  return _mergeEvaluations(results);
 }

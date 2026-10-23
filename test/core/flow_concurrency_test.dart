@@ -434,7 +434,7 @@ void main() {
   );
 
   test(
-    'recovery can wait for a lease while completed output advances',
+    'recovery retires a producer while completed output holds its lease',
     () async {
       final events = <String>[];
       final mapperGate = Completer<int>();
@@ -468,15 +468,15 @@ void main() {
             .forEach((value) => Task.sync(() => events.add('consume $value'))),
       );
       await _until(() => mapperStarted && pulls == 2);
-      expect(events, isEmpty);
+      expect(events, ['recover']);
       mapperGate.complete(1);
       expect(await running, isA<ExitSuccess>());
-      expect(events, ['consume 1', 'release', 'recover', 'consume 2']);
+      expect(events, ['recover', 'consume 1', 'release', 'consume 2']);
     },
   );
 
   test(
-    'cancelling recovery waiting for a leased producer cannot deadlock',
+    'cancelling after recovery releases all retired producer resources',
     () async {
       final controller = CancellationController();
       var pulls = 0;
@@ -514,7 +514,7 @@ void main() {
             .toList(),
         signal: controller.signal,
       );
-      await _until(() => started && pulls == 2);
+      await _until(() => started && pulls == 2 && recovered);
       controller.requestCancel(reason: 'cancel recovery');
       expect(
         _causes(_cause(await running))
@@ -524,7 +524,7 @@ void main() {
         'cancel recovery',
       );
       expect(released, isTrue);
-      expect(recovered, isFalse);
+      expect(recovered, isTrue);
     },
   );
 
