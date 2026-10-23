@@ -66,6 +66,37 @@ final class Task<T, E> {
     Future<T> Function() create, {
     required E Function(Object error, StackTrace stackTrace) onError,
   }) => Task._(_FromFuture(create, onError));
+
+  /// Registers a callback operation each time this task executes.
+  ///
+  /// [register] receives a completion callback and synchronously returns a
+  /// cancellation function. The first completion wins; duplicate and late
+  /// completions are ignored. A registration exception becomes a defect, even
+  /// if completion was already called synchronously. If that completion failed,
+  /// its cause is retained before the registration defect.
+  ///
+  /// Cancellation waits for the returned function to stop using resources and
+  /// finish cleanup. Cancellation during registration waits for [register] to
+  /// return before calling that function. An operation that completed before
+  /// cancellation does not receive a cancellation call. Cleanup exceptions keep
+  /// their original object and stack trace alongside cancellation. Cleanup runs
+  /// in the Zone where registration executed, including after asynchronous gaps.
+  static Task<T, E> fromCallback<T, E>(
+    FutureOr<void> Function() Function(void Function(Exit<T, E> exit) complete)
+    register,
+  ) => Task._(_FromCallback((complete) => register(complete)));
+
+  /// Checks for owner cancellation when this task executes.
+  ///
+  /// Succeeds with no value if cancellation has not been requested. A request
+  /// terminates execution before the next business callback can start.
+  static Task<void, Never> checkCancelled() => const Task._(_Success(null));
+
+  /// Yields to the event loop before continuing with the next task.
+  ///
+  /// Timers and other ready work can advance. Cancellation received while
+  /// yielding terminates execution before the next business callback starts.
+  static Task<void, Never> yieldNow() => const Task._(_Yield());
 }
 
 /// Transforms and combines tasks using their static value and error types.
@@ -240,6 +271,24 @@ Future<Exit<T, E>> evaluateTask<T, E>(
                   : Cause.failure(onError(error, stackTrace));
             }
             evaluating = false;
+          case _FromCallback(:final register):
+            final pending = _runCallback(register, signal);
+            final exit = pending is Future<Exit<Object?, Object?>>
+                ? await pending
+                : pending;
+            switch (exit) {
+              case ExitSuccess(value: final result):
+                value = result;
+                failure = null;
+              case ExitFailure(:final cause):
+                failure = cause;
+            }
+            evaluating = false;
+          case _Yield():
+            await Future<void>.delayed(Duration.zero);
+            value = null;
+            failure = null;
+            evaluating = false;
           case _Continue(:final source, :final frame):
             frames.add(frame);
             current = source;
@@ -278,6 +327,81 @@ Future<Exit<T, E>> evaluateTask<T, E>(
     }
   }
 }
+
+FutureOr<Exit<Object?, Object?>> _runCallback(
+  _RegisterCallback register,
+  CancellationSignal? signal,
+) {
+  final zone = Zone.current;
+  final completion = Completer<Exit<Object?, Object?>>();
+  Exit<Object?, Object?>? completed;
+  Exit<Object?, Object?>? settled;
+  _CancelCallback? cancel;
+  var registered = false;
+  var cancelled = false;
+  var cleaning = false;
+  void Function()? unsubscribe;
+
+  void settle(Exit<Object?, Object?> exit) {
+    unsubscribe?.call();
+    settled = exit;
+    completion.complete(exit);
+  }
+
+  Future<void> cleanup() async {
+    if (cleaning) return;
+    cleaning = true;
+    try {
+      final pending = cancel!();
+      if (pending is Future<void>) await pending;
+      // The execution loop reports cancellation after cleanup has finished.
+      settle(const Exit.success(null));
+    } catch (error, stackTrace) {
+      settle(Exit.failure(Cause.defect(error, stackTrace)));
+    }
+  }
+
+  unsubscribe = signal?.onCancel((_) {
+    if (completed != null || cancelled || completion.isCompleted) return;
+    cancelled = true;
+    if (registered) unawaited(zone.run(cleanup));
+  });
+
+  if (cancelled) {
+    settle(const Exit.success(null));
+    return settled ?? completion.future;
+  }
+
+  try {
+    cancel = register((exit) {
+      if (completed != null || cancelled || completion.isCompleted) return;
+      completed = exit;
+      if (registered) settle(exit);
+    });
+  } catch (error, stackTrace) {
+    final defect = Cause<Object?>.defect(error, stackTrace);
+    settle(
+      Exit.failure(switch (completed) {
+        ExitFailure(:final cause) => Cause.combine([cause, defect]),
+        _ => defect,
+      }),
+    );
+    return settled ?? completion.future;
+  }
+
+  registered = true;
+  if (cancelled) {
+    unawaited(zone.run(cleanup));
+  } else if (completed case final exit?) {
+    settle(exit);
+  }
+  return settled ?? completion.future;
+}
+
+typedef _CancelCallback = FutureOr<void> Function();
+typedef _RegisterCallback = _CancelCallback Function(
+  void Function(Exit<Object?, Object?>) complete,
+);
 
 Cause<E> _typedCause<E>(Cause<Object?> cause) =>
     cause.mapError((error) => error as E);
@@ -358,6 +482,15 @@ final class _FromFuture extends _Node {
   const _FromFuture(this.create, this.onError);
   final Future<Object?> Function() create;
   final Object? Function(Object, StackTrace) onError;
+}
+
+final class _FromCallback extends _Node {
+  const _FromCallback(this.register);
+  final _RegisterCallback register;
+}
+
+final class _Yield extends _Node {
+  const _Yield();
 }
 
 final class _Continue extends _Node {
