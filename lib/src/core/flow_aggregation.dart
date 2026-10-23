@@ -26,36 +26,68 @@ extension FlowAggregationOperations<T, E> on Flow<T, E> {
   /// source business failures and explicit cancellation are discarded; defects
   /// and resource cleanup failures are retained. Both [size] and [duration] must
   /// be positive; invalid values become [RangeError] defects before source work.
-  Flow<List<T>, E> groupedWithin(int size, Duration duration) => flowFromCursor(
-    Task.defer(() {
-      if (size < 1) throw RangeError.range(size, 1, null, 'size');
-      if (duration <= Duration.zero) {
-        throw RangeError.value(
-          duration.inMicroseconds,
-          'duration',
-          'Must be positive.',
-        );
-      }
-      return Task.service(Clock.key).withError<E>().flatMap(
-        (clock) => Scope.open().withError<E>().flatMap(
-          (owner) => inTaskScope(openFlowCursor(this), owner).flatMap((source) {
-            final grouping = _TimedGrouping(
-              source,
-              owner,
-              clock,
-              size,
-              duration,
-            );
-            return inTaskScope(
-              Task.addFinalizer(grouping.cleanup),
-              owner,
-            ).withError<E>().map((_) => grouping.cursor);
-          }),
-        ),
-      );
-    }),
-  );
+  Flow<List<T>, E> groupedWithin(int size, Duration duration) =>
+      _aggregate(this, size, duration);
+
+  /// Emits the latest element after no new element arrives for [duration].
+  ///
+  /// Each new element restarts the monotonic deadline and releases the replaced
+  /// element's resources. Normal end emits the final element immediately;
+  /// failure discards a value still waiting for its deadline. A zero duration
+  /// delivers every element without delay. Negative durations become [RangeError]
+  /// defects before source work starts.
+  ///
+  /// Downstream consumption pauses new source pulls. A pull already waiting when
+  /// a deadline expires remains active, and its result is kept for the next
+  /// demand. There is at most one candidate and one pending pull, in addition to
+  /// values retained downstream. The deadline uses the time the value was read,
+  /// so time spent waiting for the consumer does not restart the interval.
+  ///
+  /// Each output has a scope for consuming callback resources. Its input stays
+  /// alive until that output is consumed. Cancellation follows [groupedWithin]'s
+  /// cleanup rules.
+  Flow<T, E> debounce(Duration duration) =>
+      _aggregate(this, null, duration).map((values) => values.single);
 }
+
+Flow<List<T>, E> _aggregate<T, E>(
+  Flow<T, E> flow,
+  int? groupSize,
+  Duration duration,
+) => flowFromCursor(
+  Task.defer(() {
+    if (groupSize != null && groupSize < 1) {
+      throw RangeError.range(groupSize, 1, null, 'size');
+    }
+    if (duration.isNegative ||
+        (groupSize != null && duration == Duration.zero)) {
+      throw RangeError.value(
+        duration.inMicroseconds,
+        'duration',
+        groupSize == null ? 'Must not be negative.' : 'Must be positive.',
+      );
+    }
+    return Task.service(Clock.key).withError<E>().flatMap(
+      (clock) => Scope.open().withError<E>().flatMap(
+        (owner) => inTaskScope(openFlowCursor(flow), owner).flatMap((source) {
+          final aggregation = groupSize == null
+              ? _TimedAggregation.debounced(source, owner, clock, duration)
+              : _TimedAggregation.grouped(
+                  source,
+                  owner,
+                  clock,
+                  groupSize,
+                  duration,
+                );
+          return inTaskScope(
+            Task.addFinalizer(aggregation.cleanup),
+            owner,
+          ).withError<E>().map((_) => aggregation.cursor);
+        }),
+      ),
+    );
+  }),
+);
 
 final class _TimedValue<T> {
   _TimedValue(this.value, this.receivedAt, this.producers);
@@ -65,13 +97,26 @@ final class _TimedValue<T> {
   final List<FlowProducer> producers;
 }
 
-final class _TimedGrouping<T, E> {
-  _TimedGrouping(this.source, this.owner, this.clock, this.size, this.duration);
+final class _TimedAggregation<T, E> {
+  _TimedAggregation.grouped(
+    this.source,
+    this.owner,
+    this.clock,
+    int size,
+    this.duration,
+  ) : groupSize = size;
+
+  _TimedAggregation.debounced(
+    this.source,
+    this.owner,
+    this.clock,
+    this.duration,
+  ) : groupSize = null;
 
   final FlowCursor<T, E> source;
   final Scope owner;
   final Clock clock;
-  final int size;
+  final int? groupSize;
   final Duration duration;
   final _stopReason = Object();
   late final _lifetime = FlowProducer(owner);
@@ -139,12 +184,21 @@ final class _TimedGrouping<T, E> {
               when value.receivedAt >= deadline) {
             return Task.succeed(Option.some(_emit()));
           }
+          if (groupSize == null && _values.isNotEmpty) {
+            final replaced = _inputs.toList();
+            _inputs.clear();
+            _values.clear();
+            _clearTimer();
+            // The new snapshot remains in _pendingValue while old cleanup runs.
+            // A cleanup failure still leaves that value owned by this scope.
+            return _release(replaced).withError<E>().flatMap((_) => _pull());
+          }
           _result = null;
           _pendingValue = null;
           _values.add(value.value);
           _inputs.addAll(value.producers);
           if (_values.length == 1) _deadline = value.receivedAt + duration;
-          if (_values.length == size || clock.elapsed >= _deadline!) {
+          if (_values.length == groupSize || clock.elapsed >= _deadline!) {
             return Task.succeed(Option.some(_emit()));
           }
           _armTimer();
@@ -285,19 +339,21 @@ final class _TimedGrouping<T, E> {
       _values.clear();
       _result = null;
       _ended = true;
-      final release = Task.uninterruptibleMask<void, Never>(
-        (_) => Task.fromFuture(
-          () => releaseFlowProducers(inputs),
-          onError: Error.throwWithStackTrace,
-        ).flatMap(taskFromEvaluation),
-      );
       return source
           .finish(exit)
           .ensuring(current?.finish(exit) ?? Task.succeed(null))
-          .ensuring(release)
+          .ensuring(_release(inputs))
           .ensuring(_lifetime.finish(exit));
     },
   );
+
+  Task<void, Never> _release(List<FlowProducer> producers) =>
+      Task.uninterruptibleMask<void, Never>(
+        (_) => Task.fromFuture(
+          () => releaseFlowProducers(producers),
+          onError: Error.throwWithStackTrace,
+        ).flatMap(taskFromEvaluation),
+      );
 
   Task<void, Never> cleanup(
     Exit<Object?, Object?> exit,
