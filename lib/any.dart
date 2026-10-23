@@ -32,4 +32,7 @@ export 'src/core/synchronized_ref.dart'
 export 'src/core/async_queue.dart'
     show AsyncQueue, QueueOverflowStrategy, QueueClosed;
 export 'src/core/pub_sub.dart' show PubSub, PubSubSubscription, PubSubClosed;
+export 'src/core/config.dart' show Config, ConfigOperations;
+export 'src/core/config_provider.dart'
+    show ConfigProvider, ConfigError, ConfigIssue, ConfigIssueKind;
 export 'src/core/task_local.dart' show TaskLocal;
