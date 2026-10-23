@@ -4,10 +4,11 @@ import '../cause.dart';
 import '../clock.dart';
 import '../exit.dart';
 import '../fiber.dart';
+import '../option.dart';
 import '../scope.dart';
 import '../task.dart';
 
-// The single resource lifecycle used by SharedResource and SharedResourceMap.
+// The resource lifecycle used by SharedResource, SharedResourceMap, and Pool.
 final class SharedResourceState<K, T, E> {
   SharedResourceState._(
     this._acquire,
@@ -17,15 +18,18 @@ final class SharedResourceState<K, T, E> {
     this._scope,
     this._capacity,
     this._onCapacityExceeded,
+    this._onClosing,
   );
 
   final Task<T, E> Function(K key) _acquire;
-  final Duration _idleTimeout;
+  final Duration? _idleTimeout;
   final TaskEnvironment _environment;
   final Clock _clock;
   final Scope _scope;
   final int? _capacity;
   final E Function(K key)? _onCapacityExceeded;
+  final void Function(K key, Future<TaskEvaluation<void, Never>> completion)?
+  _onClosing;
   final _generations = <_Generation<K, T, E>>{};
   final _current = <K, _Generation<K, T, E>>{};
   var _closed = false;
@@ -34,7 +38,9 @@ final class SharedResourceState<K, T, E> {
     Task<T, E> Function(K key) acquire, {
     int? capacity,
     E Function(K key)? onCapacityExceeded,
-    Duration idleTimeout = Duration.zero,
+    Duration? idleTimeout = Duration.zero,
+    void Function(K key, Future<TaskEvaluation<void, Never>> completion)?
+    onClosing,
   }) => accessTaskEnvironment(
     (scope, _) => captureTaskEnvironment().flatMap(
       (environment) => Task.service(Clock.key).flatMap(
@@ -46,7 +52,7 @@ final class SharedResourceState<K, T, E> {
             if (capacity != null && onCapacityExceeded == null) {
               throw ArgumentError.notNull('onCapacityExceeded');
             }
-            if (idleTimeout.isNegative) {
+            if (idleTimeout?.isNegative ?? false) {
               throw ArgumentError.value(
                 idleTimeout,
                 'idleTimeout',
@@ -61,9 +67,10 @@ final class SharedResourceState<K, T, E> {
               scope,
               capacity,
               onCapacityExceeded,
+              onClosing,
             );
           }),
-          release: (resource, exit) => resource._close(exit),
+          release: (resource, exit) => resource.close(exit),
         ),
       ),
     ),
@@ -73,10 +80,15 @@ final class SharedResourceState<K, T, E> {
     if (_closed) throw StateError('The shared resource is closed.');
   }
 
-  Task<_Lease<K, T, E>, E> _reserve(K key, Scope borrowerScope) {
+  Task<Option<_Lease<K, T, E>>, E> _reserve(
+    K key,
+    Scope borrowerScope, {
+    required bool create,
+  }) {
     _checkOpen();
     var generation = _current[key];
     if (generation == null) {
+      if (!create) return Task.succeed(const Option.none());
       final capacity = _capacity;
       if (capacity != null && _generations.length >= capacity) {
         return Task.fail(_onCapacityExceeded!(key));
@@ -87,14 +99,14 @@ final class SharedResourceState<K, T, E> {
       final lease = _Lease(generation, borrowerScope);
       generation.leases.add(lease);
       _start(generation);
-      return Task.succeed(lease);
+      return Task.succeed(Option.some(lease));
     }
     final lease = _Lease(generation, borrowerScope);
     generation.leases.add(lease);
     if (!_cancelIdle(generation)) {
       _beginClose(generation, const Exit.success(null));
     }
-    return Task.succeed(lease);
+    return Task.succeed(Option.some(lease));
   }
 
   void _start(_Generation<K, T, E> generation) {
@@ -166,6 +178,7 @@ final class SharedResourceState<K, T, E> {
     generation.closing = completion;
     _retire(generation);
     _cancelIdle(generation);
+    _onClosing?.call(generation.key, completion.future);
     unawaited(_finishClose(generation, exit, completion, background));
     return completion.future;
   }
@@ -228,8 +241,10 @@ final class SharedResourceState<K, T, E> {
         _idleTimeout == Duration.zero) {
       return _await(_beginClose(generation, generation.ownerExit ?? exit));
     }
+    final timeout = _idleTimeout;
+    if (timeout == null) return Task.succeed(null);
     try {
-      generation.cancelIdle = _clock.schedule(_idleTimeout, () {
+      generation.cancelIdle = _clock.schedule(timeout, () {
         generation.cancelIdle = null;
         _beginClose(generation, const Exit.success(null), background: true);
       });
@@ -242,7 +257,7 @@ final class SharedResourceState<K, T, E> {
     }
   });
 
-  Task<void, Never> _close(Exit<Object?, Object?> exit) => Task.defer(() {
+  Task<void, Never> close(Exit<Object?, Object?> exit) => Task.defer(() {
     _closed = true;
     final generations = _generations.toList();
     for (final generation in generations) {
@@ -259,17 +274,9 @@ final class SharedResourceState<K, T, E> {
         }
       }
     }
-    return Task.fromFuture<TaskEvaluation<void, Never>, Never>(() async {
-      final results = <TaskEvaluation<void, Never>>[];
-      await Future.wait([
-        for (final generation in generations)
-          _closeWhenUnused(generation, exit).then(results.add),
-      ]);
-      return results.fold<TaskEvaluation<void, Never>>(
-        TaskEvaluation<void, Never>(const Exit.success(null), const []),
-        _append<void, Never>,
-      );
-    }, onError: Error.throwWithStackTrace).flatMap(taskFromEvaluation);
+    return _awaitAll([
+      for (final generation in generations) _closeWhenUnused(generation, exit),
+    ]);
   });
 
   Future<TaskEvaluation<void, Never>> _closeWhenUnused(
@@ -283,23 +290,39 @@ final class SharedResourceState<K, T, E> {
     return _beginClose(generation, exit);
   }
 
-  Task<T, E> acquire(K key) => Task.uninterruptibleMask(
-    (restore) =>
-        accessTaskEnvironment(
-              (scope, _) => Task.defer(() => _reserve(key, scope)),
-            )
-            .flatMap(
-              (lease) =>
-                  Task.addFinalizer((exit) => _release(lease, exit))
-                      .map((_) => lease),
-            )
-            .flatMap(
-              (lease) =>
-                  restore(lease.generation.awaitResult())
-                      .withError<E>()
-                      .flatMap((result) => _confirm(lease, result)),
-            ),
+  Task<T, E> acquire(K key) => _borrow(key, create: true).map(
+    (value) => switch (value) {
+      OptionSome(:final value) => value,
+      OptionNone() => throw StateError('A new resource lease was not created.'),
+    },
   );
+
+  // Existence, lease registration, and idle timer cancellation share one
+  // synchronous boundary. Pool can retry a slot that expired before delivery.
+  Task<Option<T>, E> acquireExisting(K key) => _borrow(key, create: false);
+
+  Task<Option<T>, E> _borrow(K key, {required bool create}) =>
+      Task.uninterruptibleMask(
+        (restore) =>
+            accessTaskEnvironment(
+              (scope, _) =>
+                  Task.defer(() => _reserve(key, scope, create: create)),
+            ).flatMap(
+              (reserved) => switch (reserved) {
+                OptionNone() => Task.succeed(const Option.none()),
+                OptionSome(value: final lease) =>
+                  Task.addFinalizer((exit) => _release(lease, exit))
+                      .withError<E>()
+                      .flatMap(
+                        (_) =>
+                            restore(lease.generation.awaitResult())
+                                .withError<E>()
+                                .flatMap((result) => _confirm(lease, result))
+                                .map(Option.some),
+                      ),
+              },
+            ),
+      );
 
   Task<T, E> _confirm(_Lease<K, T, E> lease, TaskEvaluation<T, E> result) {
     if (result.exit is ExitFailure<T, E>) {
@@ -327,15 +350,24 @@ final class SharedResourceState<K, T, E> {
     return taskFromEvaluation(result);
   }
 
-  Task<void, Never> invalidate(K key) => Task.uninterruptibleMask(
+  Task<void, Never> invalidate(K key) => invalidateAll([key]);
+
+  // Retire every selected generation before waiting; one failed cleanup must
+  // not prevent another selected idle generation from being released.
+  Task<void, Never> invalidateAll(Iterable<K> keys) => Task.uninterruptibleMask(
     (_) => Task.defer(() {
       _checkOpen();
-      final generation = _current[key];
-      if (generation == null) return Task.succeed(null);
-      _retire(generation);
-      _cancelIdle(generation);
-      if (generation.leases.isNotEmpty) return Task.succeed(null);
-      return _await(_beginClose(generation, const Exit.success(null)));
+      final pending = <Future<TaskEvaluation<void, Never>>>[];
+      for (final key in keys) {
+        final generation = _current[key];
+        if (generation == null) continue;
+        _retire(generation);
+        _cancelIdle(generation);
+        if (generation.leases.isEmpty) {
+          pending.add(_beginClose(generation, const Exit.success(null)));
+        }
+      }
+      return pending.isEmpty ? Task.succeed(null) : _awaitAll(pending);
     }),
   );
 }
@@ -400,6 +432,17 @@ Task<void, Never> _await(Future<TaskEvaluation<void, Never>> future) =>
       () => future,
       onError: Error.throwWithStackTrace,
     ).flatMap(taskFromEvaluation);
+
+Task<void, Never> _awaitAll(
+  Iterable<Future<TaskEvaluation<void, Never>>> pending,
+) => Task.fromFuture<TaskEvaluation<void, Never>, Never>(() async {
+  final results = <TaskEvaluation<void, Never>>[];
+  await Future.wait([for (final future in pending) future.then(results.add)]);
+  return results.fold<TaskEvaluation<void, Never>>(
+    TaskEvaluation<void, Never>(const Exit.success(null), const []),
+    _append<void, Never>,
+  );
+}, onError: Error.throwWithStackTrace).flatMap(taskFromEvaluation);
 
 TaskEvaluation<void, Never> _defects(Iterable<FailureEvent> events) {
   final seen = <Object>{};

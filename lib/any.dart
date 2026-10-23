@@ -78,3 +78,4 @@ export 'src/core/shared_resource_map.dart'
     show SharedResourceMap, SharedResourceMapOperations;
 export 'src/core/request_resolver.dart'
     show RequestResolver, RequestResolverOperations;
+export 'src/core/pool.dart' show Pool, PoolOperations;
