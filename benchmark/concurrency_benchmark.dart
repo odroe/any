@@ -36,6 +36,9 @@ Future<void> main(List<String> arguments) async {
     'all_8': () async {
       _check(await all(List.filled(count, task), concurrency: 8).run(()));
     },
+    'all_settled_8': () async {
+      _check(await allSettled(List.filled(count, task), concurrency: 8).run(()));
+    },
   };
   print(
     'Dart ${Platform.version.split(' ').first}, ${Platform.operatingSystem}',
