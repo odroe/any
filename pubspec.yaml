@@ -1,5 +1,5 @@
 name: any
-description: An empty Dart package.
+description: Typed tasks, structured concurrency, scoped resources, and application services for Dart.
 version: 0.0.0
 repository: https://github.com/odroe/any
 
