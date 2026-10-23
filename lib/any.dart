@@ -10,3 +10,4 @@ export 'src/core/cause.dart'
         CauseCancelled,
         CauseGroup,
         CauseMapping;
+export 'src/core/exit.dart' show Exit, ExitSuccess, ExitFailure, ExitMapping;
