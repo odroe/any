@@ -13,3 +13,5 @@ export 'src/core/cause.dart'
 export 'src/core/exit.dart' show Exit, ExitSuccess, ExitFailure, ExitMapping;
 export 'src/core/cancellation.dart'
     show CancellationController, CancellationSignal;
+export 'src/core/context.dart'
+    show ServiceKey, ServiceBinding, Context, MissingService, DuplicateService;
