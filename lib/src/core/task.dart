@@ -10,7 +10,8 @@ import 'result.dart';
 /// Constructing and combining tasks does not run their callbacks. Each execution
 /// starts with independent state. Unexpected exceptions become defects, and
 /// cancellation remains separate from business errors, including when [E] is
-/// [Never].
+/// [Never]. Cancellation is observed only while enabled; [uninterruptibleMask]
+/// can defer it across a critical section.
 final class Task<T, E> {
   const Task._(this._node);
 
@@ -44,6 +45,34 @@ final class Task<T, E> {
   static Task<T, E> defer<T, E>(Task<T, E> Function() create) =>
       Task._(_Suspend(() => create()._node));
 
+  /// Defers cancellation while executing the task returned by [body].
+  ///
+  /// [body] runs lazily on each execution with cancellation disabled. Its
+  /// `restore` function wraps a task with the cancellation state that was active
+  /// before this mask. Nested masks therefore cannot enable cancellation that
+  /// was already disabled. Leaving either region restores its enclosing state,
+  /// including when a callback throws.
+  ///
+  /// Pending cancellation is observed when cancellation becomes enabled again.
+  /// Defects already produced by the body are retained alongside cancellation.
+  /// A task that never completes while masked can indefinitely delay
+  /// cancellation; use `restore` around work that should remain cancellable.
+  /// Cancellation observed before this mask starts prevents [body] from running.
+  ///
+  /// `restore` only captures a cancellation state, not an execution or signal.
+  /// Tasks it returns are lazy and may be reused, including in another execution,
+  /// where they use that execution's signal with the captured state.
+  static Task<T, E> uninterruptibleMask<T, E>(
+    Task<T, E> Function(RestoreCancellation restore) body,
+  ) => Task._(
+    _Mask(
+      (interruptible) => body(
+        <A, B>(Task<A, B> task) =>
+            Task._(_Interruptibility(task._node, interruptible)),
+      )._node,
+    ),
+  );
+
   /// Describes the already available business [result].
   static Task<T, E> fromResult<T, E>(Result<T, E> result) =>
       Task._(switch (result) {
@@ -56,12 +85,13 @@ final class Task<T, E> {
   /// Both synchronous exceptions from [create] and errors completing its Future
   /// are mapped. An exception thrown by [onError] becomes a defect.
   ///
-  /// A Future cannot be cancelled. If cancellation arrives after it starts,
-  /// execution waits for it to settle before returning. No subsequent business
-  /// callback runs. A Future error observed after cancellation is retained as a
-  /// defect with its original stack trace alongside cancellation; [onError] is
-  /// skipped. This also applies to a synchronous exception from [create] if it
-  /// requests cancellation before throwing.
+  /// A Future cannot be cancelled. If enabled cancellation arrives after it
+  /// starts, execution waits for it to settle before returning. No subsequent
+  /// business callback runs. A Future error observed after cancellation is
+  /// retained as a defect with its original stack trace alongside cancellation;
+  /// [onError] is skipped. This also applies to a synchronous exception from
+  /// [create] if it requests cancellation before throwing. While cancellation is
+  /// masked, [onError] and subsequent callbacks run normally.
   static Task<T, E> fromFuture<T, E>(
     Future<T> Function() create, {
     required E Function(Object error, StackTrace stackTrace) onError,
@@ -75,12 +105,14 @@ final class Task<T, E> {
   /// if completion was already called synchronously. If that completion failed,
   /// its cause is retained before the registration defect.
   ///
-  /// Cancellation waits for the returned function to stop using resources and
-  /// finish cleanup. Cancellation during registration waits for [register] to
+  /// Enabled cancellation waits for the returned function to stop using resources
+  /// and finish cleanup. Cancellation during registration waits for [register] to
   /// return before calling that function. An operation that completed before
   /// cancellation does not receive a cancellation call. Cleanup exceptions keep
   /// their original object and stack trace alongside cancellation. Cleanup runs
   /// in the Zone where registration executed, including after asynchronous gaps.
+  /// A masked operation waits for completion without calling its cancellation
+  /// function.
   static Task<T, E> fromCallback<T, E>(
     FutureOr<void> Function() Function(void Function(Exit<T, E> exit) complete)
     register,
@@ -88,16 +120,22 @@ final class Task<T, E> {
 
   /// Checks for owner cancellation when this task executes.
   ///
-  /// Succeeds with no value if cancellation has not been requested. A request
-  /// terminates execution before the next business callback can start.
+  /// Succeeds with no value if cancellation has not been requested or is masked.
+  /// An enabled request terminates execution before the next business callback.
   static Task<void, Never> checkCancelled() => const Task._(_Success(null));
 
   /// Yields to the event loop before continuing with the next task.
   ///
-  /// Timers and other ready work can advance. Cancellation received while
-  /// yielding terminates execution before the next business callback starts.
+  /// Timers and other ready work can advance. Enabled cancellation received
+  /// while yielding terminates execution before the next business callback.
   static Task<void, Never> yieldNow() => const Task._(_Yield());
 }
+
+/// Wraps a task with the cancellation state captured by an enclosing mask.
+///
+/// The wrapper is lazy. Repeated executions use their own cancellation signals
+/// and the same captured state; no execution or signal is retained.
+typedef RestoreCancellation = Task<T, E> Function<T, E>(Task<T, E> task);
 
 /// Transforms and combines tasks using their static value and error types.
 extension TaskOperations<T, E> on Task<T, E> {
@@ -226,13 +264,15 @@ Future<Exit<T, E>> evaluateTask<T, E>(
   var current = task._node;
   final frames = <_Frame>[];
   var evaluating = true;
+  var interruptible = true;
   Object? value;
   Cause<Object?>? failure;
   var remaining = 2048;
 
   while (true) {
-    if (signal?.isCancelled ?? false) {
-      return Exit.failure(_cancelled(failure, signal!.reason));
+    final effectiveSignal = interruptible ? signal : null;
+    if (effectiveSignal?.isCancelled ?? false) {
+      return Exit.failure(_cancelled(failure, effectiveSignal!.reason));
     }
     if (--remaining == 0) {
       remaining = 2048;
@@ -254,25 +294,35 @@ Future<Exit<T, E>> evaluateTask<T, E>(
             try {
               current = _Success(body());
             } catch (error, stackTrace) {
-              failure = onError == null || (signal?.isCancelled ?? false)
+              failure =
+                  onError == null || (effectiveSignal?.isCancelled ?? false)
                   ? Cause.defect(error, stackTrace)
                   : Cause.failure(onError(error, stackTrace));
               evaluating = false;
             }
           case _Suspend(:final create):
             current = create();
+          case _Mask(:final create):
+            final previous = interruptible;
+            frames.add(_Frame(interruptible: previous));
+            interruptible = false;
+            current = create(previous);
+          case _Interruptibility(:final source, interruptible: final restored):
+            frames.add(_Frame(interruptible: interruptible));
+            interruptible = restored;
+            current = source;
           case _FromFuture(:final create, :final onError):
             try {
               value = await create();
               failure = null;
             } catch (error, stackTrace) {
-              failure = signal?.isCancelled ?? false
+              failure = effectiveSignal?.isCancelled ?? false
                   ? Cause.defect(error, stackTrace)
                   : Cause.failure(onError(error, stackTrace));
             }
             evaluating = false;
           case _FromCallback(:final register):
-            final pending = _runCallback(register, signal);
+            final pending = _runCallback(register, effectiveSignal);
             final exit = pending is Future<Exit<Object?, Object?>>
                 ? await pending
                 : pending;
@@ -303,10 +353,14 @@ Future<Exit<T, E>> evaluateTask<T, E>(
       }
 
       final frame = frames.removeLast();
+      if (frame.interruptible case final restored?) {
+        interruptible = restored;
+        continue;
+      }
       if (failure case final cause?) {
         final resume = frame.failure;
         if (resume == null) continue;
-        current = resume(cause, signal);
+        current = resume(cause, effectiveSignal);
       } else {
         final resume = frame.success;
         if (resume == null) continue;
@@ -478,6 +532,17 @@ final class _Suspend extends _Node {
   final _Node Function() create;
 }
 
+final class _Mask extends _Node {
+  const _Mask(this.create);
+  final _Node Function(bool interruptible) create;
+}
+
+final class _Interruptibility extends _Node {
+  const _Interruptibility(this.source, this.interruptible);
+  final _Node source;
+  final bool interruptible;
+}
+
 final class _FromFuture extends _Node {
   const _FromFuture(this.create, this.onError);
   final Future<Object?> Function() create;
@@ -500,7 +565,8 @@ final class _Continue extends _Node {
 }
 
 final class _Frame {
-  const _Frame({this.success, this.failure});
+  const _Frame({this.success, this.failure, this.interruptible});
   final _Node Function(Object?)? success;
   final _Node Function(Cause<Object?>, CancellationSignal?)? failure;
+  final bool? interruptible;
 }
