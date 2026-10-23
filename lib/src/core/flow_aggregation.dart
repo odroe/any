@@ -48,6 +48,60 @@ extension FlowAggregationOperations<T, E> on Flow<T, E> {
   /// cleanup rules.
   Flow<T, E> debounce(Duration duration) =>
       _aggregate(this, null, duration).map((values) => values.single);
+
+  /// Delivers every element with at least [duration] between deliveries.
+  ///
+  /// The first element is immediate. Time spent producing the next element or
+  /// consuming the previous one counts toward the interval. End and failure
+  /// propagate without an interval delay. A zero duration preserves the source;
+  /// negative durations become [RangeError] defects before source work starts.
+  ///
+  /// Pulling remains driven by downstream demand. At most one pulled element
+  /// waits for its deadline; no background producer or additional resource scope
+  /// is created. Waiting uses the current Clock's monotonic time, keeps the
+  /// element's resources alive, and is cancellable.
+  Flow<T, E> throttle(Duration duration) => flowFromCursor(
+    Task.defer(() {
+      if (duration.isNegative) {
+        throw RangeError.value(
+          duration.inMicroseconds,
+          'duration',
+          'Must not be negative.',
+        );
+      }
+      if (duration == Duration.zero) return openFlowCursor(this);
+      return Task.service(Clock.key).withError<E>().flatMap(
+        (clock) => openFlowCursor(this).map((source) {
+          Duration? deliveredAt;
+          Task<Option<T>, E> deliver(Option<T> item) => Task.defer(() {
+            final now = clock.elapsed;
+            final deadline = deliveredAt == null
+                ? null
+                : deliveredAt! + duration;
+            if (deadline != null && now < deadline) {
+              return Task.fromCallback<void, Never>(
+                (complete) => clock.schedule(
+                  deadline - now,
+                  () => complete(const Exit.success(null)),
+                ),
+              ).withError<E>().flatMap((_) => deliver(item));
+            }
+            deliveredAt = now;
+            return Task.succeed(item);
+          });
+          return FlowCursor(
+            source.pull().flatMap(
+              (item) =>
+                  item is OptionNone<T> ? Task.succeed(item) : deliver(item),
+            ),
+            source.scopeForValue,
+            source.finish,
+            source.producers,
+          );
+        }),
+      );
+    }),
+  );
 }
 
 Flow<List<T>, E> _aggregate<T, E>(
