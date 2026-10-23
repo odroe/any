@@ -5,7 +5,9 @@ import 'cause.dart';
 import 'context.dart';
 import 'exit.dart';
 import 'fiber.dart';
+import 'internal/task_timing.dart';
 import 'result.dart';
+import 'schedule.dart';
 import 'scope.dart';
 import 'task_local.dart';
 
@@ -20,6 +22,13 @@ final class Task<T, E> {
   const Task._(this._node);
 
   final _Node _node;
+
+  /// Waits for [duration] using the clock in the current context.
+  ///
+  /// The timer is registered only when this task runs. Nonpositive durations
+  /// schedule a zero-delay timer. Cancellation removes the timer and stops the
+  /// wait. Use [yieldNow] to yield directly to the host event loop instead.
+  static Task<void, Never> sleep(Duration duration) => sleepTask(duration);
 
   /// Reads [key] from the services available when this task executes.
   ///
@@ -199,6 +208,41 @@ typedef RestoreCancellation = Task<T, E> Function<T, E>(Task<T, E> task);
 
 /// Transforms and combines tasks using their static value and error types.
 extension TaskOperations<T, E> on Task<T, E> {
+  /// Waits for [duration] before starting this computation.
+  ///
+  /// Uses [Task.sleep], including its clock and cancellation rules. Cancelling
+  /// the delay prevents the computation from starting.
+  Task<T, E> delay(Duration duration) =>
+      Task.sleep(duration).withError<E>().flatMap((_) => this);
+
+  /// Retries single business failures according to [schedule].
+  ///
+  /// The first attempt starts immediately. `Schedule.recurs(3)` allows three
+  /// further attempts. [when], if supplied, must return true to retry; a thrown
+  /// exception becomes a defect. Defects, cancellation, and grouped failures
+  /// are never retried. Exhaustion returns the last business failure.
+  ///
+  /// Each attempt has its own scope and completes cleanup before another
+  /// attempt or delay begins. Cleanup failures prevent retry. Counting and
+  /// elapsed time start fresh on each execution; elapsed time includes attempts,
+  /// cleanup, and waits. Waiting uses the current clock and is cancellable.
+  Task<T, E> retry(Schedule schedule, {bool Function(E error)? when}) =>
+      retryTask(this, schedule, when: when);
+
+  /// Repeats successful attempts and returns the last successful value.
+  ///
+  /// The first attempt starts immediately. After each success, [until] can stop
+  /// repetition by returning true; otherwise [schedule] decides whether and
+  /// when to continue. A failed attempt stops immediately, and an exception in
+  /// [until] becomes a defect. Each attempt finishes its scoped resources before
+  /// the next begins, including the last attempt before returning its value.
+  ///
+  /// Policy state is independent per execution. Time includes attempts and
+  /// cleanup, and waits use the current clock. Cancellation stops future
+  /// attempts and waits for current work and cleanup under the usual Task rules.
+  Task<T, E> repeat(Schedule schedule, {bool Function(T value)? until}) =>
+      repeatTask(this, schedule, until: until);
+
   /// Runs this computation with [context] overlaid on its current services.
   ///
   /// Provided bindings replace matching keys and leave all other services

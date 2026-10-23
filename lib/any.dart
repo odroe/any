@@ -45,3 +45,4 @@ export 'src/core/layer.dart'
         TaskLayerOperations;
 export 'src/core/metric.dart'
     show Metric, Counter, Gauge, Histogram, MetricRegistry, MetricSnapshot;
+export 'src/core/schedule.dart' show Schedule;
