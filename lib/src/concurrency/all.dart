@@ -83,11 +83,16 @@ Task<List<T>, E, R> all<T, E, R>(
 
             // Observe body failure before cleanup, while Task.run retains
             // ownership of the child's scope and combines cleanup failures.
-            final exit = await Task<T, E, R>((child) async {
-              final exit = await task.runIn(child);
-              if (exit is ExitFailure<T, E>) stop();
-              return exit;
-            }).run(context.dependencies, cancellation: controller.token);
+            final exit =
+                await Task<T, E, R>((child) async {
+                  final exit = await task.runIn(child);
+                  if (exit is ExitFailure<T, E>) stop();
+                  return exit;
+                }).run(
+                  context.dependencies,
+                  cancellation: controller.token,
+                  yieldEvery: context.yieldEvery,
+                );
 
             outcomes[index] = exit;
             if (exit is ExitFailure<T, E>) stop();

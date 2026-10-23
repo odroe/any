@@ -70,6 +70,7 @@ final class Semaphore {
           return await task.run(
             context.dependencies,
             cancellation: context.cancellation,
+            yieldEvery: context.yieldEvery,
           );
         } finally {
           if (_waiting.isEmpty) {

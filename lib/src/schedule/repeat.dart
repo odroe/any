@@ -34,6 +34,7 @@ extension TaskRepeat<T, E, R> on Task<T, E, R> {
       final exit = await run(
         context.dependencies,
         cancellation: context.cancellation,
+        yieldEvery: context.yieldEvery,
       );
       if (exit is ExitFailure<T, E>) return exit;
       if (context.cancellation.isCancelled) {

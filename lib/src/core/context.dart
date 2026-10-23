@@ -9,7 +9,7 @@ import 'scope.dart';
 /// [withDependencies] creates a local view sharing the same [scope]. Use
 /// [withScope] to associate a view with a separately managed lifetime. The caller
 /// owns each scope and is responsible for closing it. Both methods preserve the
-/// same [cancellation] signal.
+/// same [cancellation] signal and [yieldEvery] policy.
 ///
 /// Context fields are immutable. Dependency objects are shared by reference and
 /// may themselves be mutable.
@@ -31,11 +31,17 @@ final class Context<R> {
   /// Creates a context referencing [scope], [dependencies], and [cancellation].
   ///
   /// Defaults to [CancellationToken.none] when no cancellation token is supplied.
+  /// Throws a [RangeError] if [yieldEvery] is supplied and less than one.
   Context({
     required this.scope,
     required this.dependencies,
     CancellationToken? cancellation,
-  }) : cancellation = cancellation ?? CancellationToken.none;
+    this.yieldEvery,
+  }) : cancellation = cancellation ?? CancellationToken.none {
+    if (yieldEvery != null && yieldEvery! < 1) {
+      throw RangeError.range(yieldEvery!, 1, null, 'yieldEvery');
+    }
+  }
 
   /// The resource lifetime used by this computation.
   final Scope scope;
@@ -46,6 +52,15 @@ final class Context<R> {
   /// The cooperative cancellation signal shared by this computation's steps.
   final CancellationToken cancellation;
 
+  /// The interpreter-step budget between voluntary event-loop yields.
+  ///
+  /// Null, the default, adds no voluntary yields. A positive value lets timers,
+  /// I/O, and queued cancellation requests run during long task compositions.
+  /// Each execution counts graph traversal and continuation steps, including
+  /// error handlers. This is not a duration or a count of user callbacks.
+  /// Synchronous callbacks and finalizers themselves cannot be interrupted.
+  final int? yieldEvery;
+
   /// Creates a context with [dependencies] and the same scope and cancellation.
   ///
   /// The dependency type [D] may differ from [R]. This context and its
@@ -54,6 +69,7 @@ final class Context<R> {
     scope: scope,
     dependencies: dependencies,
     cancellation: cancellation,
+    yieldEvery: yieldEvery,
   );
 
   /// Creates a context with [scope] and the same dependencies and cancellation.
@@ -64,5 +80,6 @@ final class Context<R> {
     scope: scope,
     dependencies: dependencies,
     cancellation: cancellation,
+    yieldEvery: yieldEvery,
   );
 }

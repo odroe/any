@@ -118,6 +118,11 @@ final class Task<T, E, R> {
   ///
   /// Synchronous steps can execute consecutively in one microtask. A queued
   /// cancellation request can be observed only after its callback runs.
+  /// Set [yieldEvery] to a positive interpreter-step budget to periodically
+  /// yield to the event queue, for example `yieldEvery: 2048`. The default adds
+  /// no voluntary yields. The budget counts traversal and continuation steps,
+  /// not elapsed time, and cannot interrupt an individual synchronous callback.
+  /// A nonpositive budget fails with a [RangeError] before execution starts.
   ///
   /// Finalizers receive the task's exit and finish before the returned future
   /// completes. Once cleanup begins, later requests do not change that exit or
@@ -127,12 +132,14 @@ final class Task<T, E, R> {
   Future<Exit<T, E>> run(
     R dependencies, {
     CancellationToken? cancellation,
+    int? yieldEvery,
   }) async {
     final scope = Scope();
     final context = Context(
       scope: scope,
       dependencies: dependencies,
       cancellation: cancellation,
+      yieldEvery: yieldEvery,
     );
     final exit = _checkCancellation(await runIn(context), context.cancellation);
 
@@ -183,7 +190,7 @@ final class Task<T, E, R> {
   /// [TaskComposition.adapt] combines dependency projection and expected error
   /// translation when integrating a task into another workflow.
   Future<Exit<T, E>> runIn(Context<R> context) async {
-    // Defer entry once. Only computations returning a Future suspend the loop.
+    // Defer entry once; optional budgets yield to events rather than microtasks.
     await Future<void>.value();
     Task<Object?, Object?, Object?> current = this;
     List<Task<Object?, Object?, Object?>>? pending;
@@ -191,9 +198,15 @@ final class Task<T, E, R> {
     List<(int, Context<Object?>)>? contexts;
     var errorHandlers = 0;
     final cancellation = context.cancellation;
+    final yieldEvery = context.yieldEvery;
+    var remaining = yieldEvery ?? 0;
 
     try {
       while (true) {
+        if (yieldEvery != null && --remaining == 0) {
+          await Future<void>.delayed(Duration.zero);
+          remaining = yieldEvery;
+        }
         if (context.scope.isClosed) {
           throw StateError('Cannot run a task in a closed scope.');
         }
@@ -202,6 +215,16 @@ final class Task<T, E, R> {
         }
 
         while (current._source != null) {
+          if (yieldEvery != null && --remaining == 0) {
+            await Future<void>.delayed(Duration.zero);
+            remaining = yieldEvery;
+            if (context.scope.isClosed) {
+              throw StateError('Cannot run a task in a closed scope.');
+            }
+            if (cancellation.isCancelled) {
+              return Exit.failure(Cause.cancelled(reason: cancellation.reason));
+            }
+          }
           (pending ??= []).add(current);
           if (current._failure != null || current._recover != null) {
             errorHandlers++;
@@ -239,6 +262,13 @@ final class Task<T, E, R> {
                     ),
                   };
             return _checkCancellation(typed, cancellation);
+          }
+          if (yieldEvery != null && --remaining == 0) {
+            await Future<void>.delayed(Duration.zero);
+            remaining = yieldEvery;
+            if (context.scope.isClosed) {
+              throw StateError('Cannot run a task in a closed scope.');
+            }
           }
           if (contexts != null &&
               contexts.isNotEmpty &&

@@ -66,6 +66,7 @@ Task<List<Exit<T, E>>, E, R> allSettled<T, E, R>(
             outcomes[index] = await task.run(
               context.dependencies,
               cancellation: controller.token,
+              yieldEvery: context.yieldEvery,
             );
           }
         }

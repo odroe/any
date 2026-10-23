@@ -33,6 +33,7 @@ Task<T, E, R> raceTasks<T, E, R>(
         scope: scope,
         dependencies: context.dependencies,
         cancellation: controllers[index].token,
+        yieldEvery: context.yieldEvery,
       ),
     );
     if (successOnly && exit is ExitFailure<T, E>) {

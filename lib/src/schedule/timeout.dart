@@ -44,6 +44,7 @@ extension TaskTimeout<T, E, R> on Task<T, E, R> {
           scope: context.scope,
           dependencies: context.dependencies,
           cancellation: controller.token,
+          yieldEvery: context.yieldEvery,
         ),
       );
     } finally {

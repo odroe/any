@@ -27,6 +27,8 @@ extension TaskStreamMapping<S> on Stream<S> {
   /// as a [TaskStreamException]. Internal shutdown cancellations are omitted.
   ///
   /// Throws a [RangeError] immediately if [concurrency] is less than one.
+  /// [yieldEvery] optionally sets each child's [Context.yieldEvery] budget and
+  /// must also be positive when supplied.
   ///
   /// ```dart
   /// final results = Stream.fromIterable([1, 2, 3]).mapConcurrent(
@@ -43,9 +45,13 @@ extension TaskStreamMapping<S> on Stream<S> {
     required R dependencies,
     required int concurrency,
     CancellationToken? cancellation,
+    int? yieldEvery,
   }) {
     if (concurrency < 1) {
       throw RangeError.range(concurrency, 1, null, 'concurrency');
+    }
+    if (yieldEvery != null && yieldEvery < 1) {
+      throw RangeError.range(yieldEvery, 1, null, 'yieldEvery');
     }
     return _ConcurrentMap<S, T, E, R>(
       this,
@@ -53,6 +59,7 @@ extension TaskStreamMapping<S> on Stream<S> {
       dependencies,
       concurrency,
       cancellation ?? CancellationToken.none,
+      yieldEvery,
     ).output.stream;
   }
 }
@@ -80,6 +87,7 @@ final class _ConcurrentMap<S, T, E, R> {
     this.dependencies,
     this.limit,
     this.parent,
+    this.yieldEvery,
   ) {
     output = StreamController<Exit<T, E>>(
       sync: true,
@@ -95,6 +103,7 @@ final class _ConcurrentMap<S, T, E, R> {
   final R dependencies;
   final int limit;
   final CancellationToken parent;
+  final int? yieldEvery;
   late final StreamController<Exit<T, E>> output;
   final _children = CancellationController();
   final _stopReason = Object();
@@ -153,7 +162,11 @@ final class _ConcurrentMap<S, T, E, R> {
     _active++;
     _update();
     Task<T, E, R>((context) => task(value).runIn(context))
-        .run(dependencies, cancellation: _children.token)
+        .run(
+          dependencies,
+          cancellation: _children.token,
+          yieldEvery: yieldEvery,
+        )
         .then((exit) {
           _active--;
           final filtered = _filter(exit);

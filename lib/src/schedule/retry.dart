@@ -37,6 +37,7 @@ extension TaskRetry<T, E, R> on Task<T, E, R> {
       final exit = await run(
         context.dependencies,
         cancellation: context.cancellation,
+        yieldEvery: context.yieldEvery,
       );
       if (exit case ExitFailure(cause: CauseFailure(:final error))) {
         if (context.cancellation.isCancelled || when != null && !when(error)) {

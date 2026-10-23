@@ -105,7 +105,11 @@ final class TaskGroup<E, R> {
       if (handle.isCompleted) _children.remove(handle);
     };
     handle._future = task
-        .run(context.dependencies, cancellation: controller.token)
+        .run(
+          context.dependencies,
+          cancellation: controller.token,
+          yieldEvery: context.yieldEvery,
+        )
         .then((exit) {
           handle._completed = true;
           if (handle._observed) _children.remove(handle);
