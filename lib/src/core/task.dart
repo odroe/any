@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'cancellation.dart';
 import 'cause.dart';
+import 'context.dart';
 import 'exit.dart';
 import 'fiber.dart';
 import 'result.dart';
@@ -18,6 +19,14 @@ final class Task<T, E> {
   const Task._(this._node);
 
   final _Node _node;
+
+  /// Reads [key] from the services available when this task executes.
+  ///
+  /// Runtime installs the application's services. A local [provideContext]
+  /// can replace bindings for a computation and its children. A missing key
+  /// produces a [MissingService] defect; nullable service values are preserved.
+  static Task<T, Never> service<T>(ServiceKey<T> key) =>
+      Task._(_Service((context) => context.read(key)));
 
   /// Describes a computation that succeeds with [value].
   static Task<T, Never> succeed<T>(T value) => Task._(_Success(value));
@@ -189,6 +198,16 @@ typedef RestoreCancellation = Task<T, E> Function<T, E>(Task<T, E> task);
 
 /// Transforms and combines tasks using their static value and error types.
 extension TaskOperations<T, E> on Task<T, E> {
+  /// Runs this computation with [context] overlaid on its current services.
+  ///
+  /// Provided bindings replace matching keys and leave all other services
+  /// available. The enclosing context is restored on success or failure.
+  /// Child fibers inherit the local bindings, and finalizers retain the
+  /// services present when they were registered. This does not acquire or
+  /// release the supplied service objects.
+  Task<T, E> provideContext(Context context) =>
+      Task._(_ProvideContext(_node, context));
+
   /// Starts this task as a child owned by the current task scope.
   ///
   /// Parent cancellation reaches the child. The scope cancels and waits for
@@ -197,10 +216,11 @@ extension TaskOperations<T, E> on Task<T, E> {
   /// Each execution starts a fresh fiber.
   Task<Fiber<T, E>, Never> fork() => Task._(
     _Fork(
-      (scope, parent, signal) => startFiber(
+      (scope, parent, context, signal) => startFiber(
         this,
         owner: scope,
         signal: signal,
+        context: context,
         report: fiberReport(parent),
       ),
     ),
@@ -213,10 +233,11 @@ extension TaskOperations<T, E> on Task<T, E> {
   /// useful for work whose explicit owner outlives the creating task.
   Task<Fiber<T, E>, Never> forkIn(Scope scope) => Task._(
     _Fork(
-      (_, parent, _) => startFiber(
+      (_, parent, context, _) => startFiber(
         this,
         owner: scope,
         inheritHost: false,
+        context: context,
         report: fiberReport(parent),
       ),
     ),
@@ -391,6 +412,7 @@ Future<TaskEvaluation<T, E>> evaluateTask<T, E>(
   CancellationSignal? signal,
   Scope? scope,
   Fiber<Object?, Object?>? fiber,
+  Context? context,
   List<Scope> closingScopes = const [],
 }) async {
   final ownedScope = scope ?? createScope();
@@ -400,6 +422,7 @@ Future<TaskEvaluation<T, E>> evaluateTask<T, E>(
     scope: ownedScope,
     closingScopes: closingScopes,
     fiber: fiber,
+    context: context ?? Context.from(const []),
   );
   var result = evaluated;
   var cancellationObserved = cancelled;
@@ -448,6 +471,7 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
   required List<Scope> closingScopes,
   CancellationSignal? signal,
   Fiber<Object?, Object?>? fiber,
+  required Context context,
 }) async {
   var current = task._node;
   final frames = <_Frame>[];
@@ -457,6 +481,7 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
   var evaluating = true;
   var interruptible = true;
   var currentScope = scope;
+  var currentContext = context;
   Object? value;
   Cause<Object?>? failure;
   var events = const <FailureEvent>[];
@@ -483,11 +508,20 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
     try {
       if (evaluating) {
         switch (current) {
+          case _Service(:final read):
+            value = read(currentContext);
+            failure = null;
+            events = const [];
+            evaluating = false;
+          case _ProvideContext(:final source, :final context):
+            frames.add(_Frame(context: currentContext));
+            currentContext = overlayContexts(currentContext, context);
+            current = source;
           case _Fork(:final start):
             if (fiber == null) {
               throw StateError('Fork requires an active runtime execution.');
             }
-            value = start(currentScope, fiber, signal);
+            value = start(currentScope, fiber, currentContext, signal);
             failure = null;
             events = const [];
             evaluating = false;
@@ -603,6 +637,7 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
             evaluating = false;
           case _AddFinalizer(:final finalizer):
             final zone = Zone.current;
+            final services = currentContext;
             final pending = addScopeFinalizer(
               currentScope,
               (exit) => zone.run(() => finalizer(exit)),
@@ -611,6 +646,7 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
                   task,
                   closingScopes: [...closingScopes, scope],
                   fiber: fiber,
+                  context: services,
                 ),
               ),
             );
@@ -698,6 +734,10 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
       }
 
       final frame = frames.removeLast();
+      if (frame.context case final restored?) {
+        currentContext = restored;
+        continue;
+      }
       if (frame.interruptible case final restored?) {
         interruptible = restored;
         continue;
@@ -925,8 +965,24 @@ sealed class _Node {
 
 final class _Fork extends _Node {
   const _Fork(this.start);
-  final Object Function(Scope, Fiber<Object?, Object?>, CancellationSignal?)
+  final Object Function(
+    Scope,
+    Fiber<Object?, Object?>,
+    Context,
+    CancellationSignal?,
+  )
   start;
+}
+
+final class _Service extends _Node {
+  const _Service(this.read);
+  final Object? Function(Context) read;
+}
+
+final class _ProvideContext extends _Node {
+  const _ProvideContext(this.source, this.context);
+  final _Node source;
+  final Context context;
 }
 
 final class _AwaitFiber extends _Node {
@@ -1024,9 +1080,10 @@ final class _CloseScope extends _Node {
 }
 
 final class _Frame {
-  const _Frame({this.success, this.failure, this.interruptible});
+  const _Frame({this.success, this.failure, this.interruptible, this.context});
   final _Node Function(Object?)? success;
   final _Node Function(Cause<Object?>, List<FailureEvent>, CancellationSignal?)?
   failure;
   final bool? interruptible;
+  final Context? context;
 }

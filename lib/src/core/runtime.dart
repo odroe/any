@@ -2,9 +2,12 @@ import 'dart:async';
 
 import 'cancellation.dart';
 import 'cause.dart';
+import 'clock.dart';
+import 'context.dart';
 import 'exit.dart';
 import 'fiber.dart';
 import 'scope.dart';
+import 'random_source.dart';
 import 'task.dart';
 
 /// Owns root task executions and waits for them when closing.
@@ -14,11 +17,24 @@ import 'task.dart';
 final class Runtime {
   /// Creates a runtime with an optional unobserved-failure reporter.
   ///
+  /// [context] supplies application services and overrides the default [Clock]
+  /// and [RandomSource] bindings when their keys are present. Other defaults
+  /// remain available. Supplied objects retain their caller-managed lifetime.
+  ///
   /// A failed fiber is reported once on the next event-loop turn if its result
   /// has not been observed. The default forwards a [TaskException] to the Zone
   /// that creates this runtime. Exceptions thrown by [onUnhandledError] are
   /// forwarded to that same Zone; they cannot interrupt task cleanup.
-  Runtime({void Function(Cause<Object?> cause)? onUnhandledError}) {
+  Runtime({
+    Context? context,
+    void Function(Cause<Object?> cause)? onUnhandledError,
+  }) : _context = overlayContexts(
+         Context.from([
+           Clock.key.bind(Clock()),
+           RandomSource.key.bind(RandomSource()),
+         ]),
+         context ?? Context.from(const []),
+       ) {
     final zone = Zone.current;
     _report = (cause) {
       try {
@@ -34,6 +50,7 @@ final class Runtime {
   }
 
   final _scope = createScope();
+  final Context _context;
   late final void Function(Cause<Object?>) _report;
   Future<Exit<void, Never>>? _closing;
 
@@ -52,7 +69,13 @@ final class Runtime {
         report: _report,
       );
     }
-    return startFiber(task, owner: _scope, report: _report, signal: signal);
+    return startFiber(
+      task,
+      owner: _scope,
+      report: _report,
+      signal: signal,
+      context: _context,
+    );
   }
 
   /// Runs [task] and returns its complete exit after resource cleanup.

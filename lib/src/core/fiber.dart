@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'cancellation.dart';
 import 'cause.dart';
+import 'context.dart';
 import 'exit.dart';
 import 'option.dart';
 import 'scope.dart';
@@ -114,6 +115,7 @@ final _currentFibers = Object();
 Fiber<T, E> startFiber<T, E>(
   Task<T, E> task, {
   required Scope owner,
+  required Context context,
   required void Function(Cause<Object?> cause) report,
   bool inheritHost = true,
   CancellationSignal? signal,
@@ -138,6 +140,7 @@ Fiber<T, E> startFiber<T, E>(
             signal: fiber._controller.signal,
             scope: fiber._scope,
             fiber: fiber,
+            context: context,
           );
         } catch (error, stackTrace) {
           result = TaskEvaluation.fresh(

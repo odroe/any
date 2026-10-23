@@ -1,11 +1,16 @@
 import 'dart:math' as math;
 
+import 'context.dart';
+
 /// A replaceable source of pseudorandom integers, doubles, and booleans.
 ///
 /// The default implementation uses [math.Random] and is not suitable for
 /// cryptographic purposes. Implement this interface to control random choices
 /// in tests or to supply another source.
 abstract interface class RandomSource {
+  /// Identifies the pseudorandom source installed in a runtime or local context.
+  static final key = ServiceKey<RandomSource>('random');
+
   /// Creates a source backed by [math.Random], optionally initialized with [seed].
   ///
   /// A seed controls the generator's initial state. The generated sequence is

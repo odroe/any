@@ -99,6 +99,11 @@ final class Context {
   }
 }
 
+// Explicit local providers replace matching bindings and inherit all others.
+// Keep this operation internal so Context.merge continues to diagnose mistakes.
+Context overlayContexts(Context base, Context provided) =>
+    Context._({...base._services, ...provided._services});
+
 /// Indicates that a required service [key] is absent from a [Context].
 final class MissingService implements Exception {
   /// Creates a diagnostic for the absent [key].
