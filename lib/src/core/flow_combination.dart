@@ -63,6 +63,36 @@ extension FlowCombinationOperations<T, E> on Flow<T, E> {
       ).withError<E>().map((_) => zipped.cursor);
     }),
   );
+
+  /// Combines each update with the most recent element from the other input.
+  ///
+  /// Both inputs open and read concurrently. Nothing is emitted until each has
+  /// produced an element; earlier updates retain only that input's latest value.
+  /// Afterwards, each observed update emits a record in completion order. Its
+  /// first field comes from this flow and its second from [other].
+  ///
+  /// Each input retains one latest value and has at most one pending read or
+  /// undelivered update. The latest value's resources stay alive until replaced
+  /// or consumption ends. Each output holds independent leases, so replacing a
+  /// latest value cannot invalidate records still used downstream.
+  ///
+  /// A completed input keeps its latest value while the other continues. An
+  /// input that ends without producing an element ends the combined flow and
+  /// stops the other input. Failure, early termination, and cancellation wait
+  /// for both inputs and their cleanup, including pending native Futures.
+  Flow<(T, U), E> combineLatest<U>(Flow<U, E> other) => flowFromCursor(
+    Scope.open().withError<E>().flatMap((owner) {
+      final combined = _Latest(
+        _PullSlot(openFlowCursor(this), owner),
+        _PullSlot(openFlowCursor(other), owner),
+        owner,
+      );
+      return inTaskScope(
+        Task.addFinalizer(combined.cleanup),
+        owner,
+      ).withError<E>().map((_) => combined.cursor);
+    }),
+  );
 }
 
 final class _Entry<T> {
@@ -470,6 +500,130 @@ final class _Zipped<A, B, E> {
     output.current = null;
     left.entry = null;
     right.entry = null;
+    return readers.cleanup();
+  });
+}
+
+enum _Side { left, right }
+
+final class _Latest<A, B, E> {
+  _Latest(this.left, this.right, Scope owner)
+    : readers = _Readers(owner),
+      output = _Output(owner);
+
+  final _PullSlot<A, E> left;
+  final _PullSlot<B, E> right;
+  final _Readers<E> readers;
+  final _Output output;
+  final _updates = Queue<_Side>();
+  _Entry<A>? _leftLatest;
+  _Entry<B>? _rightLatest;
+
+  late final cursor = FlowCursor<(A, B), E>(
+    _pull(),
+    () => output.scope,
+    _finish,
+    output.producers,
+  );
+
+  bool get _ended =>
+      (left.ended && left.fiber == null && _leftLatest == null) ||
+      (right.ended && right.fiber == null && _rightLatest == null) ||
+      (left.ended && right.ended && !readers.active);
+
+  Task<Option<(A, B)>, E> _pull() => Task.defer(() {
+    if (output.current != null) {
+      return output
+          .retire(const Exit.success(null))
+          .withError<E>()
+          .flatMap((_) => _pull());
+    }
+    if (readers.stopping) {
+      return readers.awaitStopped().withError<E>().flatMap(
+        (_) => readers.result(() => const Option<Never>.none()),
+      );
+    }
+    return readers
+        .start(left, onReady: () => _updates.addLast(_Side.left))
+        .flatMap(
+          (_) => readers.start(
+            right,
+            onReady: () => _updates.addLast(_Side.right),
+          ),
+        )
+        .withError<E>()
+        .flatMap((_) {
+          if (readers.stopping) return _pull();
+          if (_ended) {
+            return _finish(const Exit.success(null))
+                .withError<E>()
+                .map((_) => const Option<Never>.none());
+          }
+          if (_updates.isNotEmpty) return _update(_updates.removeFirst());
+          return readers
+              .wait(() => readers.stopping || _ended || _updates.isNotEmpty)
+              .withError<E>()
+              .flatMap((_) => _pull());
+        });
+  });
+
+  Task<Option<(A, B)>, E> _update(_Side side) {
+    final List<FlowProducer> previous;
+    switch (side) {
+      case _Side.left:
+        final next = left.entry;
+        if (next == null) return _pull();
+        left.entry = null;
+        previous = _leftLatest?.producers ?? const [];
+        _leftLatest = next;
+      case _Side.right:
+        final next = right.entry;
+        if (next == null) return _pull();
+        right.entry = null;
+        previous = _rightLatest?.producers ?? const [];
+        _rightLatest = next;
+    }
+    return _release(previous).withError<E>().flatMap((_) {
+      final a = _leftLatest;
+      final b = _rightLatest;
+      if (readers.stopping || a == null || b == null) return _pull();
+      final retained = [...a.producers, ...b.producers];
+      for (final producer in retained) {
+        producer.retain();
+      }
+      return Task.succeed(output.emit((a.value, b.value), retained));
+    });
+  }
+
+  Task<void, Never> _finish(Exit<Object?, Object?> exit) => Task.defer(() {
+    readers.stop();
+    return readers.awaitStopped().flatMap((_) {
+      final retained = [
+        ...?left.entry?.producers,
+        ...?right.entry?.producers,
+        ...?_leftLatest?.producers,
+        ...?_rightLatest?.producers,
+      ];
+      left.entry = null;
+      right.entry = null;
+      _leftLatest = null;
+      _rightLatest = null;
+      _updates.clear();
+      return left
+          .finish(exit)
+          .ensuring(right.finish(exit))
+          .ensuring(_release(retained))
+          .ensuring(output.finish(exit));
+    });
+  });
+
+  Task<void, Never> cleanup(Exit<Object?, Object?> exit) => Task.defer(() {
+    output.current = null;
+    left.entry = null;
+    right.entry = null;
+    _leftLatest = null;
+    _rightLatest = null;
+    _updates.clear();
     return readers.cleanup();
   });
 }
