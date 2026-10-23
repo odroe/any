@@ -145,23 +145,48 @@ extension FlowOperations<T, E> on Flow<T, E> {
     (source) => source.pull().map((item) => item.map(transform)),
   );
 
-  /// Runs [transform] for each element, one task at a time and in input order.
+  /// Runs [transform] with at most [concurrency] outstanding elements.
   ///
-  /// The next element is requested only after the current task succeeds.
-  /// Acquired resources belong to the current producer and are released before
-  /// its inputs. Use Task.scoped inside [transform] for resources needed by only
-  /// that step. Inner flows and concatenated branches have separate lifetimes.
-  Flow<U, E> mapTask<U>(Task<U, E> Function(T value) transform) => _transform(
-    _open,
-    (source) => source.pull().flatMap(
-      (item) => switch (item) {
-        OptionSome(:final value) => inTaskScope(
-          transform(value),
-          source.scope,
-        ).map(Option.some),
-        OptionNone() => Task.succeed(const Option<Never>.none()),
-      },
-    ),
+  /// By default, results retain input order. Set [preserveOrder] to false to
+  /// emit them in completion order. Input is always pulled sequentially. The
+  /// limit includes running tasks, completed results awaiting delivery, and the
+  /// element being consumed. With the default limit of one there is no prefetch.
+  ///
+  /// Each result has a scope for resources acquired by its mapping task and
+  /// downstream callbacks. They are released after that element is consumed,
+  /// before releasing its input resources. Input resources remain available
+  /// even if prefetch advances to another inner flow or concatenated branch.
+  /// Use Task.scoped inside [transform] for resources needed only during mapping.
+  ///
+  /// Failure stops further input and cancels unfinished work, waiting for its
+  /// cleanup. Early termination also waits and retains already observed defects.
+  /// [concurrency] must be positive; invalid values become [RangeError] defects
+  /// before upstream work starts.
+  Flow<U, E> mapTask<U>(
+    Task<U, E> Function(T value) transform, {
+    int concurrency = 1,
+    bool preserveOrder = true,
+  }) => Flow._(
+    Task.defer(() {
+      if (concurrency < 1) {
+        throw RangeError.range(concurrency, 1, null, 'concurrency');
+      }
+      return Scope.open().withError<E>().flatMap(
+        (owner) => inTaskScope(_open, owner).flatMap((source) {
+          final mapping = _ConcurrentMap(
+            source,
+            owner,
+            transform,
+            concurrency,
+            preserveOrder,
+          );
+          return inTaskScope(
+            Task.addFinalizer(mapping.cleanup),
+            owner,
+          ).withError<E>().map((_) => mapping.cursor);
+        }),
+      );
+    }),
   );
 
   /// Keeps elements for which [test] returns true, preserving their order.
@@ -191,9 +216,10 @@ extension FlowOperations<T, E> on Flow<T, E> {
   /// Consumes each flow returned by [transform] fully before requesting another
   /// element from this flow.
   ///
-  /// Each inner producer is closed before the next is opened. Failure stops
-  /// both producers. Resources from the outer element remain available to its
-  /// inner flow.
+  /// Resources from the outer element remain available to its inner flow.
+  /// Downstream concurrent mapping can keep an earlier inner producer alive
+  /// while its emitted values are still in use. Otherwise each inner producer
+  /// closes before the next opens. Failure stops further production.
   Flow<U, E> flatMap<U>(Flow<U, E> Function(T value) transform) => Flow._(
     _open.map((source) {
       _Cursor<U, E>? inner;
@@ -219,7 +245,12 @@ extension FlowOperations<T, E> on Flow<T, E> {
           },
         );
       });
-      return _Cursor(next(), () => inner?.scope ?? source.scope, source.close);
+      return _Cursor(
+        next(),
+        () => inner?.scope ?? source.scope,
+        source.close,
+        () => [...source._producers(), ...?inner?._producers()],
+      );
     }),
   );
 
@@ -260,7 +291,7 @@ extension FlowOperations<T, E> on Flow<T, E> {
           remaining--;
           return source.pull();
         });
-        return _Cursor(pull, source._scope, source.close);
+        return _Cursor(pull, source._scope, source.close, source._producers);
       });
     }),
   );
@@ -282,7 +313,7 @@ extension FlowOperations<T, E> on Flow<T, E> {
             return next();
           }),
         );
-        return _Cursor(next(), source._scope, source.close);
+        return _Cursor(next(), source._scope, source.close, source._producers);
       });
     }),
   );
@@ -321,9 +352,12 @@ extension FlowOperations<T, E> on Flow<T, E> {
         });
       });
 
-  /// Consumes [next] only after this producer completes and cleans up normally.
+  /// Starts [next] after this producer reaches its end.
   ///
-  /// A failure, including a cleanup defect, prevents [next] from starting.
+  /// Cleanup normally finishes before [next] starts. Downstream concurrent
+  /// mapping can keep earlier values in use; their producer stays alive until
+  /// those values finish consumption. Failures stop further production, even
+  /// when a delayed cleanup fails after [next] has already started.
   Flow<T, E> concat(Flow<T, E> next) => Flow._(
     accessTaskEnvironment(
       (owner, _) => _open.map((source) {
@@ -343,6 +377,7 @@ extension FlowOperations<T, E> on Flow<T, E> {
           pull,
           () => current.scope,
           (exit) => Task.defer(() => current.close(exit)),
+          () => current._producers(),
         );
       }),
     ),
@@ -359,6 +394,7 @@ extension FlowOperations<T, E> on Flow<T, E> {
             source.pull().mapError(transform),
             source._scope,
             source.close,
+            source._producers,
           ),
         ),
   );
@@ -377,28 +413,32 @@ extension FlowOperations<T, E> on Flow<T, E> {
         final pull = Task.defer(
           () => current.pull().recover((error) {
             if (replaced) return Task.fail(error);
-            final Task<Option<T>, E> failed = Task.fail(error);
-            // Merge cleanup with the business failure before deciding whether
-            // recovery still applies. Pending cancellation then stops recovery.
-            return Task.uninterruptibleMask<Option<T>, E>(
-              (_) => failed.onExit(
-                (exit) => Task.defer(() => current.close(exit)),
-              ),
-            ).recover((error) {
-              replaced = true;
-              return inTaskScope(recover(error)._open, owner).flatMap((
-                replacement,
-              ) {
-                current = replacement;
-                return current.pull();
-              });
-            });
+            final failed = Exit<Object?, E>.failure(Cause.failure(error));
+            // Lease waits remain cancellable; Scope.close itself waits for all
+            // cleanup. Add the body failure before considering recovery.
+            return current
+                .close(failed)
+                .withError<E>()
+                .mapCause(
+                  (cause) => Cause.combine([Cause.failure(error), cause]),
+                )
+                .flatMap<Option<T>>((_) => Task.fail(error))
+                .recover((error) {
+                  replaced = true;
+                  return inTaskScope(recover(error)._open, owner).flatMap((
+                    replacement,
+                  ) {
+                    current = replacement;
+                    return current.pull();
+                  });
+                });
           }),
         );
         return _Cursor(
           pull,
           () => current.scope,
           (exit) => Task.defer(() => current.close(exit)),
+          () => current._producers(),
         );
       }),
     ),
@@ -510,17 +550,24 @@ Flow<U, E> _transform<T, U, E>(
   Task<_Cursor<T, E>, E> open,
   Task<Option<U>, E> Function(_Cursor<T, E> source) transform,
 ) => Flow._(
-  open.map((source) => _Cursor(transform(source), source._scope, source.close)),
+  open.map(
+    (source) => _Cursor(
+      transform(source),
+      source._scope,
+      source.close,
+      source._producers,
+    ),
+  ),
 );
 
 Task<_Cursor<T, E>, E> _openCursor<T, E>(Task<Task<Option<T>, E>, E> open) =>
     Scope.open().map((scope) {
+      final producer = _Producer(scope);
       Task<Option<T>, E>? next;
       var closed = false;
       Task<void, Never> close(Exit<Object?, Object?> exit) => Task.defer(() {
-        if (closed) return Task.succeed(null);
         closed = true;
-        return scope.close(exit);
+        return producer.close(exit);
       });
       final pull = Task.defer(() {
         if (closed) return Task.succeed(const Option<Never>.none());
@@ -532,23 +579,27 @@ Task<_Cursor<T, E>, E> _openCursor<T, E>(Task<Task<Option<T>, E>, E> open) =>
             return initialized;
           });
         });
-        return inTaskScope(read, scope).flatMap(
-          (item) => item is OptionSome<T>
-              ? Task.succeed(item)
-              : close(const Exit.success(null)).withError<E>().map((_) => item),
-        );
+        return inTaskScope(read, scope).flatMap((item) {
+          if (item is OptionSome<T>) return Task.succeed(item);
+          closed = true;
+          return producer
+              .finish(const Exit.success(null))
+              .withError<E>()
+              .map((_) => item);
+        });
       });
-      return _Cursor(pull, () => scope, close);
+      return _Cursor(pull, () => scope, close, () => [producer]);
     });
 
 // Transformations share their producer's lifetime. Composite flows expose the
 // currently active producer so downstream acquisitions release before its inputs.
 final class _Cursor<T, E> {
-  _Cursor(this._pull, this._scope, this.close);
+  _Cursor(this._pull, this._scope, this.close, this._producers);
 
   final Task<Option<T>, E> _pull;
   final Scope Function() _scope;
   final Task<void, Never> Function(Exit<Object?, Object?> exit) close;
+  final List<_Producer> Function() _producers;
 
   Scope get scope => _scope();
   Task<Option<T>, E> pull() => _pull;
@@ -817,4 +868,395 @@ StackTrace _streamStack(Cause<Object?> cause) {
     if (reason case CauseDefect(:final stackTrace)) return stackTrace;
   }
   return StackTrace.current;
+}
+
+// Leases keep an emitted value's producer alive while downstream work uses it.
+// Normal completion may advance to another producer before those leases end.
+final class _Producer {
+  _Producer(this.scope, {this.afterClose});
+
+  final Scope scope;
+  final Future<TaskEvaluation<void, Never>> Function(Exit<Object?, Object?>)?
+  afterClose;
+  var _leases = 0;
+  Exit<Object?, Object?>? _exit;
+  Completer<void>? _released;
+  Future<TaskEvaluation<void, Never>>? _closing;
+
+  void retain() {
+    if (_closing != null) throw StateError('The producer has already closed.');
+    _leases++;
+  }
+
+  Task<void, Never> finish(Exit<Object?, Object?> exit) => Task.defer(() {
+    _exit ??= exit;
+    return _leases == 0 ? _closeTask() : Task.succeed(null);
+  });
+
+  Task<void, Never> close(Exit<Object?, Object?> exit) => Task.defer(() {
+    _exit ??= exit;
+    return waitForLeases().flatMap((_) => _closeTask());
+  });
+
+  Task<void, Never> waitForLeases() => Task.defer(() {
+    if (_leases == 0) return Task.succeed(null);
+    return Task.fromCallback<void, Never>((complete) {
+      var active = true;
+      (_released ??= Completer<void>()).future.then((_) {
+        if (active) complete(const Exit.success(null));
+      });
+      return () {
+        active = false;
+      };
+    });
+  });
+
+  Task<void, Never> _closeTask() => Task.uninterruptibleMask(
+    (_) => Task.fromFuture(
+      _closeNow,
+      onError: (Object error, StackTrace stackTrace) =>
+          Error.throwWithStackTrace(error, stackTrace),
+    ).flatMap(taskFromEvaluation),
+  );
+
+  Future<TaskEvaluation<void, Never>> release() {
+    if (_leases <= 0) {
+      throw StateError('The producer lease was already released.');
+    }
+    _leases--;
+    if (_leases != 0) {
+      return Future.value(const TaskEvaluation(Exit.success(null), []));
+    }
+    _released?.complete();
+    _released = null;
+    return _exit == null
+        ? Future.value(const TaskEvaluation(Exit.success(null), []))
+        : _closeNow();
+  }
+
+  Future<TaskEvaluation<void, Never>> _closeNow() => _closing ??= _close();
+
+  Future<TaskEvaluation<void, Never>> _close() async {
+    final exit = _exit!;
+    await closeScope(scope, exit);
+    final own = scopeCleanupFor(scope);
+    final after = afterClose;
+    return after == null ? own : _mergeEvaluations([own, await after(exit)]);
+  }
+}
+
+final class _MapEntry<T, E> {
+  _MapEntry(this.producer);
+
+  final _Producer producer;
+  TaskEvaluation<T, E>? result;
+}
+
+final class _ConcurrentMap<T, U, E> {
+  _ConcurrentMap(
+    this.source,
+    this.owner,
+    this.transform,
+    this.concurrency,
+    this.preserveOrder,
+  );
+
+  final _Cursor<T, E> source;
+  final Scope owner;
+  final Task<U, E> Function(T) transform;
+  final int concurrency;
+  final bool preserveOrder;
+  final _stopReason = Object();
+  final _entries = <_MapEntry<U, E>>{};
+  final _ordered = Queue<_MapEntry<U, E>>();
+  final _ready = Queue<_MapEntry<U, E>>();
+  final _failures = <TaskEvaluation<Object?, E>>[];
+  final _active = <Fiber<U, E>>{};
+  Fiber<void, E>? _driver;
+  _MapEntry<U, E>? _current;
+  void Function()? _consumerWake;
+  void Function()? _driverWake;
+  var _started = false;
+  var _driverDone = false;
+  var _ended = false;
+  var _stopping = false;
+
+  late final cursor = _Cursor<U, E>(
+    _pull(),
+    () => _current?.producer.scope ?? owner,
+    _close,
+    () => [if (_current case final current?) current.producer],
+  );
+
+  Task<Option<U>, E> _pull() => Task.defer(() {
+    final previous = _current;
+    if (previous != null) {
+      _current = null;
+      return previous.producer
+          .finish(const Exit.success(null))
+          .withError<E>()
+          .flatMap((_) => _pull());
+    }
+    if (!_started) {
+      _started = true;
+      return forkTaskIn(
+        _produce(),
+        owner,
+        inheritHost: true,
+      ).withError<E>().flatMap((fiber) {
+        _driver = fiber;
+        listenFiber(fiber, (exit) {
+          _driverDone = true;
+          if (exit is ExitFailure<void, E>) {
+            _failures.add(TaskEvaluation(exit, fiberFailureEvents(fiber)));
+            _stop();
+          }
+          _notify();
+        });
+        return _pull();
+      });
+    }
+    if (_stopping) {
+      if (!_driverDone || _active.isNotEmpty) {
+        return _wait().withError<E>().flatMap((_) => _pull());
+      }
+      return taskFromEvaluation(
+        _failure<Option<U>, E>(() => const Option.none()),
+      );
+    }
+    final ready = preserveOrder ? _ordered : _ready;
+    if (ready.isNotEmpty && ready.first.result != null) {
+      final entry = ready.removeFirst();
+      if (preserveOrder) {
+        _ready.remove(entry);
+      } else {
+        _ordered.remove(entry);
+      }
+      _current = entry;
+      return Task.succeed(
+        Option.some((entry.result!.exit as ExitSuccess<U, E>).value),
+      );
+    }
+    if (_ended && _entries.isEmpty && _driverDone) {
+      return owner
+          .close(const Exit.success(null))
+          .withError<E>()
+          .map((_) => const Option.none());
+    }
+    return _wait().withError<E>().flatMap((_) => _pull());
+  });
+
+  Task<void, E> _produce() => Task.defer(() {
+    if (_stopping || _ended) return Task.succeed(null);
+    if (_entries.length >= concurrency) {
+      return Task.fromCallback<void, Never>((complete) {
+        void notify() {
+          _driverWake = null;
+          complete(const Exit.success(null));
+        }
+
+        _driverWake = notify;
+        if (_stopping || _entries.length < concurrency) notify();
+        return () {
+          if (identical(_driverWake, notify)) _driverWake = null;
+        };
+      }).withError<E>().flatMap((_) => _produce());
+    }
+    return source.pull().flatMap((item) {
+      if (item is OptionNone<T>) {
+        _ended = true;
+        _notify();
+        return Task.succeed(null);
+      }
+      final value = (item as OptionSome<T>).value;
+      return Task.sync(() {
+        final inputs = source._producers().toSet().toList();
+        final scope = createScope(parent: source.scope);
+        for (final input in inputs) {
+          input.retain();
+        }
+        late final _MapEntry<U, E> entry;
+        final producer = _Producer(
+          scope,
+          afterClose: (exit) async {
+            final results = <TaskEvaluation<void, Never>>[];
+            for (final input in inputs.reversed) {
+              results.add(await input.release());
+            }
+            _entries.remove(entry);
+            _notify();
+            return _mergeEvaluations(results);
+          },
+        );
+        entry = _MapEntry(producer);
+        _entries.add(entry);
+        _ordered.addLast(entry);
+        return entry;
+      }).withError<E>().flatMap(
+        (entry) =>
+            forkTaskIn(
+              inTaskScope(
+                Task.defer(() => transform(value)),
+                entry.producer.scope,
+              ),
+              owner,
+              inheritHost: true,
+            ).withError<E>().flatMap((fiber) {
+              _active.add(fiber);
+              if (_stopping) fiber.requestCancel(reason: _stopReason);
+              listenFiber(fiber, (exit) {
+                _active.remove(fiber);
+                final result = TaskEvaluation(exit, fiberFailureEvents(fiber));
+                entry.result = result;
+                if (exit is ExitFailure<U, E>) {
+                  _failures.add(result);
+                  _stop();
+                } else {
+                  _ready.addLast(entry);
+                }
+                _notify();
+              });
+              return _produce();
+            }),
+      );
+    });
+  });
+
+  bool get _canPull {
+    if (_stopping) return _driverDone && _active.isEmpty;
+    final ready = preserveOrder ? _ordered : _ready;
+    return (ready.isNotEmpty && ready.first.result != null) ||
+        (_ended && _entries.isEmpty && _driverDone);
+  }
+
+  Task<void, Never> _wait() => Task.fromCallback((complete) {
+    void notify() {
+      _consumerWake = null;
+      complete(const Exit.success(null));
+    }
+
+    _consumerWake = notify;
+    if (_canPull) notify();
+    return () {
+      if (identical(_consumerWake, notify)) _consumerWake = null;
+    };
+  });
+
+  void _notify() {
+    _driverWake?.call();
+    _consumerWake?.call();
+  }
+
+  void _stop() {
+    if (_stopping) return;
+    _stopping = true;
+    _driver?.requestCancel(reason: _stopReason);
+    for (final fiber in _active.toList()) {
+      fiber.requestCancel(reason: _stopReason);
+    }
+    _notify();
+  }
+
+  Task<void, Never> _close(Exit<Object?, Object?> exit) => Task.defer(() {
+    _stop();
+    if (_started && (!_driverDone || _active.isNotEmpty)) {
+      return _wait().flatMap((_) => _close(exit));
+    }
+    final entries = _entries.toList().reversed.toList();
+    Task<void, Never> closeAt(int index) => Task.defer(
+      () => index == entries.length
+          ? owner.close(exit)
+          : entries[index].producer.waitForLeases().flatMap(
+              (_) => closeAt(index + 1),
+            ),
+    );
+    return closeAt(0);
+  });
+
+  Task<void, Never> cleanup(Exit<Object?, Object?> exit) => Task.defer(() {
+    // Scope has already stopped every worker and closed the producer tree.
+    // Waiting for leases here would wait on resources this same scope owns.
+    _stop();
+    _entries.clear();
+    _ordered.clear();
+    _ready.clear();
+    _current = null;
+    return taskFromEvaluation(_failure<void, Never>(() {}, defectsOnly: true));
+  });
+
+  TaskEvaluation<A, F> _failure<A, F>(
+    A Function() success, {
+    bool defectsOnly = false,
+  }) {
+    final causes = <Cause<F>>[];
+    final events = <FailureEvent>[];
+    final seen = <Object>{};
+    for (final result in _failures) {
+      if (result.exit case ExitFailure(:final cause)) {
+        final sources = Map<CauseDefect, Queue<FailureEvent>>.identity();
+        for (final event in result.events) {
+          (sources[event.cause] ??= Queue()).addLast(event);
+        }
+        for (final reason in _causes(cause)) {
+          switch (reason) {
+            case CauseDefect():
+              final event = sources[reason]!.removeFirst();
+              if (seen.add(event.source)) {
+                causes.add(reason);
+                events.add(event);
+              }
+            case CauseFailure(:final error):
+              if (!defectsOnly) causes.add(Cause.failure(error as F));
+            case CauseCancelled(:final reason):
+              if (!defectsOnly && !identical(reason, _stopReason)) {
+                causes.add(Cause.cancelled(reason));
+              }
+            case CauseGroup():
+              throw StateError('Cause groups must be flat.');
+          }
+        }
+      }
+    }
+    return TaskEvaluation(
+      causes.isEmpty
+          ? Exit.success(success())
+          : Exit.failure(Cause.combine(causes)),
+      List.unmodifiable(events),
+    );
+  }
+}
+
+List<Cause<E>> _causes<E>(Cause<E> cause) => switch (cause) {
+  CauseGroup(:final causes) => causes,
+  _ => [cause],
+};
+
+TaskEvaluation<void, Never> _mergeEvaluations(
+  Iterable<TaskEvaluation<void, Never>> results,
+) {
+  final causes = <Cause<Never>>[];
+  final events = <FailureEvent>[];
+  final seen = <Object>{};
+  for (final result in results) {
+    if (result.exit case ExitFailure(:final cause)) {
+      final sources = Map<CauseDefect, Queue<FailureEvent>>.identity();
+      for (final event in result.events) {
+        (sources[event.cause] ??= Queue()).addLast(event);
+      }
+      for (final reason in _causes(cause)) {
+        if (reason is CauseDefect) {
+          final event = sources[reason]!.removeFirst();
+          if (!seen.add(event.source)) continue;
+          events.add(event);
+        }
+        causes.add(reason);
+      }
+    }
+  }
+  return TaskEvaluation(
+    causes.isEmpty
+        ? const Exit.success(null)
+        : Exit.failure(Cause.combine(causes)),
+    List.unmodifiable(events),
+  );
 }
