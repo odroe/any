@@ -15,3 +15,5 @@ export 'src/core/cancellation.dart'
     show CancellationController, CancellationSignal;
 export 'src/core/context.dart'
     show ServiceKey, ServiceBinding, Context, MissingService, DuplicateService;
+export 'src/core/task.dart' show Task, TaskOperations, InfallibleTaskOperations;
+export 'src/core/runtime.dart' show Runtime, RuntimeClosed, TaskException;
