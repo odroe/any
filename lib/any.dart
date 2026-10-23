@@ -82,3 +82,4 @@ export 'src/core/pool.dart' show Pool, PoolOperations;
 export 'src/core/flow_timing.dart' show FlowTimingOperations;
 export 'src/core/flow_combination.dart' show FlowCombinationOperations;
 export 'src/core/flow_aggregation.dart' show FlowAggregationOperations;
+export 'src/core/flow_sharing.dart' show FlowSharingOperations;
