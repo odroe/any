@@ -35,13 +35,14 @@ void main() {
       final source = RandomSource(seed: 42);
 
       expect(source.nextInt(1), 0);
-      expect(source.nextInt(1 << 32), inInclusiveRange(0, (1 << 32) - 1));
+      const maximum = 4294967296;
+      expect(source.nextInt(maximum), inInclusiveRange(0, maximum - 1));
     });
 
     test('rejects invalid integer bounds', () {
       final source = RandomSource(seed: 42);
 
-      for (final max in [-1, 0, (1 << 32) + 1]) {
+      for (final max in [-1, 0, 4294967297]) {
         expect(() => source.nextInt(max), throwsArgumentError);
       }
     });

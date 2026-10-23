@@ -19,7 +19,7 @@ abstract interface class RandomSource {
 
   /// Returns an integer from zero, inclusive, to [max], exclusive.
   ///
-  /// The default source accepts [max] from 1 through `1 << 32`, inclusive, and
+  /// The default source accepts [max] from 1 through `2^32`, inclusive, and
   /// preserves [math.Random.nextInt]'s behavior for invalid bounds.
   int nextInt(int max);
 
