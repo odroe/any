@@ -6,6 +6,7 @@ import 'cancellation.dart';
 import 'cause.dart';
 import 'exit.dart';
 import 'fiber.dart';
+import 'internal/flow_cursor.dart';
 import 'option.dart';
 import 'runtime.dart';
 import 'scope.dart';
@@ -28,7 +29,7 @@ final class Flow<T, E> {
 
   Flow._source(Task<Task<Option<T>, E>, E> open) : _open = _openCursor(open);
 
-  final Task<_Cursor<T, E>, E> _open;
+  final Task<FlowCursor<T, E>, E> _open;
 
   /// Reads [values] lazily using a new iterator for each consumption.
   ///
@@ -224,7 +225,7 @@ extension FlowOperations<T, E> on Flow<T, E> {
   /// closes before the next opens. Failure stops further production.
   Flow<U, E> flatMap<U>(Flow<U, E> Function(T value) transform) => Flow._(
     _open.map((source) {
-      _Cursor<U, E>? inner;
+      FlowCursor<U, E>? inner;
       Task<Option<U>, E> next() => Task.defer(() {
         final current = inner;
         if (current != null) {
@@ -247,11 +248,11 @@ extension FlowOperations<T, E> on Flow<T, E> {
           },
         );
       });
-      return _Cursor(
+      return FlowCursor(
         next(),
         () => inner?.scope ?? source.scope,
         source.finish,
-        () => [...source._producers(), ...?inner?._producers()],
+        () => [...source.producers(), ...?inner?.producers()],
       );
     }),
   );
@@ -347,7 +348,12 @@ extension FlowOperations<T, E> on Flow<T, E> {
           remaining--;
           return source.pull();
         });
-        return _Cursor(pull, source._scope, source.finish, source._producers);
+        return FlowCursor(
+          pull,
+          source.scopeForValue,
+          source.finish,
+          source.producers,
+        );
       });
     }),
   );
@@ -369,7 +375,12 @@ extension FlowOperations<T, E> on Flow<T, E> {
             return next();
           }),
         );
-        return _Cursor(next(), source._scope, source.finish, source._producers);
+        return FlowCursor(
+          next(),
+          source.scopeForValue,
+          source.finish,
+          source.producers,
+        );
       });
     }),
   );
@@ -429,11 +440,11 @@ extension FlowOperations<T, E> on Flow<T, E> {
             });
           }),
         );
-        return _Cursor(
+        return FlowCursor(
           pull,
           () => current.scope,
           (exit) => Task.defer(() => current.finish(exit)),
-          () => current._producers(),
+          () => current.producers(),
         );
       }),
     ),
@@ -446,11 +457,11 @@ extension FlowOperations<T, E> on Flow<T, E> {
     _open
         .mapError(transform)
         .map(
-          (source) => _Cursor(
+          (source) => FlowCursor(
             source.pull().mapError(transform),
-            source._scope,
+            source.scopeForValue,
             source.finish,
-            source._producers,
+            source.producers,
           ),
         ),
   );
@@ -495,11 +506,11 @@ extension FlowOperations<T, E> on Flow<T, E> {
                 });
           }),
         );
-        return _Cursor(
+        return FlowCursor(
           pull,
           () => current.scope,
           (exit) => Task.defer(() => current.finish(exit)),
-          () => current._producers(),
+          () => current.producers(),
         );
       }),
     ),
@@ -608,22 +619,22 @@ void _checkCount(int count) {
 }
 
 Flow<U, E> _transform<T, U, E>(
-  Task<_Cursor<T, E>, E> open,
-  Task<Option<U>, E> Function(_Cursor<T, E> source) transform,
+  Task<FlowCursor<T, E>, E> open,
+  Task<Option<U>, E> Function(FlowCursor<T, E> source) transform,
 ) => Flow._(
   open.map(
-    (source) => _Cursor(
+    (source) => FlowCursor(
       transform(source),
-      source._scope,
+      source.scopeForValue,
       source.finish,
-      source._producers,
+      source.producers,
     ),
   ),
 );
 
-Task<_Cursor<T, E>, E> _openCursor<T, E>(Task<Task<Option<T>, E>, E> open) =>
+Task<FlowCursor<T, E>, E> _openCursor<T, E>(Task<Task<Option<T>, E>, E> open) =>
     Scope.open().map((scope) {
-      final producer = _Producer(scope);
+      final producer = FlowProducer(scope);
       Task<Option<T>, E>? next;
       var closed = false;
       Task<void, Never> finish(Exit<Object?, Object?> exit) => Task.defer(() {
@@ -649,23 +660,8 @@ Task<_Cursor<T, E>, E> _openCursor<T, E>(Task<Task<Option<T>, E>, E> open) =>
               .map((_) => item);
         });
       });
-      return _Cursor(pull, () => scope, finish, () => [producer]);
+      return FlowCursor(pull, () => scope, finish, () => [producer]);
     });
-
-// A pull acknowledges the preceding delivery; its transport slot can be reused.
-// Operators retaining values must retain this resource snapshot before pulling
-// again. Finishing production retires scopes without waiting on downstream leases.
-final class _Cursor<T, E> {
-  _Cursor(this._pull, this._scope, this.finish, this._producers);
-
-  final Task<Option<T>, E> _pull;
-  final Scope Function() _scope;
-  final Task<void, Never> Function(Exit<Object?, Object?> exit) finish;
-  final List<_Producer> Function() _producers;
-
-  Scope get scope => _scope();
-  Task<Option<T>, E> pull() => _pull;
-}
 
 final class _StreamSource<T> {
   _StreamSource(this.capacity, this.overflow);
@@ -932,87 +928,23 @@ StackTrace _streamStack(Cause<Object?> cause) {
   return StackTrace.current;
 }
 
-// Leases keep an emitted value's producer alive while downstream work uses it.
-// Normal completion may advance to another producer before those leases end.
-final class _Producer {
-  _Producer(this.scope, {this.afterClose});
-
-  final Scope scope;
-  final Future<TaskEvaluation<void, Never>> Function(Exit<Object?, Object?>)?
-  afterClose;
-  var _leases = 0;
-  Exit<Object?, Object?>? _exit;
-  Future<TaskEvaluation<void, Never>>? _closing;
-
-  void retain() {
-    if (_closing != null) throw StateError('The producer has already closed.');
-    _leases++;
-  }
-
-  Task<void, Never> finish(Exit<Object?, Object?> exit) => Task.defer(() {
-    _exit ??= exit;
-    // An enclosing Scope close already owns this cleanup. Waiting from one of
-    // its finalizers could wait on a sibling queued behind that same finalizer.
-    if (_closing == null && scopeIsClosing(scope)) return Task.succeed(null);
-    return _leases == 0 ? _closeTask() : Task.succeed(null);
-  });
-
-  Task<void, Never> _closeTask() => Task.uninterruptibleMask(
-    (_) => Task.fromFuture(
-      _closeNow,
-      onError: (Object error, StackTrace stackTrace) =>
-          Error.throwWithStackTrace(error, stackTrace),
-    ).flatMap(taskFromEvaluation),
-  );
-
-  Future<TaskEvaluation<void, Never>> release() {
-    if (_leases <= 0) {
-      throw StateError('The producer lease was already released.');
-    }
-    _leases--;
-    if (_leases != 0) {
-      return Future.value(const TaskEvaluation(Exit.success(null), []));
-    }
-    return _exit == null || (_closing == null && scopeIsClosing(scope))
-        ? Future.value(const TaskEvaluation(Exit.success(null), []))
-        : _closeNow();
-  }
-
-  Future<TaskEvaluation<void, Never>> _closeNow() {
-    final closing = _closing;
-    // A producer has one delivery path for cleanup failure: the call that
-    // initiates closure. Later retirement waits without replaying that result.
-    return closing == null
-        ? _closing = _close()
-        : closing.then((_) => const TaskEvaluation(Exit.success(null), []));
-  }
-
-  Future<TaskEvaluation<void, Never>> _close() async {
-    final exit = _exit!;
-    await closeScope(scope, exit);
-    final own = scopeCleanupFor(scope);
-    final after = afterClose;
-    return after == null ? own : _mergeEvaluations([own, await after(exit)]);
-  }
-}
-
 final class _BufferedEntry<T> {
   _BufferedEntry(this.value, this.scope, this.producers);
 
   final T value;
   final Scope scope;
-  final List<_Producer> producers;
+  final List<FlowProducer> producers;
 }
 
 final class _Buffered<T, E> {
   _Buffered(this.source, this.owner, this.capacity);
 
-  final _Cursor<T, E> source;
+  final FlowCursor<T, E> source;
   final Scope owner;
   final int capacity;
   final _stopReason = Object();
   final _values = Queue<_BufferedEntry<T>>();
-  late final _lifetime = _Producer(owner);
+  late final _lifetime = FlowProducer(owner);
   _BufferedEntry<T>? _current;
   Fiber<void, E>? _driver;
   TaskEvaluation<void, E>? _terminal;
@@ -1024,7 +956,7 @@ final class _Buffered<T, E> {
   var _stoppedByUs = false;
   var _terminalDelivered = false;
 
-  late final cursor = _Cursor<T, E>(
+  late final cursor = FlowCursor<T, E>(
     _pull(),
     () => _current?.scope ?? owner,
     _finish,
@@ -1114,7 +1046,7 @@ final class _Buffered<T, E> {
     // The sole driver reserves the remaining slot until this pull finishes.
     return source.pull().flatMap((item) {
       if (item is OptionNone<T>) return Task.succeed(null);
-      final producers = source._producers().toSet().toList();
+      final producers = source.producers().toSet().toList();
       for (final producer in producers) {
         producer.retain();
       }
@@ -1166,10 +1098,10 @@ final class _Buffered<T, E> {
         .ensuring(_lifetime.finish(exit));
   });
 
-  Task<void, Never> _release(List<_Producer> producers) =>
+  Task<void, Never> _release(List<FlowProducer> producers) =>
       Task.uninterruptibleMask(
         (_) => Task.fromFuture(
-          () => _releaseProducers(producers),
+          () => releaseFlowProducers(producers),
           onError: Error.throwWithStackTrace,
         ).flatMap(taskFromEvaluation),
       );
@@ -1206,7 +1138,7 @@ final class _Buffered<T, E> {
 final class _MapEntry<T, E> {
   _MapEntry(this.producer);
 
-  final _Producer producer;
+  final FlowProducer producer;
   TaskEvaluation<T, E>? result;
 }
 
@@ -1219,7 +1151,7 @@ final class _ConcurrentMap<T, U, E> {
     this.preserveOrder,
   );
 
-  final _Cursor<T, E> source;
+  final FlowCursor<T, E> source;
   final Scope owner;
   final Task<U, E> Function(T) transform;
   final int concurrency;
@@ -1227,7 +1159,7 @@ final class _ConcurrentMap<T, U, E> {
   final _stopReason = Object();
   final _admitted = <_MapEntry<U, E>>{};
   final _resources = <_MapEntry<U, E>>{};
-  late final _lifetime = _Producer(owner);
+  late final _lifetime = FlowProducer(owner);
   final _ordered = Queue<_MapEntry<U, E>>();
   final _ready = Queue<_MapEntry<U, E>>();
   final _failures = <TaskEvaluation<Object?, E>>[];
@@ -1241,7 +1173,7 @@ final class _ConcurrentMap<T, U, E> {
   var _ended = false;
   var _stopping = false;
 
-  late final cursor = _Cursor<U, E>(
+  late final cursor = FlowCursor<U, E>(
     _pull(),
     () => _current?.producer.scope ?? owner,
     _finish,
@@ -1334,14 +1266,14 @@ final class _ConcurrentMap<T, U, E> {
       }
       final value = (item as OptionSome<T>).value;
       return Task.sync(() {
-        final inputs = source._producers().toSet().toList();
+        final inputs = source.producers().toSet().toList();
         final scope = createScope(parent: source.scope);
         for (final input in inputs) {
           input.retain();
         }
         _lifetime.retain();
         late final _MapEntry<U, E> entry;
-        final producer = _Producer(
+        final producer = FlowProducer(
           scope,
           afterClose: (exit) async {
             final results = <TaskEvaluation<void, Never>>[];
@@ -1350,7 +1282,7 @@ final class _ConcurrentMap<T, U, E> {
             }
             _resources.remove(entry);
             results.add(await _lifetime.release());
-            return _mergeEvaluations(results);
+            return mergeFlowEvaluations(results);
           },
         );
         entry = _MapEntry(producer);
@@ -1500,49 +1432,19 @@ List<Cause<E>> _causes<E>(Cause<E> cause) => switch (cause) {
   _ => [cause],
 };
 
-TaskEvaluation<void, Never> _mergeEvaluations(
-  Iterable<TaskEvaluation<void, Never>> results,
-) {
-  final causes = <Cause<Never>>[];
-  final events = <FailureEvent>[];
-  final seen = <Object>{};
-  for (final result in results) {
-    if (result.exit case ExitFailure(:final cause)) {
-      final sources = Map<CauseDefect, Queue<FailureEvent>>.identity();
-      for (final event in result.events) {
-        (sources[event.cause] ??= Queue()).addLast(event);
-      }
-      for (final reason in _causes(cause)) {
-        if (reason is CauseDefect) {
-          final event = sources[reason]!.removeFirst();
-          if (!seen.add(event.source)) continue;
-          events.add(event);
-        }
-        causes.add(reason);
-      }
-    }
-  }
-  return TaskEvaluation(
-    causes.isEmpty
-        ? const Exit.success(null)
-        : Exit.failure(Cause.combine(causes)),
-    List.unmodifiable(events),
-  );
-}
-
 final class _Grouped<T, E> {
   _Grouped(this.source, this.owner, this.size);
 
-  final _Cursor<T, E> source;
+  final FlowCursor<T, E> source;
   final Scope owner;
   final int size;
-  late final _lifetime = _Producer(owner);
+  late final _lifetime = FlowProducer(owner);
   final _values = <T>[];
-  final _inputs = <_Producer>[];
-  _Producer? _current;
+  final _inputs = <FlowProducer>[];
+  FlowProducer? _current;
   var _ended = false;
 
-  late final cursor = _Cursor<List<T>, E>(
+  late final cursor = FlowCursor<List<T>, E>(
     _pull(),
     () => _current?.scope ?? owner,
     _finish,
@@ -1572,7 +1474,7 @@ final class _Grouped<T, E> {
   Task<Option<List<T>>, E> _collect() => Task.defer(
     () => source.pull().flatMap((item) {
       if (item case OptionSome(:final value)) {
-        final inputs = source._producers().toSet();
+        final inputs = source.producers().toSet();
         for (final producer in inputs) {
           producer.retain();
           _inputs.add(producer);
@@ -1597,11 +1499,11 @@ final class _Grouped<T, E> {
     _inputs.clear();
     final scope = createScope(parent: owner);
     _lifetime.retain();
-    _current = _Producer(
+    _current = FlowProducer(
       scope,
       afterClose: (_) async {
-        final released = await _releaseProducers(inputs);
-        return _mergeEvaluations([released, await _lifetime.release()]);
+        final released = await releaseFlowProducers(inputs);
+        return mergeFlowEvaluations([released, await _lifetime.release()]);
       },
     );
     return values;
@@ -1616,7 +1518,7 @@ final class _Grouped<T, E> {
     _values.clear();
     final release = Task.uninterruptibleMask<void, Never>(
       (_) => Task.fromFuture(
-        () => _releaseProducers(inputs),
+        () => releaseFlowProducers(inputs),
         onError: Error.throwWithStackTrace,
       ).flatMap(taskFromEvaluation),
     );
@@ -1628,12 +1530,7 @@ final class _Grouped<T, E> {
   });
 }
 
-Future<TaskEvaluation<void, Never>> _releaseProducers(
-  List<_Producer> producers,
-) async {
-  final results = <TaskEvaluation<void, Never>>[];
-  for (final producer in producers.reversed) {
-    results.add(await producer.release());
-  }
-  return _mergeEvaluations(results);
-}
+// Internal bridges for flow operators in other libraries; not exported.
+Task<FlowCursor<T, E>, E> openFlowCursor<T, E>(Flow<T, E> flow) => flow._open;
+
+Flow<T, E> flowFromCursor<T, E>(Task<FlowCursor<T, E>, E> open) => Flow._(open);
