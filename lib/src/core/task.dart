@@ -8,6 +8,7 @@ import 'fiber.dart';
 import 'internal/task_concurrency.dart';
 import 'internal/task_timing.dart';
 import 'internal/task_timeout.dart';
+import 'option.dart';
 import 'result.dart';
 import 'schedule.dart';
 import 'scope.dart';
@@ -112,6 +113,60 @@ final class Task<T, E> {
 
   /// Describes a computation that succeeds with [value].
   static Task<T, Never> succeed<T>(T value) => Task._(_Success(value));
+
+  /// Runs [task] only when [condition] returns true during this execution.
+  ///
+  /// A skipped computation succeeds with [OptionNone]; a computed value,
+  /// including `null`, is wrapped in [OptionSome]. The condition is checked once
+  /// per execution, and exceptions from it become defects.
+  static Task<Option<T>, E> when<T, E>(
+    bool Function() condition,
+    Task<T, E> task,
+  ) => Task.defer(
+    () => condition()
+        ? task.map((value) => Option.some(value))
+        : Task.succeed(const Option.none()),
+  );
+
+  /// Repeatedly applies [step] while [whileTrue] accepts the current state.
+  ///
+  /// Each execution begins with [initial]. The condition is checked before
+  /// every step; the first state it rejects is returned. Failures stop the loop,
+  /// and exceptions in either callback become defects. Synchronous loops are
+  /// stack safe and use the executor's cooperative cancellation checks.
+  ///
+  /// Steps share the current resource scope. Apply [TaskOperations.scoped] to a
+  /// step when its resources must be released before the next iteration.
+  static Task<S, E> loop<S, E>(
+    S initial, {
+    required bool Function(S state) whileTrue,
+    required Task<S, E> Function(S state) step,
+  }) => Task.defer(
+    () => whileTrue(initial)
+        ? step(initial)
+              .flatMap((state) => loop(state, whileTrue: whileTrue, step: step))
+        : Task.succeed(initial),
+  );
+
+  /// Reduces [values] sequentially with a task-producing [combine] callback.
+  ///
+  /// Each execution creates a new iterator and starts with [initial]. The next
+  /// element is read only after the preceding task succeeds. Empty input
+  /// returns [initial]; iteration or callback exceptions become defects.
+  /// Combiner tasks share the current resource scope, like [flatMap].
+  static Task<S, E> fold<A, S, E>(
+    Iterable<A> values,
+    S initial,
+    Task<S, E> Function(S state, A value) combine,
+  ) => Task.defer(() {
+    final iterator = values.iterator;
+    Task<S, E> next(S state) => Task.defer(
+      () => iterator.moveNext()
+          ? combine(state, iterator.current).flatMap(next)
+          : Task.succeed(state),
+    );
+    return next(initial);
+  });
 
   /// Describes a computation that fails with the business [error].
   static Task<Never, E> fail<E>(E error) =>
