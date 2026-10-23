@@ -682,13 +682,17 @@ Task<R, E> provideTaskLocal<T, R, E>(
 Task<T, E> inTaskScope<T, E>(Task<T, E> task, Scope scope) =>
     Task._(_InScope(task._node, scope));
 
-Task<Fiber<T, E>, Never> forkTaskIn<T, E>(Task<T, E> task, Scope scope) =>
+Task<Fiber<T, E>, Never> forkTaskIn<T, E>(
+  Task<T, E> task,
+  Scope scope, {
+  bool inheritHost = false,
+}) =>
     Task._(
       _Fork(
         (_, parent, context, locals, _) => startFiber(
           task,
           owner: scope,
-          inheritHost: false,
+          inheritHost: inheritHost,
           deferStart: true,
           context: context,
           locals: locals,

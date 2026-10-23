@@ -48,3 +48,5 @@ export 'src/core/metric.dart'
 export 'src/core/schedule.dart' show Schedule;
 export 'src/core/rate_limiter.dart' show RateLimiter, RateLimiterOperations;
 export 'src/core/flow.dart' show Flow, FlowOperations, InfallibleFlowOperations;
+export 'src/core/circuit_breaker.dart'
+    show CircuitBreaker, CircuitBreakerState, CircuitBreakerOperations;
