@@ -7,6 +7,7 @@ import 'exit.dart';
 import 'fiber.dart';
 import 'internal/task_concurrency.dart';
 import 'internal/task_timing.dart';
+import 'internal/task_timeout.dart';
 import 'result.dart';
 import 'schedule.dart';
 import 'scope.dart';
@@ -279,6 +280,30 @@ typedef RestoreCancellation = Task<T, E> Function<T, E>(Task<T, E> task);
 
 /// Transforms and combines tasks using their static value and error types.
 extension TaskOperations<T, E> on Task<T, E> {
+  /// Limits this computation's time and maps expiration into its error type.
+  ///
+  /// Timing uses the current clock and includes resource cleanup. If the timer
+  /// wins, this cancels the computation and waits for it to finish before
+  /// calling [onTimeout]. Cleanup defects remain alongside the timeout error;
+  /// an exception in [onTimeout] becomes a defect without hiding those failures.
+  ///
+  /// This is a cooperative deadline. Non-cancellable Futures must settle before
+  /// this task returns. Nonpositive durations schedule a zero-delay timer;
+  /// synchronous work may finish before that timer is observed. Completion or
+  /// owner cancellation removes the timer and waits for all owned work.
+  Task<T, E> timeout(Duration duration, {required E Function() onTimeout}) =>
+      timeoutTask(this, duration, onTimeout: onTimeout);
+
+  /// Runs [fallback] if this computation exceeds [duration] without defects.
+  ///
+  /// The timed computation is cancelled and fully cleaned up before [fallback]
+  /// is called. Any defect, including cleanup failure, prevents the fallback
+  /// from starting. An ordinary business failure is propagated directly.
+  /// The fallback has no deadline of its own unless explicitly wrapped.
+  /// Timing and cancellation boundaries are those of [timeout].
+  Task<T, E> timeoutOrElse(Duration duration, Task<T, E> Function() fallback) =>
+      timeoutOrElseTask(this, duration, fallback);
+
   /// Waits for [duration] before starting this computation.
   ///
   /// Uses [Task.sleep], including its clock and cancellation rules. Cancelling
