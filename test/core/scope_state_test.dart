@@ -2,20 +2,34 @@ import 'dart:async';
 
 import 'package:any/any.dart';
 import 'package:any/src/core/scope.dart' as scopes;
+import 'package:any/src/core/task.dart' as tasks;
 import 'package:test/test.dart';
 
 void main() {
   late Runtime runtime;
 
-  Future<Exit<void, Never>> runFinalizer(
+  Future<tasks.TaskEvaluation<void, Never>> runFinalizer(
     Task<void, Never> task,
     scopes.Scope scope,
-  ) => runtime.run(task);
+  ) => tasks.evaluateTask(task);
 
   FutureOr<Cause<Never>?> add(
     scopes.Scope scope,
     Task<void, Never> Function(Exit<Object?, Object?>) finalizer,
-  ) => scopes.addScopeFinalizer(scope, finalizer, runFinalizer: runFinalizer);
+  ) {
+    final pending = scopes.addScopeFinalizer(
+      scope,
+      finalizer,
+      runFinalizer: runFinalizer,
+    );
+    if (pending == null) return null;
+    return (pending as Future<tasks.TaskEvaluation<void, Never>?>).then(
+      (result) => switch (result?.exit) {
+        ExitFailure(:final cause) => cause,
+        _ => null,
+      },
+    );
+  }
 
   setUp(() => runtime = Runtime());
   tearDown(() async {
@@ -367,7 +381,7 @@ void main() {
       (_) => Task.succeed(null),
       runFinalizer: (task, scope) {
         seen.add(scope);
-        return runtime.run(task);
+        return tasks.evaluateTask(task);
       },
     );
 

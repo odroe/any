@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'cause.dart';
 import 'exit.dart';
+import 'fiber.dart';
 import 'task.dart';
 
 /// Owns child scopes and resource finalizers.
@@ -29,11 +30,61 @@ final class Scope {
 
   Scope? _parent;
   final _children = <Scope>{};
+  final _fibers = <Fiber<Object?, Object?>>{};
   final _finalizers = <_Finalizer>[];
   _Closing? _closing;
 }
 
 // Internal lifecycle operations. These declarations are not exported by any.dart.
+
+void attachScopeFiber(Scope scope, Fiber<Object?, Object?> fiber) {
+  if (scope._closing != null) {
+    throw StateError('Cannot start a fiber in a closing or closed scope.');
+  }
+  scope._fibers.add(fiber);
+}
+
+void detachScopeFiber(Scope scope, Fiber<Object?, Object?> fiber) {
+  scope._fibers.remove(fiber);
+}
+
+// Fiber root scopes are separate cleanup trees but remain part of the owner's
+// lifetime. Follow both edge kinds when checking whether a wait owns its caller.
+bool scopeOwnsFiber(Scope scope, Fiber<Object?, Object?> target) {
+  final pending = <Scope>[scope];
+  while (pending.isNotEmpty) {
+    final current = pending.removeLast();
+    if (current._fibers.contains(target)) return true;
+    pending.addAll(current._children);
+    pending.addAll(current._fibers.map(fiberScope));
+  }
+  return false;
+}
+
+// Explicit closes read the full stable result. Automatic boundaries exclude
+// occurrences already observed or carried by their current failure path.
+TaskEvaluation<void, Never> scopeCleanupFor(
+  Scope scope, [
+  Set<Object> observed = const {},
+]) {
+  final closing = scope._closing!;
+  if (!closing.completion.isCompleted) {
+    throw StateError('Scope cleanup is not complete.');
+  }
+  final events = closing.events
+      .where((event) => !observed.contains(event.source))
+      .toList();
+  return TaskEvaluation(
+    events.isEmpty
+        ? const Exit.success(null)
+        : Exit.failure(Cause.combine(events.map((event) => event.cause))),
+    List.unmodifiable([
+      for (final event in events)
+        if (event.cause case final CauseDefect cause)
+          FailureEvent(cause, event.source),
+    ]),
+  );
+}
 
 /// Creates a root scope, or registers a child of [parent].
 ///
@@ -81,10 +132,10 @@ bool scopeCloseWouldDeadlock(Scope target, Scope current) {
 /// resources used by cleanup. The supplied owning scope identifies self-waits.
 /// The executor captures the registration-time execution environment; Scope
 /// only manages ordering and failure accumulation.
-FutureOr<Cause<Never>?> addScopeFinalizer(
+FutureOr<TaskEvaluation<void, Never>?> addScopeFinalizer(
   Scope scope,
   Task<void, Never> Function(Exit<Object?, Object?> exit) finalizer, {
-  required Future<Exit<void, Never>> Function(
+  required Future<TaskEvaluation<void, Never>> Function(
     Task<void, Never> task,
     Scope scope,
   )
@@ -121,7 +172,12 @@ Future<Cause<Never>?> closeScope(Scope scope, Exit<Object?, Object?> exit) {
     final current = pending.removeLast();
     if (current._closing != null) continue;
     final children = current._children.toList();
-    current._closing = _Closing(exit, owner, children);
+    current._closing = _Closing(
+      exit,
+      owner,
+      children,
+      current._fibers.toList(),
+    );
     claimed.add(current);
     pending.addAll(children.reversed);
   }
@@ -131,6 +187,22 @@ Future<Cause<Never>?> closeScope(Scope scope, Exit<Object?, Object?> exit) {
 
 Future<void> _closeClaimed(List<Scope> claimed, Object owner) async {
   try {
+    // Stop every running member before releasing any resource in this tree.
+    // Fiber roots are separate scopes: each member finishes its own cleanup
+    // before its completion can unblock the owning scope.
+    final stopping = <Future<void>>[];
+    for (final scope in claimed) {
+      for (final fiber in scope._closing!.fibers) {
+        stopping.add(
+          stopFiber(fiber).then((events) {
+            for (final event in events) {
+              _record(scope, event.cause, owner, source: event.source);
+            }
+          }),
+        );
+      }
+    }
+    if (stopping.isNotEmpty) await Future.wait(stopping);
     final pending = <Scope>[claimed.first];
     while (pending.isNotEmpty) {
       final scope = pending.last;
@@ -145,17 +217,21 @@ Future<void> _closeClaimed(List<Scope> claimed, Object owner) async {
           pending.add(child);
         } else {
           final cause = await childClosing.completion.future;
-          if (cause != null) _record(scope, cause, owner);
+          if (cause != null) {
+            for (final event in childClosing.events) {
+              _record(scope, event.cause, owner, source: event.source);
+            }
+          }
         }
         continue;
       }
       while (scope._finalizers.isNotEmpty) {
-        final cause = await _runFinalizer(
+        final result = await _runFinalizer(
           scope,
           scope._finalizers.removeLast(),
           closing.exit,
         );
-        if (cause != null) _record(scope, cause, owner);
+        _recordEvaluation(scope, result, owner);
       }
       _finish(scope);
       pending.removeLast();
@@ -165,64 +241,99 @@ Future<void> _closeClaimed(List<Scope> claimed, Object owner) async {
     // must still settle the close Futures rather than leave callers suspended.
     for (final scope in claimed.reversed) {
       if (!scope._closing!.completion.isCompleted) {
-        scope._closing!.causes.add(Cause.defect(error, stackTrace));
+        _record(scope, Cause.defect(error, stackTrace), owner);
         _finish(scope);
       }
     }
   }
 }
 
-Future<Cause<Never>?> _runFinalizer(
+Future<TaskEvaluation<void, Never>> _runFinalizer(
   Scope scope,
   _Finalizer finalizer,
   Exit<Object?, Object?> exit,
 ) async {
   try {
-    final result = await finalizer.run(finalizer.create(exit), scope);
-    return switch (result) {
-      ExitFailure(:final cause) => cause,
-      _ => null,
-    };
+    return await finalizer.run(finalizer.create(exit), scope);
   } catch (error, stackTrace) {
-    return Cause.defect(error, stackTrace);
+    return TaskEvaluation.fresh(Exit.failure(Cause.defect(error, stackTrace)));
+  }
+}
+
+void _recordEvaluation(
+  Scope scope,
+  TaskEvaluation<void, Never> result,
+  Object owner,
+) {
+  if (result.exit case ExitFailure(:final cause)) {
+    final reasons = switch (cause) {
+      CauseGroup(:final causes) => causes,
+      _ => [cause],
+    };
+    final defects = result.events.iterator;
+    for (final reason in reasons) {
+      Object? source;
+      if (reason is CauseDefect) {
+        defects.moveNext();
+        source = defects.current.source;
+      }
+      _record(scope, reason, owner, source: source);
+    }
   }
 }
 
 // Record each cleanup event once in every ancestor owned by the same close.
 // Child completion does not merge the same cause into those ancestors again.
-void _record(Scope scope, Cause<Never> cause, Object owner) {
+void _record(Scope scope, Cause<Never> cause, Object owner, {Object? source}) {
+  final events = switch (cause) {
+    CauseGroup(:final causes) => [
+      for (final item in causes) _CleanupEvent(item),
+    ],
+    _ => [_CleanupEvent(cause, source)],
+  };
   for (Scope? current = scope; current != null; current = current._parent) {
     final closing = current._closing;
     if (closing == null || !identical(closing.owner, owner)) break;
-    closing.causes.add(cause);
+    for (final event in events) {
+      if (closing.sources.add(event.source)) closing.events.add(event);
+    }
   }
 }
 
 void _finish(Scope scope) {
   final closing = scope._closing!;
-  final cause = closing.causes.isEmpty
+  final cause = closing.events.isEmpty
       ? null
-      : Cause<Never>.combine(closing.causes);
-  closing.causes.clear();
+      : Cause<Never>.combine(closing.events.map((event) => event.cause));
   closing.children.clear();
+  closing.fibers.clear();
   scope._parent?._children.remove(scope);
   scope._parent = null;
   closing.completion.complete(cause);
 }
 
 final class _Closing {
-  _Closing(this.exit, this.owner, this.children);
+  _Closing(this.exit, this.owner, this.children, this.fibers);
 
   final Exit<Object?, Object?> exit;
   final Object owner;
   final List<Scope> children;
+  final List<Fiber<Object?, Object?>> fibers;
   final completion = Completer<Cause<Never>?>();
-  final causes = <Cause<Never>>[];
+  final events = <_CleanupEvent>[];
+  final sources = <Object>{};
+}
+
+final class _CleanupEvent {
+  _CleanupEvent(this.cause, [Object? source]) : source = source ?? Object();
+  final Cause<Never> cause;
+  final Object source;
 }
 
 final class _Finalizer {
   _Finalizer(this.create, this.run);
 
   final Task<void, Never> Function(Exit<Object?, Object?>) create;
-  final Future<Exit<void, Never>> Function(Task<void, Never>, Scope) run;
+  final Future<TaskEvaluation<void, Never>> Function(Task<void, Never>, Scope)
+  run;
 }

@@ -25,6 +25,7 @@ export 'src/core/scope.dart' show Scope;
 export 'src/core/ref.dart' show Ref, RefOperations;
 export 'src/core/deferred.dart' show Deferred;
 export 'src/core/latch.dart' show Latch;
+export 'src/core/fiber.dart' show Fiber;
 export 'src/core/semaphore.dart' show Semaphore, SemaphoreOperations;
 export 'src/core/synchronized_ref.dart'
     show SynchronizedRef, SynchronizedRefOperations;
