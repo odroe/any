@@ -39,7 +39,7 @@ Future<void> main(List<String> arguments) async {
   }
 }
 
-enum _Chain { map, flatMap, mixed, mapError, recover }
+enum _Chain { map, flatMap, mixed, mapError, recover, adapt }
 
 Task<int, String, ()> _build(int length, _Chain chain, bool failed) {
   var task = Task<int, String, ()>(
@@ -48,7 +48,12 @@ Task<int, String, ()> _build(int length, _Chain chain, bool failed) {
         : const Exit.success(0),
   );
   for (var i = 0; i < length; i++) {
-    if (chain == _Chain.mapError) {
+    if (chain == _Chain.adapt) {
+      task = task.adapt<String, ()>(
+        dependencies: (value) => value,
+        error: (error) => error,
+      );
+    } else if (chain == _Chain.mapError) {
       task = task.mapError((error) => error);
     } else if (chain == _Chain.recover) {
       task = task.recover(
@@ -80,7 +85,10 @@ Future<void> _measure(
 ) async {
   final iterations = math.max(20, 200000 ~/ math.max(20, length));
   final task = _build(length, chain, failed);
-  final expectedValue = chain == _Chain.mapError || chain == _Chain.recover
+  final expectedValue =
+      chain == _Chain.mapError ||
+          chain == _Chain.recover ||
+          chain == _Chain.adapt
       ? 0
       : length;
   for (var i = 0; i < iterations; i++) {

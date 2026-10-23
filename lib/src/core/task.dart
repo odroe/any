@@ -55,39 +55,54 @@ final class Task<T, E, R> {
       _transform = null,
       _next = null,
       _failure = null,
-      _recover = null;
+      _recover = null,
+      _context = null;
 
   const Task._map(this._source, this._transform)
     : _computation = null,
       _next = null,
       _failure = null,
-      _recover = null;
+      _recover = null,
+      _context = null;
 
   const Task._flatMap(this._source, this._next)
     : _computation = null,
       _transform = null,
       _failure = null,
-      _recover = null;
+      _recover = null,
+      _context = null;
 
   const Task._mapError(this._source, this._transform, this._failure)
     : _computation = null,
       _next = null,
-      _recover = null;
+      _recover = null,
+      _context = null;
 
   const Task._recover(this._source, this._recover)
     : _computation = null,
       _transform = null,
       _next = null,
-      _failure = null;
+      _failure = null,
+      _context = null;
+
+  const Task._adapt(this._source, this._transform, this._failure, this._context)
+    : _computation = null,
+      _next = null,
+      _recover = null;
 
   // A leaf stores a computation; a composition stores a source and one callback.
   // These immutable nodes can be shared without copying the existing chain.
   final FutureOr<Exit<T, E>> Function(Context<R>)? _computation;
-  final Task<Object?, Object?, R>? _source;
+  final Task<Object?, Object?, Object?>? _source;
   final Exit<T, E> Function(Object?)? _transform;
   final Task<T, E, R> Function(Object?)? _next;
   final Exit<T, E> Function(Cause<Object?>)? _failure;
   final Task<T, E, R> Function(Object?)? _recover;
+  final Context<Object?> Function(Context<Object?>)? _context;
+
+  // Each leaf restores its own dependency type at the interpreter boundary.
+  FutureOr<Exit<T, E>> _invoke(Context<Object?> context) =>
+      _computation!(context as Context<R>);
 
   /// Executes this task with [dependencies] and awaits its resource cleanup.
   ///
@@ -165,14 +180,15 @@ final class Task<T, E, R> {
   /// final exit = await workflow.run(());
   /// ```
   ///
-  /// When wrapping a task with a different expected error type, use
-  /// [Cause.mapError] on a failed exit's cause to translate its business errors.
-  /// Defects and cancellation reasons are preserved.
+  /// [TaskComposition.adapt] combines dependency projection and expected error
+  /// translation when integrating a task into another workflow.
   Future<Exit<T, E>> runIn(Context<R> context) async {
     // Defer entry once. Only computations returning a Future suspend the loop.
     await Future<void>.value();
-    Task<Object?, Object?, R> current = this;
-    List<Task<Object?, Object?, R>>? pending;
+    Task<Object?, Object?, Object?> current = this;
+    List<Task<Object?, Object?, Object?>>? pending;
+    Context<Object?> activeContext = context;
+    List<(int, Context<Object?>)>? contexts;
     var errorHandlers = 0;
     final cancellation = context.cancellation;
 
@@ -190,9 +206,20 @@ final class Task<T, E, R> {
           if (current._failure != null || current._recover != null) {
             errorHandlers++;
           }
+          final project = current._context;
+          if (project != null) {
+            (contexts ??= []).add((pending.length, activeContext));
+            activeContext = project(activeContext);
+            if (context.scope.isClosed) {
+              throw StateError('Cannot run a task in a closed scope.');
+            }
+            if (cancellation.isCancelled) {
+              return Exit.failure(Cause.cancelled(reason: cancellation.reason));
+            }
+          }
           current = current._source;
         }
-        final result = current._computation!(context);
+        final result = current._invoke(activeContext);
         var exit = result is Future<Exit<Object?, Object?>>
             ? await result
             : result;
@@ -212,6 +239,11 @@ final class Task<T, E, R> {
                     ),
                   };
             return _checkCancellation(typed, cancellation);
+          }
+          if (contexts != null &&
+              contexts.isNotEmpty &&
+              contexts.last.$1 == pending.length) {
+            activeContext = contexts.removeLast().$2;
           }
           final step = pending.removeLast();
           if (step._failure != null || step._recover != null) errorHandlers--;
@@ -247,7 +279,7 @@ final class Task<T, E, R> {
   }
 }
 
-/// Composes tasks while preserving their dependency and expected error types.
+/// Composes task values, expected errors, and dependency views.
 ///
 /// Extension methods use the receiver's static types. This allows a task with
 /// error type [Never] to be widened before composing a step that can fail.
@@ -303,6 +335,42 @@ extension TaskComposition<T, E, R> on Task<T, E, R> {
   /// remains [E] because groups and replacement tasks can still fail.
   Task<T, E, R> recover(Task<T, E, R> Function(E error) recover) =>
       Task._recover(this, (error) => recover(error as E));
+
+  /// A task that projects outer dependencies and translates expected errors.
+  ///
+  /// [dependencies] selects this task's [R] from the caller's [R0], once per
+  /// run. The projected context shares the caller's scope and cancellation
+  /// token. Resource ownership stays with that scope; this does not create a
+  /// new resource lifetime or cache dependencies.
+  ///
+  /// [error] translates every expected error through [Cause.mapError], including
+  /// grouped causes. Defect objects, stack traces, cancellation reasons, and
+  /// cause order are retained. Throws from either callback become defects.
+  /// A pre-cancelled or closed context skips both callbacks and the source task.
+  ///
+  /// ```dart
+  /// final read = Task<int, String, String>((context) {
+  ///   final value = int.tryParse(context.dependencies);
+  ///   return value == null
+  ///       ? const Exit.failure(Cause.failure('Invalid port.'))
+  ///       : Exit.success(value);
+  /// });
+  /// final configured = read.adapt<({String message}), ({String port})>(
+  ///   dependencies: (config) => config.port,
+  ///   error: (message) => (message: message),
+  /// );
+  /// final exit = await configured.run((port: '8080'));
+  /// ```
+  Task<T, F, R0> adapt<F, R0>({
+    required R Function(R0 dependencies) dependencies,
+    required F Function(E error) error,
+  }) => Task._adapt(
+    this,
+    (value) => Exit.success(value as T),
+    (cause) => Exit.failure((cause as Cause<E>).mapError(error)),
+    (context) =>
+        context.withDependencies<R>(dependencies(context.dependencies as R0)),
+  );
 }
 
 Exit<T, E> _checkCancellation<T, E>(Exit<T, E> exit, CancellationToken token) =>

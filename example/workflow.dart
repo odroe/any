@@ -98,48 +98,31 @@ Task<void, Never, WriteLog> record(String message) => Task((context) async {
 
 /// Looks up a user's endpoint, fetches its contents, then records the response.
 ///
-/// Each step keeps its own dependency and error types. Local wrappers project
-/// dependencies and translate expected failures to [FlowError]. They use
-/// [Task.runIn] so the whole workflow shares a scope and cancellation signal.
+/// Each step keeps its own dependency and error types. [TaskComposition.adapt]
+/// projects dependencies and translates expected failures to [FlowError], while
+/// the whole workflow shares a scope and cancellation signal.
 /// A failed or cancelled step skips subsequent steps. The API client closes
 /// before the database when the owning scope closes, including after failure.
-Task<String, FlowError, FlowDependencies> loadAndRecord(int userId) {
-  // TODO: Replace these local wrappers with Task.adapt when it is available.
-  final lookup = Task<Uri, FlowError, FlowDependencies>((context) async {
-    final exit = await load(userId)
-        .runIn(context.withDependencies(context.dependencies.db));
-    return switch (exit) {
-      ExitSuccess(:final value) => Exit.success(value),
-      ExitFailure(:final cause) => Exit.failure(cause.mapError(LoadFailed.new)),
-    };
-  });
-
-  return lookup
-      .flatMap(
-        (endpoint) =>
-            Task<String, FlowError, FlowDependencies>((context) async {
-              final exit = await request(endpoint)
-                  .runIn(context.withDependencies(context.dependencies.api));
-              return switch (exit) {
-                ExitSuccess(:final value) => Exit.success(value),
-                ExitFailure(:final cause) => Exit.failure(
-                  cause.mapError(RequestFailed.new),
-                ),
-              };
-            }),
-      )
-      .flatMap(
-        (body) => Task<String, FlowError, FlowDependencies>((context) async {
-          final exit = await record(body)
-              .runIn(context.withDependencies(context.dependencies.log));
-          return switch (exit) {
-            ExitSuccess() => Exit.success(body),
-            // Cause<Never> also fits the workflow's expected error type.
-            ExitFailure(:final cause) => Exit.failure(cause),
-          };
-        }),
-      );
-}
+Task<String, FlowError, FlowDependencies> loadAndRecord(int userId) =>
+    load(userId)
+        .adapt<FlowError, FlowDependencies>(
+          dependencies: (deps) => deps.db,
+          error: LoadFailed.new,
+        )
+        .flatMap(
+          (endpoint) => request(endpoint).adapt<FlowError, FlowDependencies>(
+            dependencies: (deps) => deps.api,
+            error: RequestFailed.new,
+          ),
+        )
+        .flatMap(
+          (body) => record(body)
+              .adapt<FlowError, FlowDependencies>(
+                dependencies: (deps) => deps.log,
+                error: (Never error) => error,
+              )
+              .map((_) => body),
+        );
 
 Future<void> main() async {
   final endpoint = Uri.parse('https://example.test/users/7');
