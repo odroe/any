@@ -17,3 +17,4 @@ export 'src/core/context.dart'
     show ServiceKey, ServiceBinding, Context, MissingService, DuplicateService;
 export 'src/core/task.dart' show Task, TaskOperations, InfallibleTaskOperations;
 export 'src/core/runtime.dart' show Runtime, RuntimeClosed, TaskException;
+export 'src/core/random_source.dart' show RandomSource;
