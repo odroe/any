@@ -8,6 +8,7 @@ import 'fiber.dart';
 import 'internal/task_concurrency.dart';
 import 'internal/task_timing.dart';
 import 'internal/task_timeout.dart';
+import 'logger.dart';
 import 'option.dart';
 import 'result.dart';
 import 'schedule.dart';
@@ -25,6 +26,18 @@ final class Task<T, E> {
   const Task._(this._node);
 
   final _Node _node;
+
+  /// Writes a structured log event through the current [Logger].
+  ///
+  /// [fields] are shallow-copied now and override inherited log fields when
+  /// this task runs. Records below the logger's threshold are skipped before
+  /// reading the clock. Backend errors are reported independently and do not
+  /// fail this task. An accepted write is awaited, including during cancellation.
+  static Task<void, Never> log(
+    String message, {
+    LogLevel level = LogLevel.info,
+    Map<String, Object?> fields = const {},
+  }) => logTask(message, level: level, fields: fields);
 
   /// Waits for [duration] using the clock in the current context.
   ///

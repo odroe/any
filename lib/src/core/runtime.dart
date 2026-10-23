@@ -7,6 +7,7 @@ import 'context.dart';
 import 'exit.dart';
 import 'fiber.dart';
 import 'layer.dart';
+import 'logger.dart';
 import 'metric.dart';
 import 'scope.dart';
 import 'random_source.dart';
@@ -20,9 +21,9 @@ final class Runtime {
   /// Creates a runtime with an optional unobserved-failure reporter.
   ///
   /// [context] supplies application services and overrides the default [Clock],
-  /// [RandomSource], and no-op [MetricRegistry] bindings when their keys are
-  /// present. Other defaults remain available. Supplied objects retain their
-  /// caller-managed lifetime.
+  /// [RandomSource], no-op [Logger], and no-op [MetricRegistry] bindings when
+  /// their keys are present. Other defaults remain available. Supplied objects
+  /// retain their caller-managed lifetime.
   ///
   /// A failed fiber is reported once on the next event-loop turn if its result
   /// has not been observed. The default forwards a [TaskException] to the Zone
@@ -35,6 +36,7 @@ final class Runtime {
          Context.from([
            Clock.key.bind(Clock()),
            RandomSource.key.bind(RandomSource()),
+           Logger.key.bind(Logger.noop()),
            MetricRegistry.key.bind(MetricRegistry.noop()),
          ]),
          context ?? Context.from(const []),

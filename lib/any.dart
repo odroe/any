@@ -51,3 +51,5 @@ export 'src/core/flow.dart' show Flow, FlowOperations, InfallibleFlowOperations;
 export 'src/core/circuit_breaker.dart'
     show CircuitBreaker, CircuitBreakerState, CircuitBreakerOperations;
 export 'src/core/cache.dart' show Cache, CacheOperations;
+export 'src/core/logger.dart'
+    show Logger, LogLevel, LogRecord, TaskLoggingOperations;
