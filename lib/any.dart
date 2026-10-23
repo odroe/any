@@ -47,7 +47,13 @@ export 'src/core/metric.dart'
     show Metric, Counter, Gauge, Histogram, MetricRegistry, MetricSnapshot;
 export 'src/core/schedule.dart' show Schedule;
 export 'src/core/rate_limiter.dart' show RateLimiter, RateLimiterOperations;
-export 'src/core/flow.dart' show Flow, FlowOperations, InfallibleFlowOperations;
+export 'src/core/flow.dart'
+    show
+        Flow,
+        FlowOperations,
+        InfallibleFlowOperations,
+        StreamOverflowStrategy,
+        StreamBufferOverflow;
 export 'src/core/circuit_breaker.dart'
     show CircuitBreaker, CircuitBreakerState, CircuitBreakerOperations;
 export 'src/core/cache.dart' show Cache, CacheOperations;
