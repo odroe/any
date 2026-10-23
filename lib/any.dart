@@ -30,3 +30,4 @@ export 'src/core/synchronized_ref.dart'
     show SynchronizedRef, SynchronizedRefOperations;
 export 'src/core/async_queue.dart'
     show AsyncQueue, QueueOverflowStrategy, QueueClosed;
+export 'src/core/pub_sub.dart' show PubSub, PubSubSubscription, PubSubClosed;
