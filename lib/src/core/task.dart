@@ -7,6 +7,7 @@ import 'exit.dart';
 import 'fiber.dart';
 import 'result.dart';
 import 'scope.dart';
+import 'task_local.dart';
 
 /// A lazy computation producing a value of type [T] or a business error [E].
 ///
@@ -216,11 +217,12 @@ extension TaskOperations<T, E> on Task<T, E> {
   /// Each execution starts a fresh fiber.
   Task<Fiber<T, E>, Never> fork() => Task._(
     _Fork(
-      (scope, parent, context, signal) => startFiber(
+      (scope, parent, context, locals, signal) => startFiber(
         this,
         owner: scope,
         signal: signal,
         context: context,
+        locals: locals,
         report: fiberReport(parent),
       ),
     ),
@@ -233,11 +235,12 @@ extension TaskOperations<T, E> on Task<T, E> {
   /// useful for work whose explicit owner outlives the creating task.
   Task<Fiber<T, E>, Never> forkIn(Scope scope) => Task._(
     _Fork(
-      (_, parent, context, _) => startFiber(
+      (_, parent, context, locals, _) => startFiber(
         this,
         owner: scope,
         inheritHost: false,
         context: context,
+        locals: locals,
         report: fiberReport(parent),
       ),
     ),
@@ -413,6 +416,7 @@ Future<TaskEvaluation<T, E>> evaluateTask<T, E>(
   Scope? scope,
   Fiber<Object?, Object?>? fiber,
   Context? context,
+  Map<TaskLocal<Object?>, Object?> locals = const {},
   List<Scope> closingScopes = const [],
 }) async {
   final ownedScope = scope ?? createScope();
@@ -423,6 +427,7 @@ Future<TaskEvaluation<T, E>> evaluateTask<T, E>(
     closingScopes: closingScopes,
     fiber: fiber,
     context: context ?? Context.from(const []),
+    locals: locals,
   );
   var result = evaluated;
   var cancellationObserved = cancelled;
@@ -465,6 +470,18 @@ Task<Exit<T, E>, Never> awaitFiberTask<T, E>(
 Task<T, E> joinFiberTask<T, E>(Fiber<T, E> target) =>
     Task._(_AwaitFiber(target, join: true));
 
+Task<T, Never> readTaskLocal<T>(TaskLocal<T> local, T defaultValue) => Task._(
+  _ReadLocal(
+    (values) => values.containsKey(local) ? values[local] as T : defaultValue,
+  ),
+);
+
+Task<R, E> provideTaskLocal<T, R, E>(
+  TaskLocal<T> local,
+  T value,
+  Task<R, E> task,
+) => Task._(_ProvideLocal(task._node, local, value));
+
 Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
   Task<T, E> task, {
   required Scope scope,
@@ -472,6 +489,7 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
   CancellationSignal? signal,
   Fiber<Object?, Object?>? fiber,
   required Context context,
+  required Map<TaskLocal<Object?>, Object?> locals,
 }) async {
   var current = task._node;
   final frames = <_Frame>[];
@@ -482,6 +500,7 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
   var interruptible = true;
   var currentScope = scope;
   var currentContext = context;
+  var currentLocals = locals;
   Object? value;
   Cause<Object?>? failure;
   var events = const <FailureEvent>[];
@@ -508,6 +527,22 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
     try {
       if (evaluating) {
         switch (current) {
+          case _ReadLocal(:final read):
+            value = read(currentLocals);
+            failure = null;
+            events = const [];
+            evaluating = false;
+          case _ProvideLocal(
+            :final source,
+            :final local,
+            value: final provided,
+          ):
+            frames.add(_Frame(locals: currentLocals));
+            currentLocals = Map.unmodifiable({
+              ...currentLocals,
+              local: provided,
+            });
+            current = source;
           case _Service(:final read):
             value = read(currentContext);
             failure = null;
@@ -521,7 +556,13 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
             if (fiber == null) {
               throw StateError('Fork requires an active runtime execution.');
             }
-            value = start(currentScope, fiber, currentContext, signal);
+            value = start(
+              currentScope,
+              fiber,
+              currentContext,
+              currentLocals,
+              signal,
+            );
             failure = null;
             events = const [];
             evaluating = false;
@@ -638,6 +679,7 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
           case _AddFinalizer(:final finalizer):
             final zone = Zone.current;
             final services = currentContext;
+            final localValues = currentLocals;
             final pending = addScopeFinalizer(
               currentScope,
               (exit) => zone.run(() => finalizer(exit)),
@@ -647,6 +689,7 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
                   closingScopes: [...closingScopes, scope],
                   fiber: fiber,
                   context: services,
+                  locals: localValues,
                 ),
               ),
             );
@@ -734,6 +777,10 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
       }
 
       final frame = frames.removeLast();
+      if (frame.locals case final restored?) {
+        currentLocals = restored;
+        continue;
+      }
       if (frame.context case final restored?) {
         currentContext = restored;
         continue;
@@ -969,6 +1016,7 @@ final class _Fork extends _Node {
     Scope,
     Fiber<Object?, Object?>,
     Context,
+    Map<TaskLocal<Object?>, Object?>,
     CancellationSignal?,
   )
   start;
@@ -977,6 +1025,18 @@ final class _Fork extends _Node {
 final class _Service extends _Node {
   const _Service(this.read);
   final Object? Function(Context) read;
+}
+
+final class _ReadLocal extends _Node {
+  const _ReadLocal(this.read);
+  final Object? Function(Map<TaskLocal<Object?>, Object?>) read;
+}
+
+final class _ProvideLocal extends _Node {
+  const _ProvideLocal(this.source, this.local, this.value);
+  final _Node source;
+  final TaskLocal<Object?> local;
+  final Object? value;
 }
 
 final class _ProvideContext extends _Node {
@@ -1080,10 +1140,17 @@ final class _CloseScope extends _Node {
 }
 
 final class _Frame {
-  const _Frame({this.success, this.failure, this.interruptible, this.context});
+  const _Frame({
+    this.success,
+    this.failure,
+    this.interruptible,
+    this.context,
+    this.locals,
+  });
   final _Node Function(Object?)? success;
   final _Node Function(Cause<Object?>, List<FailureEvent>, CancellationSignal?)?
   failure;
   final bool? interruptible;
   final Context? context;
+  final Map<TaskLocal<Object?>, Object?>? locals;
 }

@@ -7,6 +7,7 @@ import 'exit.dart';
 import 'option.dart';
 import 'scope.dart';
 import 'task.dart';
+import 'task_local.dart';
 
 /// A running task whose owner waits for its work and cleanup to finish.
 ///
@@ -116,6 +117,7 @@ Fiber<T, E> startFiber<T, E>(
   Task<T, E> task, {
   required Scope owner,
   required Context context,
+  Map<TaskLocal<Object?>, Object?> locals = const {},
   required void Function(Cause<Object?> cause) report,
   bool inheritHost = true,
   CancellationSignal? signal,
@@ -141,6 +143,7 @@ Fiber<T, E> startFiber<T, E>(
             scope: fiber._scope,
             fiber: fiber,
             context: context,
+            locals: locals,
           );
         } catch (error, stackTrace) {
           result = TaskEvaluation.fresh(
