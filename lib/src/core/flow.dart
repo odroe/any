@@ -294,6 +294,38 @@ extension FlowOperations<T, E> on Flow<T, E> {
     }),
   );
 
+  /// Prefetches up to [capacity] elements while downstream consumes a value.
+  ///
+  /// One producer pulls upstream sequentially. Buffered values keep their input
+  /// order and original resource scopes; downstream callbacks still run in the
+  /// consuming task. Production starts on the first pull of each consumption.
+  ///
+  /// The limit includes queued values and an in-flight pull, but excludes the
+  /// value currently delivered downstream. This operation therefore holds at
+  /// most `capacity + 1` elements, apart from leases retained by later operators.
+  /// A full buffer pauses pulling until a queued value is delivered.
+  ///
+  /// Buffered values are delivered before an upstream failure or normal end.
+  /// Early termination cancels the producer and waits for its cleanup. Consumer
+  /// cancellation discards business failures and explicit cancellation produced
+  /// by unfinished source work; defects and resource cleanup failures are still
+  /// retained. [capacity] must be positive; invalid values become [RangeError]
+  /// defects before upstream opens.
+  Flow<T, E> buffer(int capacity) => Flow._(
+    Task.defer(() {
+      if (capacity < 1) throw RangeError.range(capacity, 1, null, 'capacity');
+      return Scope.open().withError<E>().flatMap(
+        (owner) => inTaskScope(_open, owner).flatMap((source) {
+          final buffering = _Buffered(source, owner, capacity);
+          return inTaskScope(
+            Task.addFinalizer(buffering.cleanup),
+            owner,
+          ).withError<E>().map((_) => buffering.cursor);
+        }),
+      );
+    }),
+  );
+
   /// Emits at most [count] elements, then closes the upstream producer.
   ///
   /// Zero does not open the upstream flow. Negative counts become [RangeError]
@@ -946,7 +978,14 @@ final class _Producer {
         : _closeNow();
   }
 
-  Future<TaskEvaluation<void, Never>> _closeNow() => _closing ??= _close();
+  Future<TaskEvaluation<void, Never>> _closeNow() {
+    final closing = _closing;
+    // A producer has one delivery path for cleanup failure: the call that
+    // initiates closure. Later retirement waits without replaying that result.
+    return closing == null
+        ? _closing = _close()
+        : closing.then((_) => const TaskEvaluation(Exit.success(null), []));
+  }
 
   Future<TaskEvaluation<void, Never>> _close() async {
     final exit = _exit!;
@@ -955,6 +994,213 @@ final class _Producer {
     final after = afterClose;
     return after == null ? own : _mergeEvaluations([own, await after(exit)]);
   }
+}
+
+final class _BufferedEntry<T> {
+  _BufferedEntry(this.value, this.scope, this.producers);
+
+  final T value;
+  final Scope scope;
+  final List<_Producer> producers;
+}
+
+final class _Buffered<T, E> {
+  _Buffered(this.source, this.owner, this.capacity);
+
+  final _Cursor<T, E> source;
+  final Scope owner;
+  final int capacity;
+  final _stopReason = Object();
+  final _values = Queue<_BufferedEntry<T>>();
+  late final _lifetime = _Producer(owner);
+  _BufferedEntry<T>? _current;
+  Fiber<void, E>? _driver;
+  TaskEvaluation<void, E>? _terminal;
+  List<CauseCancelled> _explicitCancellation = const [];
+  void Function()? _consumerWake;
+  void Function()? _driverWake;
+  var _started = false;
+  var _stopping = false;
+  var _stoppedByUs = false;
+  var _terminalDelivered = false;
+
+  late final cursor = _Cursor<T, E>(
+    _pull(),
+    () => _current?.scope ?? owner,
+    _finish,
+    () => [_lifetime, ...?_current?.producers],
+  );
+
+  Task<Option<T>, E> _pull() => Task.defer(() {
+    final previous = _current;
+    if (previous != null) {
+      _current = null;
+      return _release(previous.producers)
+          .withError<E>()
+          .flatMap((_) => _pull());
+    }
+    if (!_started) {
+      _started = true;
+      return forkTaskIn(
+        _produce().mapCause((cause) {
+          // This callback sees explicit cancellation, but owner-requested
+          // cancellation bypasses it. Keep cleanup cancellation without replaying
+          // the scope's own request during automatic shutdown.
+          _explicitCancellation = _causes(cause)
+              .whereType<CauseCancelled>()
+              .toList();
+          return cause;
+        }),
+        owner,
+        inheritHost: true,
+      ).withError<E>().flatMap((fiber) {
+        _driver = fiber;
+        listenFiber(fiber, (exit) {
+          _terminal = TaskEvaluation(exit, fiberFailureEvents(fiber));
+          if (exit case ExitFailure(:final cause) when _stoppedByUs) {
+            _explicitCancellation = _causes(cause)
+                .whereType<CauseCancelled>()
+                .where((cause) => !identical(cause.reason, _stopReason))
+                .toList();
+          }
+          _consumerWake?.call();
+        });
+        return _pull();
+      });
+    }
+    if (_values.isNotEmpty) {
+      final entry = _values.removeFirst();
+      _current = entry;
+      _driverWake?.call();
+      return Task.succeed(Option.some(entry.value));
+    }
+    final terminal = _terminal;
+    if (terminal != null) {
+      if (terminal.exit is ExitFailure<void, E>) {
+        return taskFromEvaluation(
+          TaskEvaluation(
+            terminal.exit.map((_) => const Option<Never>.none()),
+            terminal.events,
+          ),
+        ).mapCause((cause) {
+          _terminalDelivered = true;
+          return cause;
+        });
+      }
+      return _lifetime
+          .finish(const Exit.success(null))
+          .withError<E>()
+          .map((_) => const Option.none());
+    }
+    return _wait().withError<E>().flatMap((_) => _pull());
+  });
+
+  Task<void, E> _produce() => Task.defer(() {
+    if (_stopping) return Task.succeed(null);
+    if (_values.length == capacity) {
+      return Task.fromCallback<void, Never>((complete) {
+        void notify() {
+          _driverWake = null;
+          complete(const Exit.success(null));
+        }
+
+        _driverWake = notify;
+        if (_stopping || _values.length < capacity) notify();
+        return () {
+          if (identical(_driverWake, notify)) _driverWake = null;
+        };
+      }).withError<E>().flatMap((_) => _produce());
+    }
+    // The sole driver reserves the remaining slot until this pull finishes.
+    return source.pull().flatMap((item) {
+      if (item is OptionNone<T>) return Task.succeed(null);
+      final producers = source._producers().toSet().toList();
+      for (final producer in producers) {
+        producer.retain();
+      }
+      _values.addLast(
+        _BufferedEntry((item as OptionSome<T>).value, source.scope, producers),
+      );
+      _consumerWake?.call();
+      return _produce();
+    });
+  });
+
+  Task<void, Never> _wait() => Task.fromCallback((complete) {
+    void notify() {
+      _consumerWake = null;
+      complete(const Exit.success(null));
+    }
+
+    _consumerWake = notify;
+    if (_terminal != null || (!_stopping && _values.isNotEmpty)) notify();
+    return () {
+      if (identical(_consumerWake, notify)) _consumerWake = null;
+    };
+  });
+
+  void _stop() {
+    if (_stopping) return;
+    _stopping = true;
+    // Scope marks its descendants before stopping their fibers. If it already
+    // owns shutdown, its cleanup path retains cancellation from those resources.
+    _stoppedByUs = !scopeIsClosing(owner);
+    _driver?.requestCancel(reason: _stopReason);
+    _driverWake?.call();
+  }
+
+  Task<void, Never> _finish(Exit<Object?, Object?> exit) => Task.defer(() {
+    _stop();
+    if (_started && _terminal == null) {
+      return _wait().flatMap((_) => _finish(exit));
+    }
+    final producers = [
+      ...?_current?.producers,
+      for (final entry in _values) ...entry.producers,
+    ];
+    _current = null;
+    _values.clear();
+    return source
+        .finish(exit)
+        .ensuring(_release(producers))
+        .ensuring(_lifetime.finish(exit));
+  });
+
+  Task<void, Never> _release(List<_Producer> producers) =>
+      Task.uninterruptibleMask(
+        (_) => Task.fromFuture(
+          () => _releaseProducers(producers),
+          onError: Error.throwWithStackTrace,
+        ).flatMap(taskFromEvaluation),
+      );
+
+  Task<void, Never> cleanup(Exit<Object?, Object?> exit) => Task.defer(() {
+    // The owner already stopped its driver and closed all input scopes. Do not
+    // wait on leases to resources owned by that same closing scope.
+    _stop();
+    _current = null;
+    _values.clear();
+    final events = _terminal?.events ?? const <FailureEvent>[];
+    final causes = <Cause<Never>>[];
+    if (_terminal?.exit case ExitFailure(:final cause)) {
+      for (final reason in _causes(cause)) {
+        if (reason is CauseDefect ||
+            (reason is CauseCancelled &&
+                !_terminalDelivered &&
+                _explicitCancellation.contains(reason))) {
+          causes.add(reason as Cause<Never>);
+        }
+      }
+    }
+    return taskFromEvaluation(
+      TaskEvaluation(
+        causes.isEmpty
+            ? const Exit.success(null)
+            : Exit.failure(Cause.combine(causes)),
+        events,
+      ),
+    );
+  });
 }
 
 final class _MapEntry<T, E> {
