@@ -72,3 +72,5 @@ export 'src/core/tracer.dart'
         SpanRecord,
         SpanEvent,
         TaskTracingOperations;
+export 'src/core/shared_resource.dart'
+    show SharedResource, SharedResourceOperations;

@@ -699,24 +699,46 @@ Task<Fiber<T, E>, Never> forkTaskIn<T, E>(
   Task<T, E> task,
   Scope scope, {
   bool inheritHost = false,
-}) =>
-    Task._(
-      _Fork(
-        (_, parent, context, locals, _) => startFiber(
-          task,
-          owner: scope,
-          inheritHost: inheritHost,
-          deferStart: true,
-          context: context,
-          locals: locals,
-          report: fiberReport(parent),
-        ),
-      ),
-    );
+}) => Task._(
+  _Fork(
+    (_, parent, context, locals, _) => startFiber(
+      task,
+      owner: scope,
+      inheritHost: inheritHost,
+      deferStart: true,
+      context: context,
+      locals: locals,
+      report: fiberReport(parent),
+    ),
+  ),
+);
 
 Task<T, E> accessTaskEnvironment<T, E>(
   Task<T, E> Function(Scope scope, Context context) use,
-) => Task._(_Environment((scope, context) => use(scope, context)._node));
+) => Task._(_Environment((scope, context, _, _) => use(scope, context)._node));
+
+// A shared service retains its creation environment without retaining the
+// creating fiber. Context and task-local maps are immutable snapshots.
+typedef TaskEnvironment = ({
+  Context context,
+  Map<TaskLocal<Object?>, Object?> locals,
+  void Function(Cause<Object?>) report,
+});
+
+Task<TaskEnvironment, Never> captureTaskEnvironment() => Task._(
+  _Environment((_, context, locals, fiber) {
+    if (fiber == null) {
+      throw StateError(
+        'Capturing an environment requires a runtime execution.',
+      );
+    }
+    return _Success((
+      context: context,
+      locals: locals,
+      report: fiberReport(fiber),
+    ));
+  }),
+);
 
 Task<T, E> taskFromEvaluation<T, E>(TaskEvaluation<T, E> result) =>
     Task._(switch (result.exit) {
@@ -770,7 +792,7 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
       if (evaluating) {
         switch (current) {
           case _Environment(:final use):
-            current = use(currentScope, currentContext);
+            current = use(currentScope, currentContext, currentLocals, fiber);
           case _InScope(:final source, scope: final borrowed):
             frames.add(_Frame(scope: currentScope));
             currentScope = borrowed;
@@ -1293,7 +1315,13 @@ final class _Service extends _Node {
 
 final class _Environment extends _Node {
   const _Environment(this.use);
-  final _Node Function(Scope, Context) use;
+  final _Node Function(
+    Scope,
+    Context,
+    Map<TaskLocal<Object?>, Object?>,
+    Fiber<Object?, Object?>?,
+  )
+  use;
 }
 
 final class _InScope extends _Node {
