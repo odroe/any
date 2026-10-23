@@ -10,6 +10,63 @@ List<Cause<Object?>> reasons(Cause<Object?> cause) => switch (cause) {
 
 void main() {
   test(
+    'scope cancellation forwards its original reason to owned fibers',
+    () async {
+      final runtime = Runtime();
+      addTearDown(runtime.close);
+      final reason = Object();
+      Exit<Object?, Object?>? cleanupExit;
+      final started = Completer<void>();
+      final child =
+          Task.addFinalizer(
+            (exit) => Task.sync(() {
+              cleanupExit = exit;
+            }),
+          ).flatMap(
+            (_) => Task.fromCallback<void, Never>((complete) {
+              started.complete();
+              return () {};
+            }),
+          );
+      final exit = await runtime.runOrThrow(
+        Scope.open().flatMap(
+          (scope) => child.forkIn(scope).flatMap((fiber) {
+            return Task.fromFuture<void, Never>(
+                  () => started.future,
+                  onError: Error.throwWithStackTrace,
+                )
+                .flatMap(
+                  (_) => scope.close(
+                    Exit.failure(
+                      Cause.combine([
+                        Cause.failure('body'),
+                        Cause.cancelled(reason),
+                      ]),
+                    ),
+                  ),
+                )
+                .flatMap((_) => fiber.awaitExit());
+          }),
+        ),
+      );
+      expect(
+        reasons((exit as ExitFailure).cause)
+            .whereType<CauseCancelled>()
+            .single
+            .reason,
+        same(reason),
+      );
+      expect(
+        reasons((cleanupExit as ExitFailure).cause)
+            .whereType<CauseCancelled>()
+            .single
+            .reason,
+        same(reason),
+      );
+    },
+  );
+
+  test(
     'runtime close includes cleanup defects and waits for their release',
     () async {
       final reports = <Cause<Object?>>[];

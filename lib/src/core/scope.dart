@@ -192,9 +192,10 @@ Future<void> _closeClaimed(List<Scope> claimed, Object owner) async {
     // before its completion can unblock the owning scope.
     final stopping = <Future<void>>[];
     for (final scope in claimed) {
+      final reason = _cancellationReason(scope._closing!.exit);
       for (final fiber in scope._closing!.fibers) {
         stopping.add(
-          stopFiber(fiber).then((events) {
+          stopFiber(fiber, reason: reason).then((events) {
             for (final event in events) {
               _record(scope, event.cause, owner, source: event.source);
             }
@@ -246,6 +247,19 @@ Future<void> _closeClaimed(List<Scope> claimed, Object owner) async {
       }
     }
   }
+}
+
+Object? _cancellationReason(Exit<Object?, Object?> exit) {
+  if (exit case ExitFailure(:final cause)) {
+    final causes = switch (cause) {
+      CauseGroup(:final causes) => causes,
+      _ => [cause],
+    };
+    for (final cause in causes) {
+      if (cause case CauseCancelled(:final reason)) return reason;
+    }
+  }
+  return null;
 }
 
 Future<TaskEvaluation<void, Never>> _runFinalizer(

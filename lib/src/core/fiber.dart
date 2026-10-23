@@ -215,9 +215,12 @@ Future<Exit<T, E>> fiberCompletion<T, E>(
 }
 
 /// Stops owned work and retains defects without converting business failures.
-Future<List<FailureEvent>> stopFiber(Fiber<Object?, Object?> fiber) async {
+Future<List<FailureEvent>> stopFiber(
+  Fiber<Object?, Object?> fiber, {
+  Object? reason,
+}) async {
   fiber._defectsHandledByOwner = true;
-  fiber.requestCancel();
+  fiber.requestCancel(reason: reason);
   await fiberCompletion(fiber, observe: false);
   return fiber._finalEvents;
 }
