@@ -38,6 +38,31 @@ extension FlowCombinationOperations<T, E> on Flow<T, E> {
       ).withError<E>().map((_) => merging.cursor);
     }),
   );
+
+  /// Pairs this flow's elements with [other] in their original order.
+  ///
+  /// Each requested pair opens or reads both inputs concurrently, with at most
+  /// one pending read per input. The first field comes from this flow and the
+  /// second from [other]. Resources from both elements remain available until
+  /// the pair and any downstream leases finish consumption.
+  ///
+  /// The shorter input determines the output length. As soon as either input
+  /// ends, the other pending read is stopped and any unpaired value is released.
+  /// Failure, early termination, and cancellation wait for both inputs to stop
+  /// and clean up. A native Future must settle before its read can stop.
+  Flow<(T, U), E> zip<U>(Flow<U, E> other) => flowFromCursor(
+    Scope.open().withError<E>().flatMap((owner) {
+      final zipped = _Zipped(
+        _PullSlot(openFlowCursor(this), owner),
+        _PullSlot(openFlowCursor(other), owner),
+        owner,
+      );
+      return inTaskScope(
+        Task.addFinalizer(zipped.cleanup),
+        owner,
+      ).withError<E>().map((_) => zipped.cursor);
+    }),
+  );
 }
 
 final class _Entry<T> {
@@ -89,35 +114,27 @@ final class _PullSlot<T, E> {
       Task.defer(() => source?.finish(exit) ?? Task.succeed(null));
 }
 
-final class _Merged<T, E> {
-  _Merged(this.inputs, this.owner);
+// The two inputs share stop, observation, and failure handling. Values stay in
+// their own typed slots; this coordinator never erases their types.
+final class _Readers<E> {
+  _Readers(this.owner);
 
-  final List<_PullSlot<T, E>> inputs;
   final Scope owner;
-  final _ready = Queue<_PullSlot<T, E>>();
+  final _active = <Fiber<void, E>>{};
   final _stopReason = Object();
   final _failures = <_ReadFailure<E>>[];
-  late final _lifetime = FlowProducer(owner);
-  FlowProducer? _current;
   void Function()? _wake;
-  var _stopping = false;
+  var stopping = false;
   var _stoppedByUs = false;
   var _failureDelivered = false;
 
-  late final cursor = FlowCursor<T, E>(
-    _pull(),
-    () => _current?.scope ?? owner,
-    _finish,
-    () => [?_current],
-  );
+  bool get active => _active.isNotEmpty;
 
-  bool get _active => inputs.any((input) => input.fiber != null);
-
-  Task<void, Never> _start(_PullSlot<T, E> input) => Task.defer(() {
-    if (_stopping ||
-        input.ended ||
-        input.fiber != null ||
-        input.entry != null) {
+  Task<void, Never> start<T>(
+    _PullSlot<T, E> input, {
+    void Function()? onReady,
+  }) => Task.defer(() {
+    if (stopping || input.ended || input.fiber != null || input.entry != null) {
       return Task.succeed(null);
     }
     var explicitCancellation = <CauseCancelled>[];
@@ -136,9 +153,11 @@ final class _Merged<T, E> {
             inheritHost: true,
           ).map((fiber) {
             input.fiber = fiber;
-            if (_stopping) fiber.requestCancel(reason: _stopReason);
+            _active.add(fiber);
+            if (stopping) fiber.requestCancel(reason: _stopReason);
             listenFiber(fiber, (exit) {
               input.fiber = null;
+              _active.remove(fiber);
               if (exit is ExitFailure<void, E>) {
                 if (_stoppedByUs) {
                   explicitCancellation = _causes(exit.cause)
@@ -152,9 +171,9 @@ final class _Merged<T, E> {
                     explicitCancellation,
                   ),
                 );
-                _stop();
-              } else if (input.entry != null) {
-                _ready.addLast(input);
+                stop();
+              } else {
+                onReady?.call();
               }
               _wake?.call();
             });
@@ -162,104 +181,44 @@ final class _Merged<T, E> {
     );
   });
 
-  Task<Option<T>, E> _pull() => Task.defer(() {
-    final previous = _current;
-    if (previous != null) {
-      _current = null;
-      return previous
-          .finish(const Exit.success(null))
-          .withError<E>()
-          .flatMap((_) => _pull());
-    }
-    if (_stopping) {
-      if (_active) return _wait().withError<E>().flatMap((_) => _pull());
-      return taskFromEvaluation(
-        _failure<Option<T>, E>(() => const Option.none()),
-      ).mapCause((cause) {
-        _failureDelivered = true;
-        return cause;
+  Task<void, Never> wait(bool Function() ready) =>
+      Task.fromCallback((complete) {
+        void notify() {
+          _wake = null;
+          complete(const Exit.success(null));
+        }
+
+        _wake = notify;
+        if (ready()) notify();
+        return () {
+          if (identical(_wake, notify)) _wake = null;
+        };
       });
-    }
-    return _start(inputs[0])
-        .flatMap((_) => _start(inputs[1]))
-        .withError<E>()
-        .flatMap((_) {
-          if (_stopping) return _pull();
-          if (_ready.isNotEmpty) {
-            final input = _ready.removeFirst();
-            final entry = input.entry!;
-            input.entry = null;
-            _lifetime.retain();
-            _current = FlowProducer(
-              createScope(parent: owner),
-              afterClose: (_) async => mergeFlowEvaluations([
-                await releaseFlowProducers(entry.producers),
-                await _lifetime.release(),
-              ]),
-            );
-            return Task.succeed(Option.some(entry.value));
-          }
-          if (inputs.every((input) => input.ended)) {
-            return _lifetime
-                .finish(const Exit.success(null))
-                .withError<E>()
-                .map((_) => const Option<Never>.none());
-          }
-          return _wait().withError<E>().flatMap((_) => _pull());
-        });
-  });
 
-  Task<void, Never> _wait() => Task.fromCallback((complete) {
-    void notify() {
-      _wake = null;
-      complete(const Exit.success(null));
-    }
-
-    _wake = notify;
-    if (_stopping ? !_active : _ready.isNotEmpty || !_active) notify();
-    return () {
-      if (identical(_wake, notify)) _wake = null;
-    };
-  });
-
-  void _stop() {
-    if (_stopping) return;
-    _stopping = true;
+  void stop() {
+    if (stopping) return;
+    stopping = true;
     _stoppedByUs = !scopeIsClosing(owner);
-    for (final input in inputs) {
-      input.fiber?.requestCancel(reason: _stopReason);
+    for (final fiber in _active.toList()) {
+      fiber.requestCancel(reason: _stopReason);
     }
     _wake?.call();
   }
 
-  Task<void, Never> _finish(Exit<Object?, Object?> exit) => Task.defer(() {
-    _stop();
-    if (_active) return _wait().flatMap((_) => _finish(exit));
-    final current = _current;
-    _current = null;
-    final retained = <FlowProducer>[];
-    for (final input in inputs) {
-      retained.addAll(input.entry?.producers ?? const []);
-      input.entry = null;
-    }
-    _ready.clear();
-    return inputs[0]
-        .finish(exit)
-        .ensuring(inputs[1].finish(exit))
-        .ensuring(current?.finish(exit) ?? Task.succeed(null))
-        .ensuring(_release(retained))
-        .ensuring(_lifetime.finish(exit));
-  });
+  Task<void, Never> awaitStopped() => Task.defer(
+    () => active
+        ? wait(() => !active).flatMap((_) => awaitStopped())
+        : Task.succeed(null),
+  );
 
-  Task<void, Never> cleanup(Exit<Object?, Object?> exit) => Task.defer(() {
-    // Owner closure has already stopped readers and closed child scopes. Do
-    // not wait on producer leases owned by the scope running this finalizer.
-    _stop();
-    _current = null;
-    _ready.clear();
-    for (final input in inputs) {
-      input.entry = null;
-    }
+  Task<A, E> result<A>(A Function() success) =>
+      taskFromEvaluation(_failure<A, E>(success)).mapCause((cause) {
+        _failureDelivered = true;
+        return cause;
+      });
+
+  Task<void, Never> cleanup() => Task.defer(() {
+    stop();
     return taskFromEvaluation(_failure<void, Never>(() {}, defectsOnly: true));
   });
 
@@ -307,6 +266,212 @@ final class _Merged<T, E> {
       List.unmodifiable(events),
     );
   }
+}
+
+// An output has its own callback scope and holds its inputs plus the enclosing
+// operator alive until every downstream lease releases that output.
+final class _Output {
+  _Output(this.owner);
+
+  final Scope owner;
+  late final lifetime = FlowProducer(owner);
+  FlowProducer? current;
+
+  Scope get scope => current?.scope ?? owner;
+  List<FlowProducer> producers() => [?current];
+
+  Option<T> emit<T>(T value, List<FlowProducer> inputs) {
+    lifetime.retain();
+    current = FlowProducer(
+      createScope(parent: owner),
+      afterClose: (_) async => mergeFlowEvaluations([
+        await releaseFlowProducers(inputs),
+        await lifetime.release(),
+      ]),
+    );
+    return Option.some(value);
+  }
+
+  Task<void, Never> retire(Exit<Object?, Object?> exit) => Task.defer(() {
+    final previous = current;
+    current = null;
+    return previous?.finish(exit) ?? Task.succeed(null);
+  });
+
+  Task<void, Never> finish(Exit<Object?, Object?> exit) =>
+      retire(exit).ensuring(lifetime.finish(exit));
+}
+
+final class _Merged<T, E> {
+  _Merged(this.inputs, Scope owner)
+    : readers = _Readers(owner),
+      output = _Output(owner);
+
+  final List<_PullSlot<T, E>> inputs;
+  final _Readers<E> readers;
+  final _Output output;
+  final _ready = Queue<_PullSlot<T, E>>();
+
+  late final cursor = FlowCursor<T, E>(
+    _pull(),
+    () => output.scope,
+    _finish,
+    output.producers,
+  );
+
+  Task<void, Never> _start(_PullSlot<T, E> input) => readers.start(
+    input,
+    onReady: () {
+      if (input.entry != null) _ready.addLast(input);
+    },
+  );
+
+  Task<Option<T>, E> _pull() => Task.defer(() {
+    if (output.current != null) {
+      return output
+          .retire(const Exit.success(null))
+          .withError<E>()
+          .flatMap((_) => _pull());
+    }
+    if (readers.stopping) {
+      return readers.awaitStopped().withError<E>().flatMap(
+        (_) => readers.result(() => const Option<Never>.none()),
+      );
+    }
+    return _start(
+      inputs[0],
+    ).flatMap((_) => _start(inputs[1])).withError<E>().flatMap((_) {
+      if (readers.stopping) return _pull();
+      if (_ready.isNotEmpty) {
+        final input = _ready.removeFirst();
+        final entry = input.entry!;
+        input.entry = null;
+        return Task.succeed(output.emit(entry.value, entry.producers));
+      }
+      if (inputs.every((input) => input.ended)) {
+        return output
+            .finish(const Exit.success(null))
+            .withError<E>()
+            .map((_) => const Option<Never>.none());
+      }
+      return readers
+          .wait(() => readers.stopping || _ready.isNotEmpty || !readers.active)
+          .withError<E>()
+          .flatMap((_) => _pull());
+    });
+  });
+
+  Task<void, Never> _finish(Exit<Object?, Object?> exit) => Task.defer(() {
+    readers.stop();
+    return readers.awaitStopped().flatMap((_) {
+      final retained = <FlowProducer>[];
+      for (final input in inputs) {
+        retained.addAll(input.entry?.producers ?? const []);
+        input.entry = null;
+      }
+      _ready.clear();
+      return inputs[0]
+          .finish(exit)
+          .ensuring(inputs[1].finish(exit))
+          .ensuring(_release(retained))
+          .ensuring(output.finish(exit));
+    });
+  });
+
+  Task<void, Never> cleanup(Exit<Object?, Object?> exit) => Task.defer(() {
+    // Owner closure has already stopped readers and closed child scopes. Do
+    // not wait on producer leases owned by the scope running this finalizer.
+    output.current = null;
+    _ready.clear();
+    for (final input in inputs) {
+      input.entry = null;
+    }
+    return readers.cleanup();
+  });
+}
+
+final class _Zipped<A, B, E> {
+  _Zipped(this.left, this.right, Scope owner)
+    : readers = _Readers(owner),
+      output = _Output(owner);
+
+  final _PullSlot<A, E> left;
+  final _PullSlot<B, E> right;
+  final _Readers<E> readers;
+  final _Output output;
+
+  late final cursor = FlowCursor<(A, B), E>(
+    _pull(),
+    () => output.scope,
+    _finish,
+    output.producers,
+  );
+
+  bool get _ended =>
+      (left.ended && left.fiber == null) ||
+      (right.ended && right.fiber == null);
+  bool get _paired =>
+      left.entry != null && right.entry != null && !readers.active;
+
+  Task<Option<(A, B)>, E> _pull() => Task.defer(() {
+    if (output.current != null) {
+      return output
+          .retire(const Exit.success(null))
+          .withError<E>()
+          .flatMap((_) => _pull());
+    }
+    if (readers.stopping) {
+      return readers.awaitStopped().withError<E>().flatMap(
+        (_) => readers.result(() => const Option<Never>.none()),
+      );
+    }
+    return readers
+        .start(left)
+        .flatMap((_) => readers.start(right))
+        .withError<E>()
+        .flatMap((_) {
+          if (readers.stopping) return _pull();
+          if (_ended) {
+            return _finish(const Exit.success(null))
+                .withError<E>()
+                .map((_) => const Option<Never>.none());
+          }
+          if (_paired) {
+            final a = left.entry!;
+            final b = right.entry!;
+            left.entry = null;
+            right.entry = null;
+            return Task.succeed(
+              output.emit((a.value, b.value), [...a.producers, ...b.producers]),
+            );
+          }
+          return readers
+              .wait(() => readers.stopping || _ended || _paired)
+              .withError<E>()
+              .flatMap((_) => _pull());
+        });
+  });
+
+  Task<void, Never> _finish(Exit<Object?, Object?> exit) => Task.defer(() {
+    readers.stop();
+    return readers.awaitStopped().flatMap((_) {
+      final retained = [...?left.entry?.producers, ...?right.entry?.producers];
+      left.entry = null;
+      right.entry = null;
+      return left
+          .finish(exit)
+          .ensuring(right.finish(exit))
+          .ensuring(_release(retained))
+          .ensuring(output.finish(exit));
+    });
+  });
+
+  Task<void, Never> cleanup(Exit<Object?, Object?> exit) => Task.defer(() {
+    output.current = null;
+    left.entry = null;
+    right.entry = null;
+    return readers.cleanup();
+  });
 }
 
 final class _ReadFailure<E> {
