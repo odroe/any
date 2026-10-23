@@ -229,7 +229,10 @@ final class Cache<K, V, E> {
           },
   };
 
-  Task<void, Never> _release(_Request<K, V, E> request) => Task.defer(() {
+  Task<void, Never> _release(
+    _Request<K, V, E> request,
+    Exit<Object?, Object?> exit,
+  ) => Task.defer(() {
     if (request.released) return Task.succeed(null);
     request.released = true;
     _waiting.remove(request);
@@ -254,13 +257,44 @@ final class Cache<K, V, E> {
     _drain();
     if (entry.result == null && !entry.cancelling) return Task.succeed(null);
     return entry.awaitResult().flatMap((result) {
-      final events = result.events;
+      final delivered = switch (exit) {
+        ExitFailure(:final cause) => _reasons(
+          cause,
+        ).whereType<CauseCancelled>().toList(),
+        _ => <CauseCancelled>[],
+      };
+      final cleanup = <Cause<Never>>[];
+      var removedStop = false;
+      if (result.exit case ExitFailure(:final cause)) {
+        for (final reason in _reasons(cause)) {
+          switch (reason) {
+            case CauseDefect():
+              cleanup.add(reason);
+            case CauseCancelled():
+              final index = delivered.indexWhere(
+                (value) => identical(value, reason),
+              );
+              if (index >= 0) {
+                delivered.removeAt(index);
+              } else if (!removedStop &&
+                  identical(reason.reason, entry.stopReason)) {
+                removedStop = true;
+              } else {
+                cleanup.add(reason);
+              }
+            default:
+              // Business failures do not become cleanup defects when a caller
+              // stops waiting. Explicit cleanup cancellations remain failures.
+              break;
+          }
+        }
+      }
       return taskFromEvaluation(
         TaskEvaluation<void, Never>(
-          events.isEmpty
+          cleanup.isEmpty
               ? const Exit.success(null)
-              : Exit.failure(Cause.combine(events.map((event) => event.cause))),
-          events,
+              : Exit.failure(Cause.combine(cleanup)),
+          result.events,
         ),
       );
     });
@@ -290,7 +324,7 @@ final class Cache<K, V, E> {
 
   Task<V, E> _get(K key) => Task.uninterruptibleMask((restore) {
     final request = _Request<K, V, E>(key);
-    return Task.addFinalizer((_) => _release(request))
+    return Task.addFinalizer((exit) => _release(request, exit))
         .flatMap(
           (_) => restore(
             Task.fromCallback<_Entry<K, V, E>, Never>((complete) {
@@ -321,6 +355,7 @@ extension CacheOperations<K, V, E> on Cache<K, V, E> {
   /// A miss waits for capacity if every slot is loading. Cancelling a caller
   /// removes only its wait. The last caller to leave an unfinished load cancels
   /// it and waits for its cleanup; a new request cannot join that generation.
+  /// Cleanup defects and explicit cleanup cancellations are retained.
   /// Closed caches fail with a [StateError] defect.
   Task<V, E> get(K key) => Task.defer(() => _get(key));
 
@@ -401,3 +436,8 @@ final class _Request<K, V, E> {
   _Entry<K, V, E>? entry;
   var released = false;
 }
+
+List<Cause<T>> _reasons<T>(Cause<T> cause) => switch (cause) {
+  CauseGroup(:final causes) => causes,
+  _ => [cause],
+};

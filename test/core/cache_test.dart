@@ -763,6 +763,91 @@ void main() {
     },
   );
 
+  test(
+    'last waiter cancellation retains explicit cleanup cancellation',
+    () async {
+      for (final reason in ['cleanup', 'stop']) {
+        final started = Completer<void>();
+        final cache = await _cache<String, int, Never>(
+          runtime,
+          capacity: 1,
+          ttl: ttl,
+          load: (_) =>
+              Task.sync(started.complete)
+                  .flatMap((_) => _pending<int>())
+                  .ensuring(Task.failCause(Cause.cancelled(reason))),
+        );
+        final controller = CancellationController();
+        final running = runtime.run(
+          cache.get('key'),
+          signal: controller.signal,
+        );
+        await started.future;
+        controller.requestCancel(reason: 'stop');
+        expect(
+          _reasons(_cause(await running))
+              .whereType<CauseCancelled>()
+              .map((cause) => cause.reason),
+          ['stop', reason],
+        );
+      }
+    },
+  );
+
+  test(
+    'delivered cleanup cancellation is not appended a second time',
+    () async {
+      final cache = await _cache<String, int, Never>(
+        runtime,
+        capacity: 1,
+        ttl: ttl,
+        load: (_) =>
+            Task.succeed(1)
+                .ensuring(Task.failCause(Cause.cancelled('cleanup'))),
+      );
+      final exit = await runtime.run(cache.get('key'));
+      expect(
+        _reasons(_cause(exit))
+            .whereType<CauseCancelled>()
+            .map((cause) => cause.reason),
+        ['cleanup'],
+      );
+    },
+  );
+
+  test(
+    'cleanup keeps repeated explicit cancellations and defect order',
+    () async {
+      final started = Completer<void>();
+      final cleanup = Cause<Never>.cancelled('cleanup');
+      final error = StateError('release');
+      final stack = StackTrace.fromString('release stack');
+      final cache = await _cache<String, int, Never>(
+        runtime,
+        capacity: 1,
+        ttl: ttl,
+        load: (_) => Task.sync(started.complete)
+            .flatMap((_) => _pending<int>())
+            .ensuring(
+              Task.failCause(
+                Cause.combine([cleanup, Cause.defect(error, stack), cleanup]),
+              ),
+            ),
+      );
+      final controller = CancellationController();
+      final running = runtime.run(cache.get('key'), signal: controller.signal);
+      await started.future;
+      controller.requestCancel(reason: 'stop');
+      final reasons = _reasons(_cause(await running));
+      expect(reasons, hasLength(4));
+      expect((reasons[0] as CauseCancelled).reason, 'stop');
+      expect(reasons[1], same(cleanup));
+      expect((reasons[2] as CauseDefect).error, same(error));
+      expect((reasons[2] as CauseDefect).stackTrace, same(stack));
+      expect(reasons[3], same(cleanup));
+    },
+  );
+
   test('invalid construction fails before invoking the loader', () async {
     var calls = 0;
     for (final config in [
