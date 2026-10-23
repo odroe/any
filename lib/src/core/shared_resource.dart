@@ -263,9 +263,10 @@ final class SharedResource<T, E> {
       }
     }
     return Task.fromFuture<TaskEvaluation<void, Never>, Never>(() async {
-      final results = await Future.wait([
+      final results = <TaskEvaluation<void, Never>>[];
+      await Future.wait([
         for (final generation in generations)
-          _closeWhenUnused(generation, exit),
+          _closeWhenUnused(generation, exit).then(results.add),
       ]);
       return results.fold<TaskEvaluation<void, Never>>(
         TaskEvaluation<void, Never>(const Exit.success(null), const []),

@@ -812,6 +812,54 @@ void main() {
     expect(reports, isEmpty);
   });
 
+  test(
+    'owner close keeps concurrent cleanup failures in completion order',
+    () async {
+      final foreign = Runtime();
+      addTearDown(foreign.close);
+      final entered = [Completer<void>(), Completer<void>()];
+      final releases = [Completer<void>(), Completer<void>()];
+      addTearDown(() {
+        for (final release in releases) {
+          if (!release.isCompleted) release.complete();
+        }
+      });
+      final failures = [
+        StateError('first generation'),
+        StateError('second generation'),
+      ];
+      var next = 0;
+      final resource = await _own(
+        runtime,
+        SharedResource.create(
+          Task.acquireRelease(
+            Task.sync(() => next++),
+            release: (value, _) =>
+                Task.sync(() => entered[value].complete())
+                    .flatMap((_) => _future(releases[value].future))
+                    .flatMap((_) => Task.sync(() => throw failures[value])),
+          ),
+        ),
+      );
+      final first = _Borrow(foreign, resource.acquire());
+      expect(await first.ready.future, 0);
+      await foreign.run(resource.invalidate());
+      final second = _Borrow(foreign, resource.acquire());
+      expect(await second.ready.future, 1);
+      final closing = runtime.close();
+      await foreign.run(Task.yieldNow());
+      first.release();
+      second.release();
+      await Future.wait(entered.map((entry) => entry.future));
+      releases[1].complete();
+      expect(_defects(await second.done), [same(failures[1])]);
+      releases[0].complete();
+      expect(_defects(await first.done), [same(failures[0])]);
+      expect(_defects(await closing), [same(failures[1]), same(failures[0])]);
+      expect(reports, isEmpty);
+    },
+  );
+
   test('idle cleanup defects report once to the creation runtime', () async {
     final reported = Completer<Cause<Object?>>();
     final owner = Runtime(
