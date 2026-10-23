@@ -69,6 +69,13 @@ Future<void> main(List<String> arguments) async {
       (await Future.wait(puts)).forEach(_check);
       queue.close();
     },
+    'stream_8': () async {
+      await for (final exit in Stream.fromIterable(
+        List.filled(count, 1),
+      ).mapConcurrent((_) => task, dependencies: (), concurrency: 8)) {
+        _check(exit);
+      }
+    },
   };
   print(
     'Dart ${Platform.version.split(' ').first}, ${Platform.operatingSystem}',
