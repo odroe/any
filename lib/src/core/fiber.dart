@@ -125,6 +125,7 @@ Fiber<T, E> startFiber<T, E>(
   bool inheritHost = true,
   bool deferStart = false,
   CancellationSignal? signal,
+  Scope? runScope,
 }) {
   final fiber = Fiber<T, E>._(createScope(), report);
   attachScopeFiber(owner, fiber);
@@ -145,6 +146,7 @@ Fiber<T, E> startFiber<T, E>(
             task,
             signal: fiber._controller.signal,
             scope: fiber._scope,
+            runScope: runScope,
             fiber: fiber,
             context: context,
             locals: locals,

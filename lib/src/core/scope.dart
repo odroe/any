@@ -127,6 +127,20 @@ bool scopeContains(Scope ancestor, Scope descendant) {
   return false;
 }
 
+// Actual ownership only: close dependencies do not transfer request domains.
+bool scopeOwnsScope(Scope owner, Scope target) {
+  final pending = <Scope>[owner];
+  while (pending.isNotEmpty) {
+    final scope = pending.removeLast();
+    if (scopeContains(scope, target)) return true;
+    pending.addAll(scope._children);
+    pending.addAll(scope._fibers.map(fiberScope));
+  }
+  return false;
+}
+
+bool scopeIsClosing(Scope scope) => scope._closing != null;
+
 // A finalizer also cannot await a sibling queued behind it by the same driver.
 bool scopeCloseWouldDeadlock(Scope target, Scope current) {
   if (target._closing?.completion.isCompleted ?? false) return false;

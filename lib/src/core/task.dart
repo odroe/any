@@ -425,10 +425,11 @@ extension TaskOperations<T, E> on Task<T, E> {
   /// Each execution starts a fresh fiber.
   Task<Fiber<T, E>, Never> fork() => Task._(
     _Fork(
-      (scope, parent, context, locals, signal) => startFiber(
+      (scope, parent, context, locals, signal, runScope) => startFiber(
         this,
         owner: scope,
         signal: signal,
+        runScope: scopeOwnsScope(runScope, scope) ? runScope : null,
         context: context,
         locals: locals,
         report: fiberReport(parent),
@@ -443,10 +444,11 @@ extension TaskOperations<T, E> on Task<T, E> {
   /// useful for work whose explicit owner outlives the creating task.
   Task<Fiber<T, E>, Never> forkIn(Scope scope) => Task._(
     _Fork(
-      (_, parent, context, locals, _) => startFiber(
+      (_, parent, context, locals, _, runScope) => startFiber(
         this,
         owner: scope,
         inheritHost: false,
+        runScope: scopeOwnsScope(runScope, scope) ? runScope : null,
         context: context,
         locals: locals,
         report: fiberReport(parent),
@@ -622,6 +624,7 @@ Future<TaskEvaluation<T, E>> evaluateTask<T, E>(
   Task<T, E> task, {
   CancellationSignal? signal,
   Scope? scope,
+  Scope? runScope,
   Fiber<Object?, Object?>? fiber,
   Context? context,
   Map<TaskLocal<Object?>, Object?> locals = const {},
@@ -632,6 +635,7 @@ Future<TaskEvaluation<T, E>> evaluateTask<T, E>(
     task,
     signal: signal,
     scope: ownedScope,
+    runScope: runScope ?? ownedScope,
     closingScopes: closingScopes,
     fiber: fiber,
     context: context ?? Context.from(const []),
@@ -701,11 +705,12 @@ Task<Fiber<T, E>, Never> forkTaskIn<T, E>(
   bool inheritHost = false,
 }) => Task._(
   _Fork(
-    (_, parent, context, locals, _) => startFiber(
+    (_, parent, context, locals, _, runScope) => startFiber(
       task,
       owner: scope,
       inheritHost: inheritHost,
       deferStart: true,
+      runScope: scopeOwnsScope(runScope, scope) ? runScope : null,
       context: context,
       locals: locals,
       report: fiberReport(parent),
@@ -716,6 +721,8 @@ Task<Fiber<T, E>, Never> forkTaskIn<T, E>(
 Task<T, E> accessTaskEnvironment<T, E>(
   Task<T, E> Function(Scope scope, Context context) use,
 ) => Task._(_Environment((scope, context, _, _) => use(scope, context)._node));
+
+Task<Scope, Never> currentTaskRunScope() => const Task._(_RunScope());
 
 // A shared service retains its creation environment without retaining the
 // creating fiber. Context and task-local maps are immutable snapshots.
@@ -749,6 +756,7 @@ Task<T, E> taskFromEvaluation<T, E>(TaskEvaluation<T, E> result) =>
 Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
   Task<T, E> task, {
   required Scope scope,
+  required Scope runScope,
   required List<Scope> closingScopes,
   CancellationSignal? signal,
   Fiber<Object?, Object?>? fiber,
@@ -791,6 +799,11 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
     try {
       if (evaluating) {
         switch (current) {
+          case _RunScope():
+            value = runScope;
+            failure = null;
+            events = const [];
+            evaluating = false;
           case _Environment(:final use):
             current = use(currentScope, currentContext, currentLocals, fiber);
           case _InScope(:final source, scope: final borrowed):
@@ -832,6 +845,7 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
               currentContext,
               currentLocals,
               signal,
+              runScope,
             );
             failure = null;
             events = const [];
@@ -1304,6 +1318,7 @@ final class _Fork extends _Node {
     Context,
     Map<TaskLocal<Object?>, Object?>,
     CancellationSignal?,
+    Scope,
   )
   start;
 }
@@ -1322,6 +1337,10 @@ final class _Environment extends _Node {
     Fiber<Object?, Object?>?,
   )
   use;
+}
+
+final class _RunScope extends _Node {
+  const _RunScope();
 }
 
 final class _InScope extends _Node {

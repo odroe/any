@@ -76,3 +76,5 @@ export 'src/core/shared_resource.dart'
     show SharedResource, SharedResourceOperations;
 export 'src/core/shared_resource_map.dart'
     show SharedResourceMap, SharedResourceMapOperations;
+export 'src/core/request_resolver.dart'
+    show RequestResolver, RequestResolverOperations;

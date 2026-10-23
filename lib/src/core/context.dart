@@ -104,6 +104,20 @@ final class Context {
 Context overlayContexts(Context base, Context provided) =>
     Context._({...base._services, ...provided._services});
 
+// Service objects can define value equality unrelated to authorization or
+// transaction identity. Request sharing compares bindings by identity only.
+bool contextBindingsIdentical(Context left, Context right) {
+  if (identical(left, right)) return true;
+  if (left._services.length != right._services.length) return false;
+  for (final entry in left._services.entries) {
+    if (!right._services.containsKey(entry.key) ||
+        !identical(right._services[entry.key], entry.value)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 /// Indicates that a required service [key] is absent from a [Context].
 final class MissingService implements Exception {
   /// Creates a diagnostic for the absent [key].
