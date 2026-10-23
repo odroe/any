@@ -52,6 +52,23 @@ Future<void> main(List<String> arguments) async {
         }).run(()),
       );
     },
+    'queue_roundtrip': () async {
+      final queue = AsyncQueue<int>(capacity: 1);
+      final roundtrip = queue.put<()>(1).flatMap((_) => queue.take<()>());
+      for (var i = 0; i < count; i++) {
+        _check(await roundtrip.run(()));
+      }
+      queue.close();
+    },
+    'queue_contended': () async {
+      final queue = AsyncQueue<int>(capacity: 1);
+      final puts = [for (var i = 0; i < count; i++) queue.put<()>(i).run(())];
+      for (var i = 0; i < count; i++) {
+        _check(await queue.take<()>().run(()));
+      }
+      (await Future.wait(puts)).forEach(_check);
+      queue.close();
+    },
   };
   print(
     'Dart ${Platform.version.split(' ').first}, ${Platform.operatingSystem}',
@@ -73,6 +90,6 @@ Future<void> main(List<String> arguments) async {
   }
 }
 
-void _check(Exit<Object?, Never> exit) {
+void _check(Exit<Object?, Object?> exit) {
   if (exit is ExitFailure) throw StateError('Unexpected failure: $exit');
 }
