@@ -21,3 +21,4 @@ export 'src/core/runtime.dart' show Runtime, RuntimeClosed, TaskException;
 export 'src/core/random_source.dart' show RandomSource;
 export 'src/core/redacted.dart' show Redacted;
 export 'src/core/clock.dart' show Clock;
+export 'src/core/scope.dart' show Scope;

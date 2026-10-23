@@ -4,6 +4,7 @@ import 'cancellation.dart';
 import 'cause.dart';
 import 'exit.dart';
 import 'result.dart';
+import 'scope.dart';
 
 /// A lazy computation producing a value of type [T] or a business error [E].
 ///
@@ -129,6 +130,54 @@ final class Task<T, E> {
   /// Timers and other ready work can advance. Enabled cancellation received
   /// while yielding terminates execution before the next business callback.
   static Task<void, Never> yieldNow() => const Task._(_Yield());
+
+  /// Registers cleanup in the current scope when this task executes.
+  ///
+  /// Finalizers receive the scope's body exit and run in reverse registration
+  /// order with cancellation masked. Every finalizer is attempted. Cleanup
+  /// failures are appended to the body's cause before the scope returns.
+  /// Cleanup has its own temporary scope, so it can register further cleanup
+  /// and use scoped resources before the enclosing scope continues closing.
+  static Task<void, Never> addFinalizer(
+    Task<void, Never> Function(Exit<Object?, Object?> exit) finalizer,
+  ) => Task._(_AddFinalizer(finalizer));
+
+  /// Acquires a resource and registers its release in the current scope.
+  ///
+  /// Acquisition and registration are masked from cancellation. A pending
+  /// request is handled only after a successful resource has its release
+  /// registered. An acquisition that never finishes therefore cannot be
+  /// cancelled promptly. A failed acquisition does not call [release].
+  ///
+  /// [release] runs with cancellation masked and observes the scope's exit.
+  /// Use [using] for a local lifetime, or complete all uses within this scope.
+  /// Returning a resource from Runtime.run does not extend its lifetime.
+  static Task<T, E> acquireRelease<T, E>(
+    Task<T, E> acquire, {
+    required Task<void, Never> Function(T resource, Exit<Object?, Object?> exit)
+    release,
+  }) => uninterruptibleMask(
+    (_) => acquire.flatMap(
+      (resource) =>
+          addFinalizer((exit) => release(resource, exit))
+              .withError<E>()
+              .map((_) => resource),
+    ),
+  );
+
+  /// Acquires, uses, and releases a resource within one local scope.
+  ///
+  /// Returns [use]'s result after [release] finishes, including on failure or
+  /// cancellation. Release observes the use exit; release failures follow body
+  /// failures in the final cause. Thrown callback exceptions become defects.
+  static Task<T, E> using<R, T, E>(
+    Task<R, E> acquire, {
+    required Task<T, E> Function(R resource) use,
+    required Task<void, Never> Function(R resource, Exit<T, E> exit) release,
+  }) => acquireRelease(
+    acquire,
+    release: (resource, exit) => release(resource, _typedExit<T, E>(exit)),
+  ).flatMap(use).scoped();
 }
 
 /// Wraps a task with the cancellation state captured by an enclosing mask.
@@ -139,6 +188,30 @@ typedef RestoreCancellation = Task<T, E> Function<T, E>(Task<T, E> task);
 
 /// Transforms and combines tasks using their static value and error types.
 extension TaskOperations<T, E> on Task<T, E> {
+  /// Runs this task in a child scope, waiting for its cleanup before continuing.
+  ///
+  /// Every execution creates a fresh scope. Child scopes close before parent
+  /// resources, and cleanup failures follow the body's cause without wrapping
+  /// or repeating that cause.
+  Task<T, E> scoped() => Task._(_Scoped(_node));
+
+  /// Runs [cleanup] after this task, including failure and cancellation.
+  ///
+  /// Cleanup is registered before starting this task and runs with cancellation
+  /// masked. Its failures are retained alongside the body's failure.
+  Task<T, E> ensuring(Task<void, Never> cleanup) => onExit((_) => cleanup);
+
+  /// Runs [cleanup] with this task's exit before continuing to the caller.
+  ///
+  /// The callback is registered in a local scope before starting this task.
+  /// Both the callback and returned cleanup task run in the registration Zone
+  /// with cancellation masked. Their exceptions become cleanup defects.
+  Task<T, E> onExit(Task<void, Never> Function(Exit<T, E> exit) cleanup) =>
+      Task.addFinalizer((exit) => cleanup(_typedExit<T, E>(exit)))
+          .withError<E>()
+          .flatMap((_) => this)
+          .scoped();
+
   /// Transforms the successful value when this task runs.
   ///
   /// Failures skip [transform]. Exceptions from [transform] become defects.
@@ -260,11 +333,45 @@ extension InfallibleTaskOperations<T> on Task<T, Never> {
 Future<Exit<T, E>> evaluateTask<T, E>(
   Task<T, E> task, {
   CancellationSignal? signal,
+  List<Scope> closingScopes = const [],
+}) async {
+  final ownedScope = createScope();
+  final (exit, cancelled) = await _evaluate(
+    task,
+    signal: signal,
+    scope: ownedScope,
+    closingScopes: closingScopes,
+  );
+  var result = exit;
+  var cancellationObserved = cancelled;
+  if (!cancellationObserved && (signal?.isCancelled ?? false)) {
+    result = _appendCleanup(result, Cause.cancelled(signal!.reason));
+    cancellationObserved = true;
+  }
+  result = _appendCleanup(result, await closeScope(ownedScope, result));
+  if (!cancellationObserved && (signal?.isCancelled ?? false)) {
+    result = _appendCleanup(result, Cause.cancelled(signal!.reason));
+  }
+  return result;
+}
+
+// Scope's public operations create instructions without exposing runtime state.
+Task<Scope, Never> openScopeTask() => const Task._(_OpenScope());
+
+Task<void, Never> closeScopeTask(Scope scope, Exit<Object?, Object?> exit) =>
+    Task._(_CloseScope(scope, exit));
+
+Future<(Exit<T, E>, bool)> _evaluate<T, E>(
+  Task<T, E> task, {
+  required Scope scope,
+  required List<Scope> closingScopes,
+  CancellationSignal? signal,
 }) async {
   var current = task._node;
   final frames = <_Frame>[];
   var evaluating = true;
   var interruptible = true;
+  var currentScope = scope;
   Object? value;
   Cause<Object?>? failure;
   var remaining = 2048;
@@ -272,7 +379,10 @@ Future<Exit<T, E>> evaluateTask<T, E>(
   while (true) {
     final effectiveSignal = interruptible ? signal : null;
     if (effectiveSignal?.isCancelled ?? false) {
-      return Exit.failure(_cancelled(failure, effectiveSignal!.reason));
+      return (
+        Exit<T, E>.failure(_cancelled(failure, effectiveSignal!.reason)),
+        true,
+      );
     }
     if (--remaining == 0) {
       remaining = 2048;
@@ -342,14 +452,76 @@ Future<Exit<T, E>> evaluateTask<T, E>(
           case _Continue(:final source, :final frame):
             frames.add(frame);
             current = source;
+          case _OpenScope():
+            value = createScope(parent: currentScope);
+            failure = null;
+            evaluating = false;
+          case _AddFinalizer(:final finalizer):
+            final zone = Zone.current;
+            final pending = addScopeFinalizer(
+              currentScope,
+              (exit) => zone.run(() => finalizer(exit)),
+              runFinalizer: (task, scope) => zone.run(
+                () => evaluateTask(
+                  task,
+                  closingScopes: [...closingScopes, scope],
+                ),
+              ),
+            );
+            failure = pending is Future<Cause<Never>?>
+                ? await pending
+                : pending;
+            value = null;
+            evaluating = false;
+          case _Scoped(:final source):
+            final parent = currentScope;
+            final child = createScope(parent: parent);
+            currentScope = child;
+            frames.add(
+              _Frame(
+                success: (value) {
+                  currentScope = parent;
+                  return _FinishScope(child, Exit.success(value));
+                },
+                failure: (cause, _) {
+                  currentScope = parent;
+                  return _FinishScope(child, Exit.failure(cause));
+                },
+              ),
+            );
+            current = source;
+          case _FinishScope(:final scope, :final exit):
+            final completed = _appendCleanup(
+              exit,
+              await closeScope(scope, exit),
+            );
+            switch (completed) {
+              case ExitSuccess(value: final result):
+                value = result;
+                failure = null;
+              case ExitFailure(:final cause):
+                failure = cause;
+            }
+            evaluating = false;
+          case _CloseScope(:final scope, :final exit):
+            if (scopeCloseWouldDeadlock(scope, currentScope) ||
+                closingScopes.any(
+                  (owner) => scopeCloseWouldDeadlock(scope, owner),
+                )) {
+              throw StateError('Closing this scope would wait on the caller.');
+            }
+            failure = await closeScope(scope, exit);
+            value = null;
+            evaluating = false;
         }
         continue;
       }
 
       if (frames.isEmpty) {
-        return failure == null
+        final Exit<T, E> exit = failure == null
             ? Exit.success(value as T)
             : Exit.failure(_typedCause<E>(failure));
+        return (exit, false);
       }
 
       final frame = frames.removeLast();
@@ -460,6 +632,19 @@ typedef _RegisterCallback = _CancelCallback Function(
 Cause<E> _typedCause<E>(Cause<Object?> cause) =>
     cause.mapError((error) => error as E);
 
+Exit<T, E> _typedExit<T, E>(Exit<Object?, Object?> exit) => switch (exit) {
+  ExitSuccess(:final value) => Exit.success(value as T),
+  ExitFailure(:final cause) => Exit.failure(_typedCause<E>(cause)),
+};
+
+Exit<T, E> _appendCleanup<T, E>(Exit<T, E> exit, Cause<Never>? cleanup) {
+  if (cleanup == null) return exit;
+  return switch (exit) {
+    ExitSuccess() => Exit.failure(cleanup),
+    ExitFailure(:final cause) => Exit.failure(Cause.combine([cause, cleanup])),
+  };
+}
+
 Cause<Object?> _mapErrors(
   Cause<Object?> cause,
   Object? Function(Object?) transform,
@@ -562,6 +747,32 @@ final class _Continue extends _Node {
   const _Continue(this.source, this.frame);
   final _Node source;
   final _Frame frame;
+}
+
+final class _OpenScope extends _Node {
+  const _OpenScope();
+}
+
+final class _AddFinalizer extends _Node {
+  const _AddFinalizer(this.finalizer);
+  final Task<void, Never> Function(Exit<Object?, Object?>) finalizer;
+}
+
+final class _Scoped extends _Node {
+  const _Scoped(this.source);
+  final _Node source;
+}
+
+final class _FinishScope extends _Node {
+  const _FinishScope(this.scope, this.exit);
+  final Scope scope;
+  final Exit<Object?, Object?> exit;
+}
+
+final class _CloseScope extends _Node {
+  const _CloseScope(this.scope, this.exit);
+  final Scope scope;
+  final Exit<Object?, Object?> exit;
 }
 
 final class _Frame {
