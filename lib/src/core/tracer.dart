@@ -8,7 +8,7 @@ import 'random_source.dart';
 import 'task.dart';
 import 'task_local.dart';
 
-/// Identifies a span and the trace to which it belongs.
+/// The identity of a span within a trace.
 ///
 /// Identifiers are opaque to core. Transport adapters validate their own wire
 /// formats. Generated identifiers use [RandomSource] and are not credentials.
@@ -43,10 +43,11 @@ final class SpanEvent {
   final Map<String, Object?> attributes;
 }
 
-/// The immutable snapshot delivered after a span's work and cleanup finish.
+/// A completed span's timing, outcome, attributes, and events.
 ///
 /// Successful result values are not retained. Failure causes retain their
-/// original objects and stack traces. Attribute values remain shallow copies.
+/// original objects and stack traces. Attribute maps are shallow-copied; their
+/// values remain shared by reference.
 final class SpanRecord {
   SpanRecord._({
     required this.name,
@@ -63,7 +64,7 @@ final class SpanRecord {
   }) : attributes = Map.unmodifiable(attributes),
        events = List.unmodifiable(events);
 
-  /// The operation name supplied to `withSpan`.
+  /// The operation name supplied to [TaskTracingOperations.withSpan].
   final String name;
 
   /// This span's identity.
@@ -97,23 +98,40 @@ final class SpanRecord {
   final int droppedEvents;
 }
 
-/// Collects completed spans through an ordered, awaitable backend.
+/// A tracer that exports completed task spans to an application-supplied backend.
 ///
-/// Backend failures are independently reported and never replace a business
-/// result. This adapter does not own the backend; use a layer to acquire it and
-/// flush and close it after dependent services have finished their cleanup.
+/// Bind a tracer through [key], then use [TaskTracingOperations.withSpan] around
+/// operations to record their duration and outcome, including resource cleanup.
+/// Nested spans form a trace; logs can carry the active trace and span IDs.
+///
+/// Backend errors go to the configured error handler without changing task
+/// results. The application owns the backend and must flush and close it after
+/// traced work and its cleanup have finished.
+///
+/// ```dart
+/// final records = <SpanRecord>[];
+/// final tracer = Tracer(records.add);
+/// final runtime = Runtime(context: Context.from([Tracer.key.bind(tracer)]));
+/// try {
+///   await runtime.runOrThrow(Task.succeed(42).withSpan('calculate'));
+///   assert(records.single.name == 'calculate');
+///   assert(records.single.exit is ExitSuccess);
+/// } finally {
+///   await runtime.close();
+///   await tracer.flush();
+/// }
+/// ```
 final class Tracer {
   /// Creates a tracer with bounded attributes and events per span.
   ///
-  /// Limits must be nonnegative. Existing attribute names can still be updated
-  /// at capacity; new names and excess events are dropped and counted. Event
-  /// attributes use the same attribute limit, independently for each event.
+  /// Limits must be nonnegative or this throws [RangeError]. Existing names can
+  /// still be updated at capacity; new names and excess events are dropped and
+  /// counted. Event attributes use the same limit, independently for each event.
   ///
-  /// Output and [flush] callbacks run serially in invocation order. They must
-  /// not await another operation on this tracer. Errors are passed to [onError]
-  /// in the creating zone, or to that zone's uncaught-error handler when absent.
-  /// The error handler must not write back to this tracer. Exceptions from the
-  /// handler are also sent to the creating zone.
+  /// Output and [flush] callbacks run in invocation order. They must not await
+  /// this tracer. Errors are passed to [onError] in the creating zone. Without
+  /// a handler, or if it throws, that zone's uncaught-error handler receives
+  /// them. The error handler must not write back to this tracer.
   Tracer(
     FutureOr<void> Function(SpanRecord record) output, {
     this.maxAttributes = 128,
@@ -126,7 +144,7 @@ final class Tracer {
     RangeError.checkNotNegative(maxEvents, 'maxEvents');
   }
 
-  /// Creates a tracer that does not allocate spans or read clock/random services.
+  /// Creates a tracer that disables span recording.
   Tracer.noop()
     : maxAttributes = 0,
       maxEvents = 0,
@@ -135,7 +153,7 @@ final class Tracer {
       _onError = null,
       _zone = Zone.current;
 
-  /// The tracer used by `withSpan` in the current task context.
+  /// The service key used by [TaskTracingOperations.withSpan].
   static final key = ServiceKey<Tracer>('tracer');
 
   /// Maximum retained span attributes and maximum attributes per event.
@@ -152,9 +170,9 @@ final class Tracer {
 
   /// Waits for previously ended spans, then invokes the backend flush callback.
   ///
-  /// Active spans are not ended or awaited. Later span output waits behind this
-  /// barrier. The Future succeeds even if the backend independently reports an
-  /// error. Call this after application work stops when a full drain is needed.
+  /// Active spans are not ended or awaited, so stop traced work before flushing
+  /// to drain all output. Later output waits until flushing finishes. Backend
+  /// errors are reported separately; the returned future still succeeds.
   Future<void> flush() => _enqueue(_flush ?? () {});
 
   Future<void> _enqueue(FutureOr<void> Function() action) =>
@@ -204,11 +222,11 @@ final class Tracer {
   }
 }
 
-/// The active, bounded recording state of a task span.
+/// An active trace span that accepts attributes and events.
 ///
 /// Obtain it with [current]. Forks inherit the active span; their modifications
-/// refer to the same recording state. Use a nested `withSpan` for a distinct
-/// child. Updates after the span ends have no effect.
+/// refer to the same recording state. Use [TaskTracingOperations.withSpan] to
+/// create a distinct child span. Updates after the span ends have no effect.
 final class Span {
   Span._(
     this.name,
@@ -255,12 +273,12 @@ final class Span {
     });
   }
 
-  /// Records an event using this span's captured clock.
+  /// Records a named event when the returned task executes.
   ///
-  /// Input attributes are shallow-copied now. Excess attributes are dropped in
-  /// insertion order and included in the record's dropped-attribute count.
-  /// At the event limit, no timestamp is read. Clock failures are independently
-  /// reported and the event is skipped without failing the task.
+  /// Input attributes are shallow-copied now. Excess attributes and events are
+  /// dropped and counted in the completed [SpanRecord]. Attributes are retained
+  /// in insertion order. The span's clock supplies the timestamp; a clock error
+  /// is reported separately and skips the event without failing the task.
   Task<void, Never> addEvent(
     String name, {
     Map<String, Object?> attributes = const {},
@@ -339,7 +357,7 @@ final class Span {
   });
 }
 
-/// Tracing boundaries for tasks, preserving their value and error types.
+/// Trace spans around task executions.
 extension TaskTracingOperations<T, E> on Task<T, E> {
   /// Records this task and its resource cleanup as one span.
   ///
@@ -348,11 +366,11 @@ extension TaskTracingOperations<T, E> on Task<T, E> {
   /// an incoming distributed trace. Without either, a new trace is created.
   /// Nested tasks and finalizers see this span through [Span.current].
   ///
-  /// Work runs in an owned child fiber with a local resource scope. Ending the
-  /// span waits for its full exit, including cancellation and cleanup defects,
-  /// then awaits the backend. The backend is called at most once. Reporting
-  /// errors do not change that exit. The resource boundary also applies with a
-  /// no-op tracer, which does not create a span or an additional fiber.
+  /// Resources acquired by this task are released before the span ends. The
+  /// recorded exit includes cancellation and cleanup defects. Completion waits
+  /// for cleanup and the backend, which is called at most once; reporting errors
+  /// do not change the task's outcome. A no-op tracer still creates the resource
+  /// boundary but records no span.
   Task<T, E> withSpan(
     String name, {
     Map<String, Object?> attributes = const {},

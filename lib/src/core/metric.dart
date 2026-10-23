@@ -8,6 +8,9 @@ import 'task.dart';
 /// A registry permits a name to be reused only with the same metric kind,
 /// [unit], [description], and histogram boundaries. Metadata is compared
 /// exactly; an absent unit and an empty unit are different.
+/// Names must be nonempty; invalid names throw [ArgumentError]. Measurement
+/// tasks use the current [MetricRegistry] and copy their attribute maps when
+/// constructed.
 sealed class Metric {
   Metric._(this.name, {this.unit, this.description}) {
     if (name.isEmpty) {
@@ -18,10 +21,10 @@ sealed class Metric {
   /// The nonempty name identifying this metric in a registry.
   final String name;
 
-  /// An optional measurement unit, retained unchanged.
+  /// The measurement unit, if specified.
   final String? unit;
 
-  /// An optional description, retained unchanged.
+  /// A description of what the metric measures.
   final String? description;
 
   Task<void, Never> _measure(num value, Map<String, String> attributes) {
@@ -41,10 +44,9 @@ final class Counter extends Metric {
 
   /// Adds a finite, nonnegative [value] when the returned task executes.
   ///
-  /// Attributes are copied into an immutable map when this method is called.
-  /// Invalid values become [ArgumentError] defects, including with a no-op
-  /// registry. An overflowing total becomes a [StateError] defect and leaves
-  /// the previous total unchanged. Registry capacity rules still apply.
+  /// Invalid values become [ArgumentError] defects, even with a no-op registry.
+  /// An overflowing total produces a [StateError] defect without changing the
+  /// previous total.
   Task<void, Never> add(
     num value, {
     Map<String, String> attributes = const {},
@@ -58,9 +60,8 @@ final class Gauge extends Metric {
 
   /// Replaces the current value with finite [value] when executed.
   ///
-  /// Attributes are copied when this method is called. Non-finite values become
-  /// [ArgumentError] defects, including with a no-op registry. Negative values
-  /// are allowed. Registry capacity rules still apply.
+  /// Negative values are allowed. Non-finite values become [ArgumentError]
+  /// defects, even with a no-op registry.
   Task<void, Never> set(
     num value, {
     Map<String, String> attributes = const {},
@@ -104,28 +105,42 @@ final class Histogram extends Metric {
 
   /// Records finite [value] when the returned task executes.
   ///
-  /// Attributes are copied when this method is called. Negative values are
-  /// allowed. An invalid value becomes an [ArgumentError] defect, including
-  /// with a no-op registry. An overflowing sum becomes a [StateError] defect
-  /// without changing the sum, count, or buckets.
+  /// Negative values are allowed. Invalid values become [ArgumentError] defects,
+  /// even with a no-op registry. An overflowing sum produces a [StateError]
+  /// defect without changing the sum, count, or buckets.
   Task<void, Never> record(
     num value, {
     Map<String, String> attributes = const {},
   }) => _measure(value, attributes);
 }
 
-/// Collects a bounded number of metric series in the current isolate.
+/// A bounded, in-memory collection of metric observations.
 ///
-/// A series is a metric name plus its complete attribute map, independent of
-/// map insertion order. Once the capacity is reached, measurements for unknown
-/// series are discarded; existing series continue to update. There is no
-/// eviction. Only accepted series register descriptor metadata, so rejected
-/// metric names do not accumulate in memory.
-/// Conflicting descriptors produce a [StateError] defect when measured, even
-/// after the registry has reached its series limit.
+/// Bind a registry through [key] to enable [Counter], [Gauge], and [Histogram]
+/// measurements. Read [snapshot] to inspect or export observations; the registry
+/// performs no I/O.
 ///
-/// Read [snapshot] to inspect or export observations. This registry performs no
-/// I/O; a backend can read snapshots without changing the measurement tasks.
+/// A series is a metric name plus its attributes, regardless of map order.
+/// At capacity, new series are discarded and counted in
+/// [MetricSnapshot.droppedMeasurements]; existing series continue to update and
+/// are never evicted. Only accepted series register metadata. Conflicting
+/// descriptors produce a [StateError] defect even when the registry is full.
+///
+/// ```dart
+/// final metrics = MetricRegistry();
+/// final requests = Counter('http.requests', unit: 'requests');
+/// final runtime = Runtime(
+///   context: Context.from([MetricRegistry.key.bind(metrics)]),
+/// );
+/// try {
+///   await runtime.runOrThrow(
+///     requests.add(1, attributes: {'method': 'GET'}),
+///   );
+///   assert(metrics.snapshot().counters.single.value == 1);
+/// } finally {
+///   await runtime.close();
+/// }
+/// ```
 final class MetricRegistry {
   /// Creates an in-memory registry with a positive total [maxSeries] limit.
   ///

@@ -5,16 +5,38 @@ import 'exit.dart';
 import 'option.dart';
 import 'task.dart';
 
-/// A bounded broadcast buffer owned by its creating scope.
+/// A scoped broadcast buffer that sends each value to every subscription.
 ///
-/// Each active subscription receives every accepted publication in order. A
-/// slow subscription applies backpressure to publishers; closing it releases
-/// its share of the buffer. Publications are accepted atomically for all
-/// subscriptions, rather than delivered to individual queues one at a time.
+/// Use a pub-sub when readers must each receive the publications, rather than
+/// compete for them. Subscriptions receive values in order, and a slow reader
+/// holds up publishers when the shared buffer is full. With no readers, only
+/// configured replay history is retained.
 ///
-/// With no subscriptions, only the configured replay history is retained.
-/// [end] allows accepted values to drain, while [close] discards them and fails
-/// unfinished operations. The owning scope automatically closes this pub-sub.
+/// ```dart
+/// import 'package:any/any.dart';
+///
+/// Future<void> main() async {
+///   final runtime = Runtime();
+///   try {
+///     final work = PubSub.bounded<int>(2, replay: 1)
+///         .withError<PubSubClosed>()
+///         .flatMap((messages) {
+///           return messages
+///               .publish(7)
+///               .flatMap((_) => messages.subscribe())
+///               .flatMap((subscription) => subscription.take())
+///               .map((value) => value.getOrElse(() => 0));
+///         });
+///     print(await runtime.runOrThrow(work)); // 7, from replay history.
+///   } finally {
+///     await runtime.close();
+///   }
+/// }
+/// ```
+///
+/// [end] lets subscriptions drain; [close] discards buffered values and fails
+/// unfinished operations. The creating scope closes the pub-sub automatically.
+/// A publication is accepted for all active subscriptions together.
 final class PubSub<T> {
   PubSub._(this._capacity, this._replay);
 
@@ -29,17 +51,15 @@ final class PubSub<T> {
   var _closed = false;
   var _draining = false;
 
-  /// Creates a scoped pub-sub with at most [capacity] buffered values.
+  /// Creates a pub-sub with room for [capacity] buffered values.
   ///
-  /// New subscriptions first receive up to [replay] recently accepted values,
-  /// followed by subsequent publications. History and unread values share the
-  /// same buffer. Consumed history can be replaced by a new publication;
-  /// unread values cannot.
+  /// New subscribers receive up to [replay] recent publications before live values.
+  /// History shares the buffer with unread values; only history already consumed
+  /// by every subscriber can be replaced to make space.
   ///
-  /// [capacity] must be positive, and [replay] must be between zero and
-  /// [capacity]. Invalid arguments become [RangeError] defects when executed.
-  /// Each execution creates an independent pub-sub. Returning it from a
-  /// completed runtime execution does not extend its lifetime.
+  /// [capacity] must be positive and [replay] must be between zero and [capacity],
+  /// or execution fails with a [RangeError] defect. Each execution creates a
+  /// pub-sub owned by its current scope; it cannot outlive that scope.
   static Task<PubSub<T>, Never> bounded<T>(int capacity, {int replay = 0}) =>
       Task.acquireRelease(
         Task.sync(() {
@@ -52,14 +72,14 @@ final class PubSub<T> {
         release: (pubSub, _) => pubSub.close(),
       );
 
-  /// Publishes [value], waiting in FIFO order if an unread buffer is full.
+  /// Publishes [value] to all active subscriptions.
   ///
-  /// Cancellation before acceptance removes only this publisher. After
-  /// acceptance, cancellation does not retract the publication, even if it
-  /// prevents the caller from receiving success. With no subscriptions and no
-  /// replay, publication succeeds without retaining the value.
+  /// Waits for space in arrival order when a reader's unread buffer is full. With
+  /// no readers and no replay, succeeds without retaining the value. After [end]
+  /// or [close], fails with [PubSubClosed].
   ///
-  /// An ended or closed pub-sub fails with [PubSubClosed].
+  /// Cancellation removes a waiting publication. An accepted publication cannot be
+  /// retracted, even if cancellation prevents the caller from observing success.
   Task<void, PubSubClosed> publish(T value) => Task.fromCallback((complete) {
     final request = _PublishRequest(value, complete);
     _publishes.addLast(request);
@@ -72,14 +92,14 @@ final class PubSub<T> {
     };
   });
 
-  /// Creates a subscription owned by the scope executing this task.
+  /// Creates an independently positioned, scoped subscription.
   ///
-  /// Registration and the replay snapshot form one synchronous step, so a
-  /// publication cannot fall between the history and live subscription. The
-  /// subscription automatically closes when its owning scope closes.
+  /// The replay snapshot and registration are atomic, so no publication is lost
+  /// between history and live values. The executing scope closes the subscription
+  /// automatically.
   ///
-  /// After [end], new subscriptions can still consume replay history before
-  /// receiving [OptionNone]. After [close], this fails with [PubSubClosed].
+  /// After [end], a new subscription can still read replay history before receiving
+  /// [OptionNone]. After [close], fails with [PubSubClosed].
   Task<PubSubSubscription<T>, PubSubClosed> subscribe() => Task.acquireRelease(
     Task.defer(() {
       if (_closed) return Task.fail(const PubSubClosed());
@@ -91,21 +111,19 @@ final class PubSub<T> {
     release: (subscription, _) => subscription.close(),
   );
 
-  /// Rejects new publications and lets subscriptions drain accepted values.
+  /// Stops new publications while letting subscriptions drain accepted values.
   ///
-  /// Publications still waiting for space fail with [PubSubClosed]. Each
-  /// subscription receives [OptionNone] after its own unread values drain.
-  /// Repeated calls have no effect.
+  /// Pending publications fail with [PubSubClosed]. Each subscription receives
+  /// [OptionNone] once its unread values drain. Repeated calls have no effect.
   Task<void, Never> end() => Task.sync(() {
     _ended = true;
     _drain();
   });
 
-  /// Discards the buffer and closes all subscriptions and pending operations.
+  /// Discards the buffer and closes all subscriptions.
   ///
-  /// A take that has not confirmed consumption fails with [PubSubClosed], even
-  /// if already woken. Repeated calls have no effect. The owning scope also
-  /// performs this operation automatically.
+  /// Unfinished and subsequent operations fail with [PubSubClosed]. Repeated calls
+  /// have no effect. The owning scope also calls this automatically.
   Task<void, Never> close() => Task.sync(() {
     if (_closed) return;
     _closed = true;
@@ -171,12 +189,14 @@ final class PubSub<T> {
   }
 }
 
-/// An independently positioned reader of a [PubSub].
+/// An independent reader of a [PubSub]'s publications.
 ///
-/// A subscription belongs to the scope that called [PubSub.subscribe]. Closing
-/// it releases unread values for other publishers without closing the pub-sub
-/// or affecting other subscriptions. Concurrent takes share this subscription's
-/// position and are served in arrival order.
+/// Obtain a subscription with [PubSub.subscribe]. Each subscription receives its
+/// own copy of the sequence; concurrent [take] calls on the same subscription
+/// instead divide that sequence in arrival order.
+///
+/// Closing this subscription, or its creating scope, releases unread buffer space
+/// without closing the pub-sub or affecting other subscriptions.
 final class PubSubSubscription<T> {
   PubSubSubscription._(this._pubSub, this._cursor);
 
@@ -186,16 +206,15 @@ final class PubSubSubscription<T> {
   _TakeRequest? _reserved;
   var _closed = false;
 
-  /// Takes this subscription's next value, waiting if necessary.
+  /// Removes this subscription's next value, waiting when necessary.
   ///
-  /// Returns [OptionNone] after [PubSub.end] and this subscription's accepted
-  /// values drain. A present `null` is returned as [OptionSome], when [T] allows
-  /// it. Closing the subscription or pub-sub fails with [PubSubClosed].
+  /// After [PubSub.end], returns [OptionNone] once unread values drain. A present
+  /// `null` is [OptionSome] when [T] allows it. Closing the subscription or pub-sub
+  /// fails this task with [PubSubClosed].
   ///
-  /// A wake-up reserves a turn without advancing the subscription. Cancelling
-  /// before confirmation leaves that value available to the next take on this
-  /// subscription. After confirmation, consumption is committed even if later
-  /// cancellation prevents the caller's continuation from running.
+  /// Cancelling while waiting leaves the value for the next take. Once removed,
+  /// a value cannot be restored by cancellation, even if the caller's next task
+  /// never runs.
   Task<Option<T>, PubSubClosed> take() =>
       Task.uninterruptibleMask<Option<T>, PubSubClosed>((restore) {
         final request = _TakeRequest();
@@ -219,9 +238,9 @@ final class PubSubSubscription<T> {
             .flatMap((_) => _confirmTake(request));
       }).scoped();
 
-  /// Closes this subscription and releases its unread buffer occupancy.
+  /// Closes this subscription and frees its unread buffer space.
   ///
-  /// Pending and subsequent takes fail with [PubSubClosed]. Other subscriptions
+  /// Unfinished and subsequent takes fail with [PubSubClosed]. Other subscriptions
   /// and the pub-sub stay open. Repeated calls have no effect.
   Task<void, Never> close() => Task.sync(_close);
 

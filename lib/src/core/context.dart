@@ -1,9 +1,10 @@
 import 'option.dart';
 
-/// Identifies a service of type [T] in a [Context].
+/// A typed identity for a service in a [Context].
 ///
-/// Each key has its own identity. Two keys with the same [name] and type still
-/// identify different services; the name is only used for diagnostics.
+/// Declare a key once and share it between service providers and consumers. Each
+/// new key identifies a different service, even if its type and [name] match
+/// another key. Use [bind] to associate a value with the key.
 final class ServiceKey<T> {
   /// Creates a distinct service key with a diagnostic [name].
   ServiceKey(this.name);
@@ -18,10 +19,10 @@ final class ServiceKey<T> {
   ServiceBinding<T> bind(T value) => ServiceBinding._(this, value);
 }
 
-/// A service [value] paired with its typed [key].
+/// A service value associated with a [ServiceKey].
 ///
-/// Create bindings with [ServiceKey.bind] so that the key checks the value's
-/// type before the binding can enter a [Context].
+/// Create a binding with [ServiceKey.bind], then add it to a [Context]. The key
+/// checks the value's type before the binding can be created.
 final class ServiceBinding<T> {
   const ServiceBinding._(this.key, this.value);
 
@@ -32,22 +33,36 @@ final class ServiceBinding<T> {
   final T value;
 }
 
-/// An immutable collection of typed service bindings.
+/// An immutable collection of services identified by typed keys.
 ///
-/// Use [read] when a service is required and [find] when its absence is allowed.
-/// [merge] adds distinct bindings; [replace] explicitly changes an existing
-/// binding. Neither operation modifies its inputs.
+/// Use [read] for required services and [find] for optional ones. [merge] combines
+/// contexts with distinct keys; [replace] changes an existing binding. These
+/// operations return new contexts and leave the original bindings intact.
 ///
-/// Immutability applies to the bindings, not to the service objects themselves.
+/// ```dart
+/// final endpoint = ServiceKey<Uri>('endpoint');
+/// final production = Context.from([
+///   endpoint.bind(Uri.parse('https://api.example.com')),
+/// ]);
+/// final testing = production.replace(
+///   endpoint.bind(Uri.parse('http://localhost:8080')),
+/// );
+/// assert(production.read(endpoint).host == 'api.example.com');
+/// assert(testing.read(endpoint).port == 8080);
+/// ```
+///
+/// A context stores service objects by reference. It neither copies mutable
+/// objects nor manages their cleanup. Supply it to `Runtime` or
+/// `Task.provideContext` to make its bindings available to tasks.
 final class Context {
   Context._(Map<ServiceKey<Object?>, Object?> services)
     : _services = Map.unmodifiable(services);
 
-  /// Copies [bindings] into a new context.
+  /// Creates a context containing a snapshot of [bindings].
   ///
-  /// Throws [DuplicateService] if the same key appears more than once, even if
-  /// both bindings contain the same value. Later changes to [bindings] do not
-  /// affect the context.
+  /// Throws [DuplicateService] if a key occurs more than once, even if the values
+  /// are identical. Later changes to the input collection do not affect this
+  /// context.
   factory Context.from(Iterable<ServiceBinding<Object?>> bindings) {
     final services = <ServiceKey<Object?>, Object?>{};
     for (final binding in bindings) {
@@ -77,10 +92,10 @@ final class Context {
       ? Option.some(_services[key] as T)
       : const Option.none();
 
-  /// Combines this context with the distinct services from [other].
+  /// Returns a new context containing this context's and [other]'s services.
   ///
-  /// Throws [DuplicateService] if both contexts contain the same key. Use
-  /// [replace] to explicitly change an existing binding instead.
+  /// Throws [DuplicateService] if both contain the same key. Use [replace] when
+  /// changing an existing service is intentional.
   Context merge(Context other) {
     final services = Map<ServiceKey<Object?>, Object?>.of(_services);
     for (final entry in other._services.entries) {
@@ -118,7 +133,9 @@ bool contextBindingsIdentical(Context left, Context right) {
   return true;
 }
 
-/// Indicates that a required service [key] is absent from a [Context].
+/// A missing required service in a [Context].
+///
+/// Thrown by [Context.read] and [Context.replace] when [key] has no binding.
 final class MissingService implements Exception {
   /// Creates a diagnostic for the absent [key].
   const MissingService(this.key);
@@ -130,7 +147,10 @@ final class MissingService implements Exception {
   String toString() => 'MissingService: No service is bound to "${key.name}".';
 }
 
-/// Indicates that a [Context] operation encountered the same [key] twice.
+/// A duplicate service key in a [Context] operation.
+///
+/// Thrown by [Context.from] and [Context.merge] instead of silently replacing a
+/// binding.
 final class DuplicateService implements Exception {
   /// Creates a diagnostic for the duplicate [key].
   const DuplicateService(this.key);

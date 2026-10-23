@@ -7,18 +7,57 @@ import 'latch.dart';
 import 'option.dart';
 import 'task.dart';
 
-/// Reuses a bounded number of resources through exclusive, scope-owned leases.
+/// A bounded set of reusable resources leased to one caller at a time.
 ///
-/// Each [acquire] reserves one resource until the caller's scope closes. Waiting
-/// callers are served in arrival order. Acquisition, active leases, idle values,
-/// and unfinished cleanup all count toward capacity. Cancelling a waiting
-/// caller removes only its request.
+/// Use a pool for connections or handles that cannot safely serve concurrent
+/// operations. [PoolOperations.use] borrows a resource for one operation;
+/// [PoolOperations.acquire] keeps it until the caller's scope closes. Waiting
+/// borrowers are served in arrival order.
 ///
-/// The creating scope owns this pool. Acquisition and cleanup use the services
-/// and task-local values captured there. Closing rejects new requests, stops
-/// unfinished acquisitions, and waits for active leases before cleanup. Borrowers
-/// in another runtime must release their own leases. Returning the pool from a
-/// completed Runtime.run does not extend its lifetime.
+/// The creating scope owns the pool and supplies the services and task-local
+/// values for acquisition and cleanup. Closing it rejects new requests, stops
+/// pending acquisitions, and waits for active leases. Borrowers in another
+/// runtime must release their own leases. A pool returned from a finished
+/// `Runtime.run` is already closed.
+///
+/// Here each file handle has its own position, and `use` prevents overlapping
+/// seeks on that handle.
+///
+/// ```dart
+/// import 'dart:io';
+///
+/// import 'package:any/any.dart';
+///
+/// Future<List<int>> readBytes(String path, List<int> offsets) async {
+///   final runtime = Runtime();
+///   final handle = Task.acquireRelease(
+///     Task.fromFuture(
+///       () => File(path).open(),
+///       onError: (error, _) => error.toString(),
+///     ),
+///     release: (file, _) => Task.fromFuture(() async {
+///       await file.close();
+///     }, onError: Error.throwWithStackTrace),
+///   );
+///   final program = Pool.create(handle, maxSize: 4).flatMap(
+///     (pool) => Task.forEach(
+///       offsets,
+///       (offset) => pool.use(
+///         (file) => Task.fromFuture(() async {
+///           await file.setPosition(offset);
+///           return file.readByte();
+///         }, onError: (error, _) => error.toString()),
+///       ),
+///       concurrency: 8,
+///     ),
+///   );
+///   try {
+///     return await runtime.runOrThrow(program);
+///   } finally {
+///     await runtime.close();
+///   }
+/// }
+/// ```
 final class Pool<T, E> {
   Pool._(this._state, this._maxSize);
 
@@ -29,23 +68,25 @@ final class Pool<T, E> {
   final _waiting = Queue<_Request>();
   var _closed = false;
 
-  /// Creates a pool, optionally acquiring [initialSize] resources before return.
+  /// Creates a pool, acquiring [initialSize] resources before it is ready.
   ///
-  /// [maxSize] must be positive. [initialSize] must be between zero and
-  /// [maxSize], and a supplied [idleTimeout] must not be negative. Invalid
-  /// arguments become defects during execution. Each execution creates an
-  /// independent pool.
+  /// [maxSize] must be positive; [initialSize] must be between zero and [maxSize].
+  /// Invalid values, including a negative [idleTimeout], become defects when
+  /// the task runs. Capacity includes acquisitions, borrowed and idle resources,
+  /// and unfinished cleanup. Each execution creates a separate pool.
   ///
-  /// Null [idleTimeout] retains returned resources until invalidated or closed.
-  /// Zero releases them upon return. A positive timeout starts when a resource
-  /// returns and is cancelled when it is borrowed again.
-  /// Prewarming follows the same idle policy and does not establish a minimum
-  /// size. A failed or cancelled prewarm releases everything before returning.
-  /// Background idle cleanup failures are reported to the creating runtime.
+  /// A null [idleTimeout] keeps returned resources until invalidation or closure.
+  /// Zero releases them on return. A positive duration releases resources that
+  /// remain idle that long; borrowing one resets its idle period. Idle cleanup
+  /// failures are reported to the creating runtime.
   ///
-  /// [acquire] should produce independently usable resources. If it returns the
-  /// same object more than once, different slots can expose that object at the
-  /// same time; [invalidate] retires all slots containing that object.
+  /// [initialSize] warms the pool without setting a minimum size. Warmed resources
+  /// follow the same idle policy. A failed or cancelled warmup finishes all
+  /// cleanup before returning.
+  ///
+  /// [acquire] should create independently usable resources. Returning the same
+  /// object for multiple slots allows concurrent borrowers of that object;
+  /// [PoolOperations.invalidate] retires all slots containing it.
   static Task<Pool<T, E>, E> create<T, E>(
     Task<T, E> acquire, {
     required int maxSize,
@@ -259,30 +300,37 @@ final class Pool<T, E> {
   }
 }
 
-/// Borrows and invalidates pool resources using their known value/error types.
+/// Borrows, uses, and retires pooled resources.
 extension PoolOperations<T, E> on Pool<T, E> {
-  /// Acquires an exclusive resource lease until the calling scope closes.
+  /// Borrows an exclusive resource until the calling scope closes.
   ///
-  /// Waits in FIFO order when all slots are occupied. Acquisition and cleanup
-  /// must finish before a slot can serve another request. Cancellation before
-  /// delivery cannot leak a resource or reservation. A closed pool fails with a
-  /// [StateError] defect. Acquiring while holding every slot can wait forever;
-  /// compose nested work within an existing lease instead.
+  /// Waits in arrival order when the pool is full. Resources being acquired or
+  /// cleaned up continue to occupy their slots. Cancellation removes a waiting
+  /// request without affecting other borrowers; a delivered lease is released
+  /// on scope closure.
+  ///
+  /// A closed pool fails with a [StateError] defect. Nested acquisition can wait
+  /// forever if the caller already holds every slot. Reuse the current lease for
+  /// nested work, or use [use] to bound its lifetime.
   Task<T, E> acquire() => Task.defer(_acquire);
 
-  /// Retires every current slot whose acquired value is identical to [value].
+  /// Removes [value] from reuse, matching by object identity.
   ///
-  /// Active borrowers keep their resource until their scopes close; subsequent
-  /// callers cannot reuse it. Unused resources are cleaned up before this task
-  /// finishes, and those cleanup failures propagate. Cleanup of an active lease
-  /// belongs to its returning borrower. Unknown or already retiring values do
-  /// nothing. Cancellation waits for cleanup this call has already started.
+  /// All slots containing that object are retired. Active borrowers keep their
+  /// resource until their scopes close; their cleanup failures belong to those
+  /// borrowers. For unused resources, this task waits for cleanup and propagates
+  /// its failures.
+  ///
+  /// Unknown or already retiring values have no effect. Cancellation waits for
+  /// cleanup already started. A closed pool fails with a [StateError] defect.
   Task<void, Never> invalidate(T value) => Task.defer(() => _invalidate(value));
 
-  /// Borrows a resource for [use], returning it before continuing to the caller.
+  /// Borrows a resource for [use] and returns it before completing.
   ///
-  /// The callback and its resources run in a child scope. Its failure is retained
-  /// alongside any resource cleanup failure. Exceptions from [use] are defects.
+  /// Returns the callback's result after its child scope closes and releases
+  /// the lease. If release also closes the resource, its cleanup finishes first.
+  /// Callback failures and cleanup failures are both preserved; thrown callback
+  /// exceptions become defects.
   Task<U, E> use<U>(Task<U, E> Function(T value) use) =>
       acquire().flatMap(use).scoped();
 }

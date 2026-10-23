@@ -9,23 +9,21 @@ import 'option.dart';
 import 'scope.dart';
 import 'task.dart';
 
-/// Combines independent flow consumptions using their statically known types.
+/// Concurrent combinations of two flows.
 extension FlowCombinationOperations<T, E> on Flow<T, E> {
-  /// Interleaves this flow with [other], preserving each input's element order.
+  /// Interleaves values from both flows while preserving each input's order.
   ///
-  /// Both inputs open and read concurrently. Results are delivered in their observed
-  /// completion order, which does not define an order for simultaneous values.
-  /// One completed input leaves the other running; both must finish normally
-  /// for the merged flow to end.
+  /// Values are delivered as they become available; simultaneous arrivals have
+  /// no guaranteed relative order. Completion of one input leaves the other
+  /// running. Both must finish for the merged flow to end.
   ///
-  /// Each input has at most one pending read or undelivered value. Another read
-  /// starts only when downstream requests an element. Resources for delivered
-  /// values remain alive through downstream consumption, including buffering
-  /// and concurrent mapping. Each consumption opens both inputs independently.
+  /// Each consumption starts both inputs independently, with at most one pending
+  /// read or waiting value per input. New reads require downstream demand.
+  /// Delivered values keep their resources alive through downstream use.
   ///
-  /// Failure stops both inputs and waits for cleanup. Early termination also
-  /// waits for pending reads, retaining observed defects and cleanup failures.
-  /// An underlying native Future must settle before its read can stop.
+  /// Failure stops both inputs. Stopping early waits for pending reads and cleanup,
+  /// preserving observed defects and cleanup failures. A non-cancellable [Future]
+  /// must settle before its read can stop.
   Flow<T, E> merge(Flow<T, E> other) => flowFromCursor(
     Scope.open().withError<E>().flatMap((owner) {
       final merging = _Merged([
@@ -39,17 +37,24 @@ extension FlowCombinationOperations<T, E> on Flow<T, E> {
     }),
   );
 
-  /// Pairs this flow's elements with [other] in their original order.
+  /// Pairs elements at matching positions, ending with the shorter flow.
   ///
-  /// Each requested pair opens or reads both inputs concurrently, with at most
-  /// one pending read per input. The first field comes from this flow and the
-  /// second from [other]. Resources from both elements remain available until
-  /// the pair and any downstream leases finish consumption.
+  /// The first record field comes from this flow; the second comes from [other].
+  /// Use [combineLatest] instead when either input should update a pair without
+  /// waiting for a matching next element.
   ///
-  /// The shorter input determines the output length. As soon as either input
-  /// ends, the other pending read is stopped and any unpaired value is released.
-  /// Failure, early termination, and cancellation wait for both inputs to stop
-  /// and clean up. A native Future must settle before its read can stop.
+  /// ```dart
+  /// final pairs = Flow.fromIterable([1, 2, 3])
+  ///     .zip(Flow.fromIterable(['a', 'b']))
+  ///     .toList();
+  /// // Running pairs produces [(1, 'a'), (2, 'b')].
+  /// ```
+  ///
+  /// Both inputs are read concurrently, at most once each per requested pair.
+  /// Resources from both values remain alive until the pair is consumed. When one
+  /// input ends, any unpaired value is released and the other read is cancelled.
+  /// Failure or stopping early waits for both inputs and cleanup, including any
+  /// non-cancellable [Future].
   Flow<(T, U), E> zip<U>(Flow<U, E> other) => flowFromCursor(
     Scope.open().withError<E>().flatMap((owner) {
       final zipped = _Zipped(
@@ -64,22 +69,27 @@ extension FlowCombinationOperations<T, E> on Flow<T, E> {
     }),
   );
 
-  /// Combines each update with the most recent element from the other input.
+  /// Emits each update paired with the other flow's latest value.
   ///
-  /// Both inputs open and read concurrently. Nothing is emitted until each has
-  /// produced an element; earlier updates retain only that input's latest value.
-  /// Afterwards, each observed update emits a record in completion order. Its
-  /// first field comes from this flow and its second from [other].
+  /// Nothing is emitted until both inputs have a value. Then each observed update
+  /// produces `(thisValue, otherValue)`, in arrival order. Earlier updates from
+  /// one input are replaced while waiting for the other's first value. Use [zip]
+  /// when values should instead be paired once by their positions.
   ///
-  /// Each input retains one latest value and has at most one pending read or
-  /// undelivered update. The latest value's resources stay alive until replaced
-  /// or consumption ends. Each output holds independent leases, so replacing a
-  /// latest value cannot invalidate records still used downstream.
+  /// ```dart
+  /// final pairs = Flow.fromIterable([10])
+  ///     .combineLatest(Flow.fromIterable([1, 2, 3]))
+  ///     .toList();
+  /// // Running pairs produces [(10, 1), (10, 2), (10, 3)].
+  /// ```
   ///
-  /// A completed input keeps its latest value while the other continues. An
-  /// input that ends without producing an element ends the combined flow and
-  /// stops the other input. Failure, early termination, and cancellation wait
-  /// for both inputs and their cleanup, including pending native Futures.
+  /// A completed input keeps contributing its last value. An input that ends empty
+  /// ends the result immediately. Both inputs run concurrently, each retaining a
+  /// latest value and at most one pending read or waiting update. Latest values
+  /// and emitted pairs keep their resources alive while in use.
+  ///
+  /// Failure or stopping early waits for both inputs and cleanup, including any
+  /// non-cancellable [Future].
   Flow<(T, U), E> combineLatest<U>(Flow<U, E> other) => flowFromCursor(
     Scope.open().withError<E>().flatMap((owner) {
       final combined = _Latest(

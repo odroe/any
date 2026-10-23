@@ -12,18 +12,39 @@ import 'runtime.dart';
 import 'scope.dart';
 import 'task.dart';
 
-/// A lazy sequence whose production, errors, and resources use [Task].
+/// A lazy sequence of [T] values with business failures of type [E].
 ///
-/// Consumers request one element at a time. Each consumption opens independent
-/// iteration state and a scope; finishing, failing, or cancelling consumption
-/// waits for producer cleanup. A produced value's resources stay available
-/// while its consuming callback runs. External objects, including queues and
-/// iterables, retain their own sharing and ownership rules.
+/// Use a flow to process values incrementally with [Task] operations and scoped
+/// resources. Build a pipeline, then consume it with [FlowOperations.toList],
+/// [FlowOperations.fold], or [FlowOperations.forEach]. Construction does no work;
+/// each consumption starts a new iteration.
 ///
-/// Consume a flow with [FlowOperations.toList], [FlowOperations.fold],
-/// [FlowOperations.forEach], or [FlowOperations.drain]. No work starts merely
-/// by constructing or transforming a flow. Exceptions from user callbacks
-/// become defects, following Task's error rules.
+/// ```dart
+/// import 'package:any/any.dart';
+///
+/// Future<void> main() async {
+///   final runtime = Runtime();
+///   try {
+///     final values = await runtime.runOrThrow(
+///       Flow.fromIterable([1, 2, 3])
+///           .filter((value) => value > 1)
+///           .map((value) => value * 10)
+///           .toList(),
+///     );
+///     print(values); // [20, 30]
+///   } finally {
+///     await runtime.close();
+///   }
+/// }
+/// ```
+///
+/// Consumption requests values as needed unless an operator buffers or processes
+/// concurrently. An element's resources remain alive while downstream uses it;
+/// stopping consumption waits for owned work and cleanup. A collected value does
+/// not extend its resources' lifetime beyond consumption.
+///
+/// Exceptions in callbacks become defects. External sources retain their own
+/// sharing rules: for example, consumers of [fromQueue] compete for values.
 final class Flow<T, E> {
   Flow._(this._open);
 
@@ -31,11 +52,11 @@ final class Flow<T, E> {
 
   final Task<FlowCursor<T, E>, E> _open;
 
-  /// Reads [values] lazily using a new iterator for each consumption.
+  /// Emits [values] in iteration order.
   ///
-  /// The iterable is not copied. Its iterator is created when consumption
-  /// starts; iteration exceptions become defects. Nullable values remain
-  /// elements, distinct from completion.
+  /// Each consumption creates a new iterator without copying the iterable. Changes
+  /// to the iterable remain visible according to its iterator's rules; iteration
+  /// exceptions become defects. A nullable element is distinct from completion.
   static Flow<T, Never> fromIterable<T>(Iterable<T> values) => Flow._source(
     Task.sync(() {
       final iterator = values.iterator;
@@ -47,10 +68,10 @@ final class Flow<T, E> {
     }),
   );
 
-  /// Runs [task] once per consumption and emits its successful value.
+  /// Emits the successful result of [task] once per consumption.
   ///
-  /// Resources acquired by [task] remain alive until the consumer requests the
-  /// end of the flow or exits. Task failure produces no element.
+  /// A failed task emits nothing. Resources acquired by the task stay alive through
+  /// consumption of the result and close when the flow ends or is stopped.
   static Flow<T, E> fromTask<T, E>(Task<T, E> task) => Flow._source(
     Task.sync(() {
       var emitted = false;
@@ -62,33 +83,30 @@ final class Flow<T, E> {
     }),
   );
 
-  /// Takes elements from [queue] without taking ownership of the queue.
+  /// Takes values from [queue] in queue order.
   ///
-  /// Normal queue completion drains accepted elements before ending this flow.
-  /// A closed queue fails with [QueueClosed]. Stopping this consumption removes
-  /// its pending take but does not close the queue. Concurrent consumers compete
-  /// for elements; they do not each receive a copy.
+  /// [AsyncQueue.end] lets accepted values drain before the flow ends;
+  /// [AsyncQueue.close] fails consumption with [QueueClosed]. Stopping the flow
+  /// cancels its pending take without closing the queue. Multiple consumers divide
+  /// the values among them rather than each receiving a copy.
   static Flow<T, QueueClosed> fromQueue<T>(AsyncQueue<T> queue) =>
       Flow._source(Task.succeed(queue.take()));
 
-  /// Subscribes to a new stream from [create] for each consumption.
+  /// Consumes a new Dart stream from [create] on each consumption.
   ///
-  /// The first stream error ends production. Previously buffered values are
-  /// delivered before [onError] maps that error and its original stack trace to
-  /// a business failure. Exceptions from [create], `listen`, or [onError] become
-  /// defects. The subscription is cancelled, and its cancellation future is
-  /// awaited, when consumption ends for any reason.
+  /// [onError] maps the first stream error and its stack trace to a business
+  /// failure, after any buffered values. Exceptions thrown by [create], `listen`,
+  /// or [onError] become defects. Ending or stopping consumption cancels the
+  /// subscription and waits for cancellation to finish.
   ///
-  /// [bufferCapacity] must be positive and bounds data retained by this bridge.
-  /// The subscription is paused while data awaits consumption and resumed when
-  /// another element is requested. A source may buffer internally despite
-  /// pause; this limit does not bound memory outside the bridge. [overflow]
-  /// handles data delivered beyond the bridge's capacity. Error and completion
-  /// signals are retained separately and are never dropped by this policy.
-  /// An already detected overflow is retained during cleanup even if an early
-  /// consumer limit stops before that failure would be pulled.
+  /// [bufferCapacity] limits this adapter's buffer and must be positive; otherwise
+  /// consumption fails with a [RangeError] defect before calling [create]. The
+  /// subscription pauses between requests. A source may still buffer internally,
+  /// so this is not a limit on the source's total memory use.
   ///
-  /// Invalid capacity becomes a [RangeError] defect before [create] is called.
+  /// [overflow] handles values arriving when the adapter is full. Error and done
+  /// events are never dropped. With [StreamOverflowStrategy.fail], a detected
+  /// overflow still fails consumption if it stops before reaching the overflow.
   static Flow<T, E> fromStream<T, E>(
     Stream<T> Function() create, {
     required E Function(Object error, StackTrace stackTrace) onError,
@@ -111,12 +129,11 @@ final class Flow<T, E> {
     ),
   );
 
-  /// Repeatedly applies [step] to the current state, starting at [initial].
+  /// Builds a sequence by applying [step] to a state, starting with [initial].
   ///
-  /// A present record emits its first field and uses its second as the next
-  /// state. [OptionNone] ends the sequence. Each consumption starts with
-  /// [initial]; mutable objects supplied as state are not cloned. The next step
-  /// does not run until the previous element has been consumed.
+  /// Return `Option.some((value, nextState))` to emit a value, or [OptionNone] to
+  /// finish. The next step waits until the previous value has been consumed. Each
+  /// consumption starts with [initial]; mutable state is not copied.
   static Flow<T, E> unfold<S, T, E>(
     S initial,
     Task<Option<(T, S)>, E> Function(S state) step,
@@ -136,35 +153,32 @@ final class Flow<T, E> {
   );
 }
 
-/// Transforms and consumes flows using their statically known types.
+/// Transformations and consumers for a [Flow].
 extension FlowOperations<T, E> on Flow<T, E> {
   /// Transforms each element with [transform], preserving order.
   ///
-  /// Exceptions from [transform] become defects and close the producer.
+  /// An exception from [transform] fails consumption with a defect.
   Flow<U, E> map<U>(U Function(T value) transform) => _transform(
     _open,
     (source) => source.pull().map((item) => item.map(transform)),
   );
 
-  /// Runs [transform] with at most [concurrency] outstanding elements.
+  /// Transforms elements with tasks, optionally running several at once.
   ///
-  /// By default, results retain input order. Set [preserveOrder] to false to
-  /// emit them in completion order. Input is always pulled sequentially. The
-  /// limit includes running tasks, completed results awaiting delivery, and the
-  /// last delivered element until downstream requests another. With the default
-  /// limit of one there is no prefetch. Downstream buffering retains its own
-  /// resource leases without continuing to occupy this mapping's limit.
+  /// [concurrency] defaults to one, with no prefetch. Higher limits include running
+  /// tasks, results waiting for delivery, and the currently delivered result until
+  /// downstream requests another. Input order is preserved unless [preserveOrder]
+  /// is false, which emits results in completion order. A nonpositive limit causes
+  /// a [RangeError] defect before source work starts.
   ///
-  /// Each result has a scope for resources acquired by its mapping task and
-  /// downstream callbacks. They are released after that element is consumed,
-  /// before releasing its input resources. Input resources remain available
-  /// even if prefetch advances to another inner flow or concatenated branch.
-  /// Use Task.scoped inside [transform] for resources needed only during mapping.
+  /// Each result owns resources acquired by its mapping task and downstream
+  /// callbacks. They close after consumption of that result, before releasing its
+  /// input resources. Later buffering may keep results alive beyond this method's
+  /// concurrency limit. Use [TaskOperations.scoped] inside [transform] to release
+  /// resources as soon as mapping finishes.
   ///
-  /// Failure stops further input and cancels unfinished work, waiting for its
-  /// cleanup. Early termination also waits and retains already observed defects.
-  /// [concurrency] must be positive; invalid values become [RangeError] defects
-  /// before upstream work starts.
+  /// Failure stops the source and cancels unfinished mappings. Stopping early
+  /// waits for their cleanup and preserves observed defects and cleanup failures.
   Flow<U, E> mapTask<U>(
     Task<U, E> Function(T value) transform, {
     int concurrency = 1,
@@ -196,10 +210,11 @@ extension FlowOperations<T, E> on Flow<T, E> {
   Flow<T, E> filter(bool Function(T value) test) =>
       filterTask((value) => Task.sync(() => test(value)));
 
-  /// Runs [test] sequentially and keeps elements whose result is true.
+  /// Keeps elements whose sequential [test] task returns true.
   ///
-  /// Rejected elements are consumed without being delivered downstream.
-  /// Task resources use the same lifetime rules as [mapTask].
+  /// The test's resources belong to the input element's scope, including for
+  /// rejected values. Use [TaskOperations.scoped] on the test task if its resources
+  /// should close after each test. A failed test stops consumption.
   Flow<T, E> filterTask(Task<bool, E> Function(T value) test) =>
       _transform(_open, (source) {
         Task<Option<T>, E> next() => Task.defer(
@@ -216,13 +231,12 @@ extension FlowOperations<T, E> on Flow<T, E> {
         return next();
       });
 
-  /// Consumes each flow returned by [transform] fully before requesting another
-  /// element from this flow.
+  /// Emits each flow returned by [transform] in sequence.
   ///
-  /// Resources from the outer element remain available to its inner flow.
-  /// Downstream concurrent mapping can keep an earlier inner producer alive
-  /// while its emitted values are still in use. Otherwise each inner producer
-  /// closes before the next opens. Failure stops further production.
+  /// Each inner flow finishes producing before the next outer value is requested.
+  /// The outer value's resources stay available to its inner flow. Values retained
+  /// downstream can keep an earlier inner flow's resources alive; otherwise its
+  /// cleanup finishes before the next inner flow opens. Failure stops the sequence.
   Flow<U, E> flatMap<U>(Flow<U, E> Function(T value) transform) => Flow._(
     _open.map((source) {
       FlowCursor<U, E>? inner;
@@ -257,11 +271,18 @@ extension FlowOperations<T, E> on Flow<T, E> {
     }),
   );
 
-  /// Emits the accumulated state after each element, starting at [initial].
+  /// Emits the accumulated state after each element.
   ///
-  /// The initial state is not emitted separately. Each consumption starts at
-  /// [initial]; mutable state is not cloned. Exceptions from [combine] become
-  /// defects.
+  /// [initial] is the starting state, not a separate output. Each consumption uses
+  /// that same initial value; mutable objects are not copied. Exceptions from
+  /// [combine] become defects.
+  ///
+  /// ```dart
+  /// final totals = Flow.fromIterable([1, 2, 3])
+  ///     .scan(0, (sum, value) => sum + value)
+  ///     .toList();
+  /// // Running totals produces [1, 3, 6].
+  /// ```
   Flow<S, E> scan<S>(S initial, S Function(S state, T value) combine) =>
       _transform(_open, (source) {
         var state = initial;
@@ -275,14 +296,18 @@ extension FlowOperations<T, E> on Flow<T, E> {
 
   /// Collects consecutive elements into immutable lists of at most [size].
   ///
-  /// A normal end emits the last partial group. Failure discards a partial group
-  /// and releases its resources. Each group's input resources remain alive until
-  /// that group is consumed, including when upstream mapping or recovery moves
-  /// to another producer. This operation retains at most [size] input elements
-  /// per group under construction, in addition to groups retained downstream.
+  /// Normal completion emits a final partial group; failure discards it. Each
+  /// group keeps its inputs' resources alive until the group is consumed.
+  /// [size] must be positive; otherwise consumption fails with a [RangeError]
+  /// defect before opening the source.
   ///
-  /// [size] must be positive; invalid values become [RangeError] defects before
-  /// opening the source.
+  /// ```dart
+  /// final batches = Flow.fromIterable([1, 2, 3, 4, 5]).grouped(2).toList();
+  /// // Running batches produces [[1, 2], [3, 4], [5]].
+  /// ```
+  ///
+  /// At most [size] inputs are held for the next group, in addition to any groups
+  /// still in use downstream.
   Flow<List<T>, E> grouped(int size) => Flow._(
     Task.defer(() {
       if (size < 1) throw RangeError.range(size, 1, null, 'size');
@@ -295,23 +320,29 @@ extension FlowOperations<T, E> on Flow<T, E> {
     }),
   );
 
-  /// Prefetches up to [capacity] elements while downstream consumes a value.
+  /// Prefetches up to [capacity] elements while downstream processes a value.
   ///
-  /// One producer pulls upstream sequentially. Buffered values keep their input
-  /// order and original resource scopes; downstream callbacks still run in the
-  /// consuming task. Production starts on the first pull of each consumption.
+  /// Use this between a producer and a slow consumer to let their work overlap.
+  /// Values retain their input order and resources; downstream callbacks still
+  /// run in the consuming task.
   ///
-  /// The limit includes queued values and an in-flight pull, but excludes the
-  /// value currently delivered downstream. This operation therefore holds at
-  /// most `capacity + 1` elements, apart from leases retained by later operators.
-  /// A full buffer pauses pulling until a queued value is delivered.
+  /// ```dart
+  /// final work = Flow.fromIterable([1, 2, 3])
+  ///     .mapTask((value) => Task.sync(() => value * 10))
+  ///     .buffer(2)
+  ///     .forEach((value) => Task.sync(() => print(value)));
+  /// // Running work prints 10, 20, 30. Mapping can advance ahead of printing.
+  /// ```
   ///
-  /// Buffered values are delivered before an upstream failure or normal end.
-  /// Early termination cancels the producer and waits for its cleanup. Consumer
-  /// cancellation discards business failures and explicit cancellation produced
-  /// by unfinished source work; defects and resource cleanup failures are still
-  /// retained. [capacity] must be positive; invalid values become [RangeError]
-  /// defects before upstream opens.
+  /// The limit counts queued values and a pending read, excluding the value being
+  /// consumed: up to `capacity + 1` elements may be held, plus values retained by
+  /// later operators. A full buffer stops further reads. [capacity] must be
+  /// positive or consumption fails with a [RangeError] defect before source work.
+  ///
+  /// Buffered values precede the source's completion or failure. Stopping early
+  /// cancels pending production and waits for cleanup. After consumer cancellation,
+  /// new business failures or cancellation from unfinished source work are ignored;
+  /// defects and resource cleanup failures still propagate.
   Flow<T, E> buffer(int capacity) => Flow._(
     Task.defer(() {
       if (capacity < 1) throw RangeError.range(capacity, 1, null, 'capacity');
@@ -327,11 +358,11 @@ extension FlowOperations<T, E> on Flow<T, E> {
     }),
   );
 
-  /// Emits at most [count] elements, then closes the upstream producer.
+  /// Emits at most [count] elements and then stops the source.
   ///
-  /// Zero does not open the upstream flow. Negative counts become [RangeError]
-  /// defects when consumed. The last element's resources remain available to
-  /// its consuming callback before cleanup starts.
+  /// Zero leaves the source unopened. A negative count becomes a [RangeError]
+  /// defect on consumption. The final element's resources remain available until
+  /// its downstream consumption finishes.
   Flow<T, E> take(int count) => Flow._(
     Task.defer(() {
       _checkCount(count);
@@ -419,12 +450,11 @@ extension FlowOperations<T, E> on Flow<T, E> {
         });
       });
 
-  /// Starts [next] after this producer reaches its end.
+  /// Emits this flow followed by [next].
   ///
-  /// Cleanup normally finishes before [next] starts. Downstream concurrent
-  /// mapping can keep earlier values in use; their producer stays alive until
-  /// those values finish consumption. Failures stop further production, even
-  /// when a delayed cleanup fails after [next] has already started.
+  /// [next] starts only after normal completion. Cleanup finishes first unless
+  /// values still in use downstream keep earlier resources alive. A failure,
+  /// including delayed cleanup failure, stops the combined flow.
   Flow<T, E> concat(Flow<T, E> next) => Flow._(
     accessTaskEnvironment(
       (owner, _) => _open.map((source) {
@@ -450,9 +480,11 @@ extension FlowOperations<T, E> on Flow<T, E> {
     ),
   );
 
-  /// Maps business errors from opening or pulling this flow.
+  /// Transforms business failures without changing the emitted values.
   ///
-  /// Defects, cancellation, and cleanup failures follow Task.mapError rules.
+  /// Maps errors from opening and reading the source according to
+  /// [TaskOperations.mapError]. Defects, cancellation, and cleanup failures are
+  /// not transformed.
   Flow<T, F> mapError<F>(F Function(E error) transform) => Flow._(
     _open
         .mapError(transform)
@@ -466,17 +498,16 @@ extension FlowOperations<T, E> on Flow<T, E> {
         ),
   );
 
-  /// Replaces one single business failure with the flow returned by [recover].
+  /// Continues with a replacement flow after one business failure.
   ///
-  /// The failed producer is retired before recovery is considered. Resources
-  /// still used by elements retained downstream remain alive until those
-  /// elements are released. Their later cleanup failures propagate to consumption
-  /// and cannot be handled by this recovery. Other cleanup finishes before the
-  /// replacement starts; a cleanup defect then prevents recovery.
+  /// Calls [recover] only for a single [CauseFailure]. Defects, cancellation,
+  /// grouped causes, and failures from the replacement flow propagate unchanged.
+  /// Values already delivered are not repeated or undone.
   ///
-  /// Defects, cancellation, and grouped causes bypass recovery. Errors from the
-  /// replacement flow are not recovered again. Already delivered elements remain
-  /// delivered.
+  /// The failed source's cleanup finishes before recovery, except for resources
+  /// still used downstream. Immediate cleanup failure prevents recovery. Cleanup
+  /// of retained values may fail later; those failures propagate to the consumer
+  /// and cannot be recovered here.
   Flow<T, E> recover(Flow<T, E> Function(E error) recover) => Flow._(
     accessTaskEnvironment(
       (owner, _) => _open.map((opened) {
@@ -516,9 +547,10 @@ extension FlowOperations<T, E> on Flow<T, E> {
     ),
   );
 
-  /// Collects all elements into an immutable list after producer cleanup.
+  /// Collects all elements into an immutable list.
   ///
-  /// This retains every element; use a finite flow or limit it with [take].
+  /// Returns after source cleanup. Use a finite flow or [take] to bound memory;
+  /// resources associated with the values do not remain open in the returned list.
   Task<List<T>, E> toList() => Task.defer(() {
     final values = <T>[];
     return forEach((value) => Task.sync(() => values.add(value)))
@@ -527,9 +559,8 @@ extension FlowOperations<T, E> on Flow<T, E> {
 
   /// Reduces elements in order, returning [initial] for an empty flow.
   ///
-  /// Each execution starts with [initial]; mutable objects are not cloned.
-  /// Exceptions from [combine] become defects. Producer cleanup completes before
-  /// the result is returned.
+  /// Each execution reuses [initial] without copying mutable objects. Exceptions
+  /// from [combine] become defects. The result is returned after source cleanup.
   Task<S, E> fold<S>(S initial, S Function(S state, T value) combine) =>
       Task.defer(() {
         var state = initial;
@@ -540,11 +571,12 @@ extension FlowOperations<T, E> on Flow<T, E> {
         ).map((_) => state);
       });
 
-  /// Runs [action] sequentially for each element, waiting before requesting more.
+  /// Runs [action] for each element, waiting before requesting the next.
   ///
-  /// Failure or cancellation stops production and waits for cleanup. Resources
-  /// acquired by [action] belong to the current producer, following [mapTask]'s
-  /// lifetime rules. Use Task.scoped for resources needed only during one call.
+  /// Failure or cancellation stops consumption and waits for cleanup. Resources
+  /// acquired by [action] belong to the input element's scope and may outlive that
+  /// call. Use [TaskOperations.scoped] on the returned task to close them after
+  /// each call.
   Task<void, E> forEach(Task<void, E> Function(T value) action) =>
       _open.flatMap((source) {
         Task<void, E> next() => Task.defer(
@@ -564,26 +596,25 @@ extension FlowOperations<T, E> on Flow<T, E> {
   /// Consumes all elements for their effects and waits for producer cleanup.
   Task<void, E> drain() => forEach((_) => Task.succeed(null));
 
-  /// Exposes one consumption as a lazy, single-subscription Dart stream.
+  /// Exposes this flow as a lazy, single-subscription Dart stream.
   ///
-  /// Listening starts a root task in [runtime]. Pausing the subscription stops
-  /// further pulls; cancelling requests task cancellation and waits for producer
-  /// cleanup. Its cancellation future fails with [TaskException] if cleanup or
-  /// other completed work failed, excluding the subscription's own cancellation
-  /// request. This includes failures awaiting delivery to a paused subscriber;
-  /// errors already delivered to the subscriber are not repeated. A closed
-  /// runtime rejects consumption with a [RuntimeClosed] defect.
+  /// Listening starts consumption in [runtime]; pausing stops further requests.
+  /// Use `await for` for asynchronous processing with backpressure, since
+  /// [Stream.listen] does not await an asynchronous `onData` callback.
   ///
-  /// Uncancelled consumption failures, including runtime shutdown, are delivered
-  /// as one [TaskException] error retaining the complete cause, followed by done.
-  /// A paused subscription receives those events when it resumes. It does not
-  /// delay runtime cleanup. As with other Dart streams, an asynchronous `onData`
-  /// callback is not awaited; use `await for` to process elements asynchronously
-  /// with backpressure.
+  /// Consumption failure produces one [TaskException] containing the complete
+  /// cause, followed by done. A closed runtime instead reports [RuntimeClosed]
+  /// as a defect. A paused listener receives terminal events on resume without
+  /// delaying resource cleanup.
+  ///
+  /// Cancelling the subscription waits for producer cleanup. Its future fails with
+  /// [TaskException] for cleanup failures or other completed failures not yet
+  /// delivered, including those waiting behind a pause. The cancellation request
+  /// itself and errors already sent to the listener are not reported again.
   Stream<T> toStream(Runtime runtime) => _streamFromFlow(this, runtime);
 }
 
-/// Handles data delivered beyond a native stream bridge's buffer capacity.
+/// The overflow policy for [Flow.fromStream]'s adapter buffer.
 enum StreamOverflowStrategy {
   /// Fails with a [StreamBufferOverflow] defect after previously buffered data.
   fail,
@@ -595,7 +626,10 @@ enum StreamOverflowStrategy {
   sliding,
 }
 
-/// Indicates that a native source exceeded the bridge's data buffer capacity.
+/// A defect indicating that [Flow.fromStream]'s adapter buffer overflowed.
+///
+/// Emitted when the bridge uses [StreamOverflowStrategy.fail]. The [capacity]
+/// counts buffered data values, not terminal events.
 final class StreamBufferOverflow implements Exception {
   /// Creates a diagnostic for the exceeded [capacity].
   const StreamBufferOverflow(this.capacity);
@@ -608,7 +642,7 @@ final class StreamBufferOverflow implements Exception {
       'StreamBufferOverflow: The data buffer exceeded capacity $capacity.';
 }
 
-/// Establishes a business error type for a flow with no business failures.
+/// Error-type widening for flows without business failures.
 extension InfallibleFlowOperations<T> on Flow<T, Never> {
   /// Gives this flow error type [F] without changing its identity or behavior.
   Flow<T, F> withError<F>() => this;

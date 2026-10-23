@@ -5,7 +5,7 @@ import 'exit.dart';
 import 'option.dart';
 import 'task.dart';
 
-/// Determines how a bounded [AsyncQueue] handles a full buffer.
+/// The policy used when a bounded [AsyncQueue] has no free space.
 enum QueueOverflowStrategy {
   /// Waits for space, serving pending offers in arrival order.
   backPressure,
@@ -17,15 +17,38 @@ enum QueueOverflowStrategy {
   sliding,
 }
 
-/// A FIFO queue owned by the scope in which it is created.
+/// A scoped queue that delivers each value to one waiting consumer.
 ///
-/// [end] rejects new offers and lets consumers drain accepted values. [close]
-/// discards the buffer and fails pending operations. The creating scope closes
-/// the queue automatically; returning it from a completed runtime execution
-/// does not extend its lifetime.
+/// Use a queue to distribute work among competing consumers. Values and waiting
+/// operations are served in arrival order. For nullable [T], [OptionSome] can
+/// contain `null`; [OptionNone] means normal completion.
 ///
-/// Values may be nullable. [take] distinguishes a present `null` from normal
-/// completion through [Option].
+/// ```dart
+/// import 'package:any/any.dart';
+///
+/// Future<void> main() async {
+///   final runtime = Runtime();
+///   try {
+///     final work = AsyncQueue.bounded<int>(2)
+///         .withError<QueueClosed>()
+///         .flatMap((queue) {
+///           return queue
+///               .offer(42)
+///               .flatMap((_) => queue.end())
+///               .flatMap((_) => queue.take())
+///               .map((value) => value.getOrElse(() => 0));
+///         });
+///     print(await runtime.runOrThrow(work)); // 42
+///   } finally {
+///     await runtime.close();
+///   }
+/// }
+/// ```
+///
+/// [end] lets consumers drain accepted values; [close] discards them and fails
+/// unfinished operations. The creating scope closes the queue automatically,
+/// so use it within that scope rather than returning it from a completed
+/// runtime execution.
 final class AsyncQueue<T> {
   AsyncQueue._(this._capacity, this._overflow);
 
@@ -39,19 +62,20 @@ final class AsyncQueue<T> {
   var _closed = false;
   var _draining = false;
 
-  /// Creates an independently scoped queue with at most [capacity] values.
+  /// Creates a queue that buffers at most [capacity] values.
   ///
-  /// [capacity] must be positive; an invalid value becomes a [RangeError] defect
-  /// when the task executes. The default [overflow] waits for available space.
+  /// The default [overflow] waits for space; other policies drop the new or oldest
+  /// value. [capacity] must be positive or execution fails with a [RangeError]
+  /// defect. Each execution creates a queue owned by its current scope.
   static Task<AsyncQueue<T>, Never> bounded<T>(
     int capacity, {
     QueueOverflowStrategy overflow = QueueOverflowStrategy.backPressure,
   }) => _create(capacity, overflow);
 
-  /// Creates an independently scoped queue without a buffer limit.
+  /// Creates a scoped queue whose offers never wait for buffer space.
   ///
-  /// Offers never wait for space. The caller must bound production when
-  /// consumers may be slower, or use [bounded] for backpressure.
+  /// Buffered values can grow without limit when consumers fall behind. Prefer
+  /// [bounded] when production must slow to match consumption.
   static Task<AsyncQueue<T>, Never> unbounded<T>() =>
       _create(null, QueueOverflowStrategy.backPressure);
 
@@ -68,14 +92,14 @@ final class AsyncQueue<T> {
     release: (queue, _) => queue.close(),
   );
 
-  /// Offers [value] when executed, returning whether the queue accepted it.
+  /// Adds [value], returning whether it was accepted.
   ///
-  /// Only the dropping strategy returns `false`. Backpressure waits in FIFO
-  /// order; cancelling a pending offer removes only that offer. Once accepted,
-  /// the value remains queued even if the producer is cancelled before seeing
-  /// the result. Sliding may subsequently discard it as the oldest value.
-  ///
+  /// [QueueOverflowStrategy.dropping] returns `false` when full. Backpressure waits
+  /// for space in arrival order; sliding accepts the value and removes the oldest.
   /// An ended or closed queue fails with [QueueClosed].
+  ///
+  /// Cancellation removes a waiting offer. Once accepted, a value is not retracted
+  /// even if cancellation prevents the caller from observing success.
   Task<bool, QueueClosed> offer(T value) => Task.fromCallback((complete) {
     final request = _OfferRequest(value, complete);
     _offers.addLast(request);
@@ -88,16 +112,16 @@ final class AsyncQueue<T> {
     };
   });
 
-  /// Takes the oldest value, waiting when an open queue is empty.
+  /// Removes the oldest value, waiting if the queue is open and empty.
   ///
-  /// Returns [OptionNone] after [end] and all accepted values have been taken.
-  /// [close] instead fails pending and subsequent takes with [QueueClosed].
-  /// Waiting consumers are served in FIFO order. A wake-up reserves a turn,
-  /// and the value stays buffered until this task confirms the take. Cancelling
-  /// before confirmation leaves the value available to another consumer.
-  /// After confirmation, consumption is committed even if cancellation prevents
-  /// the caller's next task from running. Sliding may discard buffered values
-  /// before confirmation, following its usual overflow policy.
+  /// Waiting consumers are served in arrival order. After [end], returns
+  /// [OptionNone] once accepted values drain; after [close], fails with
+  /// [QueueClosed].
+  ///
+  /// Cancelling a waiting take leaves the value available. Once a value has been
+  /// removed, cancellation cannot put it back, even if the caller's next task never
+  /// runs. With [QueueOverflowStrategy.sliding], a buffered value can be replaced
+  /// until it is removed.
   Task<Option<T>, QueueClosed> take() =>
       Task.uninterruptibleMask<Option<T>, QueueClosed>((restore) {
         final request = _TakeRequest();
@@ -116,20 +140,19 @@ final class AsyncQueue<T> {
             .flatMap((_) => _confirmTake(request));
       }).scoped();
 
-  /// Stops accepting offers while preserving buffered values for consumers.
+  /// Stops new offers while allowing accepted values to drain.
   ///
-  /// Pending offers that have not been accepted fail with [QueueClosed]. Takes
-  /// return [OptionNone] once the buffer drains. Repeated calls have no effect.
+  /// Pending offers fail with [QueueClosed]. Takes return [OptionNone] after the
+  /// buffer empties. Repeated calls have no effect; use [close] to discard values.
   Task<void, Never> end() => Task.sync(() {
     _ended = true;
     _drain();
   });
 
-  /// Discards buffered values and fails all unfinished queue operations.
+  /// Discards buffered values and stops all queue operations.
   ///
-  /// Takes that have not confirmed consumption fail with [QueueClosed], even
-  /// if they were already woken. Repeated calls have no effect. This is also
-  /// performed automatically when the queue's owning scope closes.
+  /// Unfinished and subsequent offers and takes fail with [QueueClosed]. Repeated
+  /// calls have no effect. The owning scope also calls this automatically.
   Task<void, Never> close() => Task.sync(() {
     if (_closed) return;
     _closed = true;
@@ -218,7 +241,10 @@ final class AsyncQueue<T> {
   }
 }
 
-/// An operation rejected because its queue has ended or closed.
+/// A business failure for an operation on an ended or closed queue.
+///
+/// [AsyncQueue.end] rejects offers but lets takes drain normally.
+/// [AsyncQueue.close] rejects both.
 final class QueueClosed implements Exception {
   /// Creates a queue lifecycle error.
   const QueueClosed();

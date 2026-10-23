@@ -14,22 +14,46 @@ import 'random_source.dart';
 import 'task.dart';
 import 'tracer.dart';
 
-/// Owns root task executions and waits for them when closing.
+/// The application boundary for running tasks and owning their services.
 ///
-/// Each [run] executes its task independently. Keep the runtime open while its
-/// tasks are in use, and inspect the result of [close] at the host boundary.
+/// Use [run] to obtain an [Exit], [runOrThrow] to integrate with exception-based
+/// code, or [start] to keep a [Fiber] handle. Each call starts an independent
+/// execution. [close] stops owned work and releases application resources.
+///
+/// ```dart
+/// final runtime = Runtime();
+/// try {
+///   final result = await runtime.run(Task.sync(() => 6 * 7));
+///   switch (result) {
+///     case ExitSuccess(:final value):
+///       print(value); // 42
+///     case ExitFailure(:final cause):
+///       print('Execution failed: $cause');
+///   }
+/// } finally {
+///   final closed = await runtime.close();
+///   if (closed case ExitFailure(:final cause)) {
+///     print('Cleanup failed: $cause');
+///   }
+/// }
+/// ```
+///
+/// Use [create] with a [Layer] when the runtime should also acquire and release
+/// application services. Inspect the closing result at the host boundary: cleanup
+/// can fail independently of the tasks that used those services.
 final class Runtime {
-  /// Creates a runtime with an optional unobserved-failure reporter.
+  /// Creates a runtime with application services and failure reporting.
   ///
-  /// [context] supplies application services and overrides the default [Clock],
-  /// [RandomSource], no-op [Logger], no-op [Tracer], and no-op [MetricRegistry]
-  /// bindings when their keys are present. Other defaults remain available.
-  /// Supplied objects retain their caller-managed lifetime.
+  /// [context] overrides matching default bindings for [Clock], [RandomSource],
+  /// [Logger], [Tracer], and [MetricRegistry]. Unspecified defaults remain available;
+  /// logging, tracing, and metrics default to no-ops. Supplied service objects keep
+  /// their caller-managed lifetime.
   ///
-  /// A failed fiber is reported once on the next event-loop turn if its result
-  /// has not been observed. The default forwards a [TaskException] to the Zone
-  /// that creates this runtime. Exceptions thrown by [onUnhandledError] are
-  /// forwarded to that same Zone; they cannot interrupt task cleanup.
+  /// [onUnhandledError] receives business failures and defects that remain
+  /// unobserved on the next event-loop turn. Each failure is reported once;
+  /// cancellation alone is not reported. Without a handler, a [TaskException]
+  /// is reported to the creating [Zone]. Exceptions thrown by the handler are
+  /// also reported to that zone and cannot interrupt cleanup.
   Runtime({
     Context? context,
     void Function(Cause<Object?> cause)? onUnhandledError,
@@ -62,16 +86,16 @@ final class Runtime {
   late final void Function(Cause<Object?>) _report;
   Future<Exit<void, Never>>? _closing;
 
-  /// Builds application [services] and returns a runtime that owns them.
+  /// Creates a runtime that acquires and owns application [services].
   ///
-  /// Construction uses [context] and the default services as its inputs. The
-  /// resulting bindings override matching inputs for subsequent executions.
-  /// Acquired resources remain alive until [close], after all owned tasks stop.
-  /// Existing objects supplied through [context] keep their external ownership.
+  /// The layer uses [context] and the default services as inputs. Its output
+  /// bindings override matching inputs for subsequent executions. Acquired
+  /// resources live until [close], which stops tasks before releasing services.
+  /// Objects supplied directly through [context] remain externally owned.
   ///
-  /// A construction failure or startup cancellation releases acquired services
-  /// before returning its complete cause, including cleanup defects. [signal]
-  /// affects startup only; use [close] to stop a successfully created runtime.
+  /// Failure or startup cancellation returns an [ExitFailure] after releasing any
+  /// acquired resources, preserving cleanup failures in its cause. [signal]
+  /// affects startup only; close the returned runtime to stop it after startup.
   static Future<Exit<Runtime, E>> create<E>(
     Layer<E> services, {
     Context? context,
@@ -110,12 +134,14 @@ final class Runtime {
     });
   }
 
-  /// Starts an independent root fiber owned by this runtime.
+  /// Starts [task] and returns a handle to its independent execution.
   ///
-  /// [signal] affects only this execution. The fiber completes after its child
-  /// tasks and resource cleanup. A closing runtime returns a completed fiber
-  /// containing a [RuntimeClosed] defect, without starting business work.
-  /// Observe the result through the fiber, or let the runtime report failures.
+  /// [signal] can cancel this execution without affecting other roots. The fiber
+  /// completes after its child work and resource cleanup. Observe its result with
+  /// [Fiber.join], [Fiber.awaitExit], or [Fiber.poll] to handle failures directly.
+  ///
+  /// A closing or closed runtime returns a completed fiber with a [RuntimeClosed]
+  /// defect; the task does not start.
   Fiber<T, E> start<T, E>(Task<T, E> task, {CancellationSignal? signal}) {
     if (_closing != null) {
       return completedFiber(
@@ -134,19 +160,22 @@ final class Runtime {
     );
   }
 
-  /// Runs [task] and returns its complete exit after resource cleanup.
+  /// Runs [task] and returns its value or complete failure as an [Exit].
   ///
-  /// [signal] requests cancellation of this execution only. An already
-  /// cancelled signal prevents business work from starting. Cancellation waits
-  /// for any in-flight, non-cancellable Future before completing the exit.
-  /// This host boundary observes the fiber's result, including failures.
+  /// The result includes child completion and resource cleanup, and counts as an
+  /// observed fiber result for failure reporting.
+  ///
+  /// [signal] cancels only this execution. An already cancelled signal prevents
+  /// the task from starting. Cancellation waits for any in-flight,
+  /// non-cancellable [Future] to settle before returning.
   Future<Exit<T, E>> run<T, E>(Task<T, E> task, {CancellationSignal? signal}) =>
       fiberCompletion(start(task, signal: signal));
 
-  /// Runs [task], throwing [TaskException] if its exit is a failure.
+  /// Runs [task] and returns its value, throwing [TaskException] on failure.
   ///
-  /// The exception retains the complete cause, including original defect stack
-  /// traces. Prefer [run] inside integrations that can handle an [Exit] directly.
+  /// The exception retains the complete [Cause], including original defect stack
+  /// traces. Execution, cancellation, and cleanup follow [run]. Prefer [run] when
+  /// the caller can handle an [Exit] directly.
   Future<T> runOrThrow<T, E>(
     Task<T, E> task, {
     CancellationSignal? signal,
@@ -155,17 +184,20 @@ final class Runtime {
     ExitFailure(:final cause) => throw TaskException(cause),
   };
 
-  /// Stops accepting work, requests cancellation, and waits for all root runs.
+  /// Stops this runtime and returns the outcome of shutting it down.
   ///
-  /// Repeated calls share the same closing result. Closing does not turn root
-  /// business failures into closing failures; each caller receives its own
-  /// execution's [Exit]. Defects encountered while stopping active roots are
-  /// included in the closing result, including resource cleanup failures.
-  /// Non-cancellable Futures must settle before closing can finish.
+  /// New work is rejected. Active roots are cancelled and fully cleaned up before
+  /// application services are released. Repeated calls share the same result.
+  /// Non-cancellable [Future]s must settle before shutdown can finish.
   ///
-  /// A task or finalizer whose completion this runtime must await cannot close
-  /// it, including a task holding a scoped resource lease from another runtime.
-  /// Such a call returns a [StateError] defect instead of starting a deadlock.
+  /// Root business failures remain in their executions' exits. Defects encountered
+  /// while stopping active roots, including cleanup failures, are also included in
+  /// the closing result.
+  ///
+  /// Call this from the host that owns the runtime. A task or finalizer whose
+  /// completion the runtime must await cannot close it: the call returns a
+  /// [StateError] defect. This includes tasks holding resource leases that the
+  /// runtime must wait to release, even when those tasks run in another runtime.
   Future<Exit<void, Never>> close() {
     if (currentFibers().any(
           (fiber) => fiberIsActive(fiber) && scopeWaitsForFiber(_scope, fiber),
@@ -205,7 +237,7 @@ final class Runtime {
   }
 }
 
-/// Indicates that an execution was rejected by a closing or closed [Runtime].
+/// An execution rejected because its [Runtime] is closing or closed.
 final class RuntimeClosed implements Exception {
   /// Creates a closed-runtime diagnostic.
   const RuntimeClosed();
@@ -214,7 +246,10 @@ final class RuntimeClosed implements Exception {
   String toString() => 'RuntimeClosed: The runtime no longer accepts tasks.';
 }
 
-/// Bridges a complete task failure into a host API that expects exceptions.
+/// A task's complete failure represented as a Dart exception.
+///
+/// [Runtime.runOrThrow] throws this exception when a task fails. Inspect [cause]
+/// for business errors, defects with their original stack traces, or cancellation.
 final class TaskException implements Exception {
   /// Creates an exception retaining the complete [cause].
   const TaskException(this.cause);

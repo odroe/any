@@ -15,17 +15,37 @@ enum CircuitBreakerState {
   halfOpen,
 }
 
-/// Stops admitting work after repeated failures in the same isolate.
+/// A circuit breaker that rejects work while a failing dependency recovers.
 ///
-/// The breaker starts closed. Reaching the consecutive failure threshold opens
-/// it. After the reset timeout, the next admission starts a half-open period
-/// with limited probes. The first successful probe closes the breaker; a counted
-/// failure opens it again. Results from a previous state generation do not
-/// change the current state or invoke its failure policy.
+/// Protect calls with [CircuitBreakerOperations.protect]. Consecutive failures
+/// open the breaker. After the reset timeout, a limited number of calls may
+/// probe the dependency: the first success closes the breaker, while a counted
+/// failure reopens it. Results from an earlier open/closed period do not change
+/// the current state.
 ///
-/// The clock is captured at creation. There are no background timers or owned
-/// resources, so the breaker does not need to be closed. Protected work is never
-/// retried automatically.
+/// Share one instance among calls to the same dependency. It uses the clock
+/// captured at creation, needs no close operation, and never retries work
+/// automatically.
+///
+/// ```dart
+/// final program =
+///     CircuitBreaker.create(
+///       failureThreshold: 3,
+///       resetTimeout: const Duration(seconds: 30),
+///     ).withError<String>().flatMap(
+///       (breaker) => breaker.protect(
+///         Task.fail<String>('Service unavailable'),
+///         onOpen: () => 'Circuit open',
+///       ),
+///     );
+/// final runtime = Runtime();
+/// try {
+///   final exit = await runtime.run(program);
+///   assert(exit is ExitFailure<String, String>);
+/// } finally {
+///   await runtime.close();
+/// }
+/// ```
 final class CircuitBreaker {
   CircuitBreaker._(
     this._clock,
@@ -86,14 +106,15 @@ final class CircuitBreaker {
     );
   });
 
-  /// Returns the current state without reading the clock or admitting a probe.
+  /// The current admission state and failure counts.
   ///
-  /// `retryAt` is the captured clock's monotonic elapsed deadline, not wall time.
-  /// It is non-null only while open. An expired deadline remains in this
-  /// snapshot until an admission starts the half-open period.
-  /// `consecutiveFailures` is retained across neutral outcomes and while open
-  /// or half-open, and resets when a successful current-generation task closes
-  /// the breaker. `activeProbes` counts only the current half-open generation.
+  /// `retryAt` is a deadline on the captured clock's [Clock.elapsed], present
+  /// only while open. Reading this snapshot does not advance the state; the next
+  /// admission after the deadline starts probing.
+  ///
+  /// `consecutiveFailures` survives neutral outcomes and open/half-open periods,
+  /// and resets on a success in the current period. `activeProbes` counts only
+  /// probes in the current half-open period.
   ({
     CircuitBreakerState state,
     int consecutiveFailures,
@@ -184,19 +205,18 @@ extension CircuitBreakerOperations on CircuitBreaker {
   /// [onOpen] runs only when the breaker is open or all probe slots are in use.
   /// Its exception becomes a defect; rejected tasks do not affect the state.
   ///
-  /// Admitted work runs in an owned child fiber, inheriting the caller's
-  /// services, task-local values, and cancellation state. Results are recorded
-  /// from its final exit after work and resource cleanup finish. A successful
-  /// task clears consecutive failures. Business failures count unless
-  /// [isFailure] returns false, and defects always count. A group counts once if
-  /// any reason counts. Cancellation and ignored business failures are neutral;
-  /// they neither reset the count nor close a half-open breaker. Cancellation
-  /// accompanied by a cleanup defect still counts as a failure.
+  /// Admitted work inherits the caller's context and cancellation state. Its
+  /// resources are released before the outcome is counted:
   ///
-  /// [isFailure] is called in cause order for each business error in a current
-  /// generation. If it throws, that execution counts as one failure and its
-  /// defect is appended to the original cause. Old-generation results retain
-  /// their task outcome but do not invoke [isFailure] or update the breaker.
+  /// * Success clears consecutive failures and closes a half-open breaker.
+  /// * Business errors count unless [isFailure] returns false; defects always
+  ///   count. A group counts once if any of its reasons counts.
+  /// * Cancellation and ignored errors are neutral. They do not reset failures
+  ///   or close the breaker. A cleanup defect still counts after cancellation.
+  ///
+  /// [isFailure] is called in cause order. If it throws, the execution counts as
+  /// a failure and the defect is appended to the original cause. Results from
+  /// earlier open/closed periods neither invoke the policy nor update state.
   /// Cancelling a probe releases its slot without reporting success.
   Task<T, E> protect<T, E>(
     Task<T, E> task, {

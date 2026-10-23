@@ -1,8 +1,14 @@
 /// A value whose string representation hides its contents.
 ///
-/// Use [reveal] to explicitly access the original value. This wrapper does not
-/// encrypt or erase the value, and it does not prevent callers from exposing
-/// the value after revealing it.
+/// Use this wrapper to keep secrets out of string interpolation and diagnostics.
+/// Access the original value explicitly with [reveal]. It is still stored in
+/// memory unchanged; the wrapper provides no encryption or secure erasure.
+///
+/// ```dart
+/// const token = Redacted('example-token');
+/// assert('$token' == 'Redacted(<redacted>)');
+/// assert(token.reveal() == 'example-token');
+/// ```
 final class Redacted<T> {
   /// Wraps [value] without copying or modifying it.
   const Redacted(T value) : _value = value;

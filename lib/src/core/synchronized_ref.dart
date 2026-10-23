@@ -1,44 +1,45 @@
 import 'semaphore.dart';
 import 'task.dart';
 
-/// A mutable value whose writes run one at a time within an isolate.
+/// A mutable value whose updates run one at a time within an isolate.
 ///
-/// All writes share one FIFO semaphore. [get] reads the latest committed value
-/// without waiting for an in-progress write. Values are retained by reference;
-/// mutations to their fields and external side effects are not rolled back.
+/// Use [SynchronizedRefOperations.modifyTask] when computing the next value
+/// requires asynchronous work. Writes wait in arrival order, while [get] always
+/// reads the latest committed value without waiting for a write. Prefer `Ref`
+/// when every update is synchronous.
 ///
-/// Writes are not reentrant. A modification that waits for another write to
-/// this same ref can deadlock. Reading this ref during a modification is safe.
+/// A modification must not wait for another write to this ref: that write
+/// cannot start until the modification finishes. Reading the ref is safe.
+/// Values are stored by reference; mutations to their fields and other side
+/// effects are not rolled back if an update fails.
 final class SynchronizedRef<T> {
   SynchronizedRef._(this._value, this._semaphore);
 
   T _value;
   final Semaphore _semaphore;
 
-  /// Creates an independent ref containing [initial] on each execution.
+  /// Creates a ref containing [initial].
   ///
-  /// The initial value is retained unchanged. Refs created from the same
-  /// mutable object share that object until a different value is stored.
+  /// Each execution creates a separate ref. The initial value is not copied, so
+  /// refs created from the same mutable object initially share that object.
   static Task<SynchronizedRef<T>, Never> create<T>(T initial) =>
       Semaphore.create(1)
           .map((semaphore) => SynchronizedRef._(initial, semaphore));
 
-  /// Reads the latest committed value when the returned task executes.
+  /// Reads the latest committed value without waiting for pending writes.
   ///
-  /// This does not wait for a pending modification or its cleanup. Until that
-  /// modification commits, reads continue to return the previous value.
+  /// Until an update and its cleanup succeed, reads return the previous value.
   Task<T, Never> get() => Task.sync(() => _value);
 }
 
-/// Writes using a synchronized ref's statically known value type.
+/// Serializes writes and commits successful replacements.
 ///
-/// A ref retains its original runtime type when viewed through a wider type.
-/// Storing an incompatible value produces a [TypeError] defect when executed,
-/// leaves the previous value in place, and releases the write permit.
+/// A wider static type does not change the ref's runtime value type. Storing an
+/// incompatible value fails with a [TypeError] defect and keeps the old value.
 extension SynchronizedRefOperations<T> on SynchronizedRef<T> {
   /// Waits for preceding writes, then stores [value].
   ///
-  /// Cancellation while waiting removes only this write from the queue.
+  /// Cancellation while waiting removes only this write.
   Task<void, Never> set(T value) => _semaphore.withPermits(
     1,
     Task.sync(() {
@@ -46,11 +47,11 @@ extension SynchronizedRefOperations<T> on SynchronizedRef<T> {
     }),
   );
 
-  /// Waits for preceding writes, then synchronously replaces the current value.
+  /// Waits for preceding writes, then replaces the value using [transform].
   ///
-  /// [transform] runs once after obtaining the write permit. A thrown exception
-  /// becomes a defect without replacing the value. The synchronous callback and
-  /// commit cannot be interrupted; cancellation cannot undo a completed commit.
+  /// The callback runs once, synchronously. A thrown exception becomes a defect
+  /// without replacing the value. Cancellation cannot interrupt the callback or
+  /// undo a completed commit.
   Task<void, Never> update(T Function(T value) transform) =>
       _semaphore.withPermits(
         1,
@@ -59,12 +60,11 @@ extension SynchronizedRefOperations<T> on SynchronizedRef<T> {
         }),
       );
 
-  /// Synchronously changes the value and returns a separate result.
+  /// Changes the value and returns a result after preceding writes finish.
   ///
-  /// [change] runs once after preceding writes and returns `(result, newValue)`.
-  /// The new value is committed before this task succeeds with `result`.
-  /// Exceptions leave the value unchanged. Like [update], the callback and
-  /// commit form one synchronous operation that cancellation cannot undo.
+  /// [change] runs synchronously and returns `(result, newValue)`. The value is
+  /// stored before this task succeeds with `result`. Exceptions become defects
+  /// without replacing the value; cancellation cannot undo a completed commit.
   Task<R, Never> modify<R>((R result, T value) Function(T value) change) =>
       _semaphore.withPermits(
         1,
@@ -75,20 +75,19 @@ extension SynchronizedRefOperations<T> on SynchronizedRef<T> {
         }),
       );
 
-  /// Computes a replacement asynchronously while excluding other writes.
+  /// Computes and commits a replacement while excluding other writes.
   ///
-  /// [change] receives the latest value after obtaining the write permit. Its
-  /// task returns `(result, newValue)` and runs in a local scope. Only success
-  /// after that scope's cleanup commits the new value and returns `result`.
-  /// Business failure, defects, cleanup failure, or enabled cancellation before
-  /// the commit leave the stored value unchanged. Thrown callback exceptions
-  /// become defects. External side effects and mutations to the old value's
-  /// fields are not undone.
+  /// [change] receives the latest value and returns a task producing
+  /// `(result, newValue)`. The task runs in a local scope. Only success after its
+  /// cleanup stores the new value and returns `result`.
   ///
-  /// Cancellation respects the enclosing task's cancellation state. An
-  /// in-flight non-cancellable Future and all cleanup must finish before the
-  /// write permit is released. Cancellation received after a commit cannot undo
-  /// it. Waiting for another write to this ref from [change] is not reentrant.
+  /// Failure or cancellation before the commit keeps the previous value. Thrown
+  /// callback exceptions become defects. Mutations to the old value's fields and
+  /// other side effects are not undone.
+  ///
+  /// Cancellation follows the caller's cancellation state. In-flight
+  /// non-cancellable futures and cleanup must finish before another write can
+  /// start. Cancellation received after a commit cannot undo it.
   Task<R, E> modifyTask<R, E>(
     Task<(R result, T value), E> Function(T value) change,
   ) => _semaphore.withPermits(

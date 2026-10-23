@@ -6,6 +6,8 @@ import 'context.dart';
 ///
 /// Use [now] for timestamps and [elapsed] for deadlines and durations. Wall time
 /// can change when the system clock is adjusted; monotonic time does not.
+/// Supply an implementation through [key] to control time in an application
+/// or test.
 abstract interface class Clock {
   /// Creates a system clock backed by [DateTime], [Stopwatch], and [Timer].
   ///
@@ -31,10 +33,8 @@ abstract interface class Clock {
   /// That zone also receives any exception thrown by the callback. Asynchronous
   /// work started by the callback is not awaited.
   ///
-  /// The returned function synchronously cancels a callback that has not
-  /// started. Calling it repeatedly or after completion has no effect; it
-  /// cannot stop a callback that is already running. The caller owns the timer
-  /// and must cancel it if it is no longer needed.
+  /// Call the returned function when the timer is no longer needed. Cancellation
+  /// is synchronous and idempotent; it cannot stop a callback already running.
   void Function() schedule(Duration delay, void Function() callback);
 }
 

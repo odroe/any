@@ -62,24 +62,37 @@ final class LogRecord {
   final String? spanId;
 }
 
-/// An ordered, awaitable adapter for a structured logging backend.
+/// A structured logger that writes records to an application-supplied backend.
 ///
-/// Writes and flushes run one at a time in invocation order. Awaiting each write
-/// supplies backpressure; callers that enqueue without awaiting are responsible
-/// for bounding their pending work. This adapter does not own or close the
-/// backend. Acquire and release backend resources through an application layer.
+/// Bind a logger through [key] to receive events from [Task.log]. Writes and
+/// flushes run in invocation order; await them to keep pending work bounded.
+/// The application owns the backend and must flush and close it after use.
 ///
-/// Backend exceptions are reported independently and never fail [write] or
-/// [flush]. An output or flush callback must not await this same logger: the
-/// resulting operation would wait for the callback itself to finish.
+/// Backend exceptions go to the configured error handler and never fail [write]
+/// or [flush]. Backend callbacks must not await this logger, which would wait
+/// for the current callback to finish.
+///
+/// ```dart
+/// final records = <LogRecord>[];
+/// final logger = Logger(records.add);
+/// final runtime = Runtime(context: Context.from([Logger.key.bind(logger)]));
+/// try {
+///   await runtime.runOrThrow(
+///     Task.log('Order accepted').withLogFields({'orderId': 'order-42'}),
+///   );
+///   assert(records.single.fields['orderId'] == 'order-42');
+/// } finally {
+///   await runtime.close();
+///   await logger.flush();
+/// }
+/// ```
 final class Logger {
   /// Creates an adapter that forwards records at or above [minLevel].
   ///
   /// [flush] is optional; without it, flushing still waits for earlier writes.
-  /// Synchronous and asynchronous backend errors are passed to [onError] in the
-  /// creating zone. Without a handler, that zone receives them through
-  /// [Zone.handleUncaughtError]. An exception from [onError] is also reported to
-  /// the creating zone. Error reporting must not log through this same logger.
+  /// Backend errors are passed to [onError] in the creating zone. Without a
+  /// handler, or if the handler throws, that zone's [Zone.handleUncaughtError]
+  /// receives the error. The handler must not log through this logger.
   Logger(
     FutureOr<void> Function(LogRecord record) output, {
     this.minLevel = LogLevel.info,
@@ -98,12 +111,11 @@ final class Logger {
       _zone = Zone.current,
       _noop = true;
 
-  /// Copies [outputs] and forwards each record to them in iterable order.
+  /// Creates a logger that writes to each of [outputs] in order.
   ///
-  /// Each output applies its own level threshold and error reporting. A failed
-  /// output does not prevent later outputs from receiving the record. Flushes
-  /// visit the outputs in the same order and await each one. An empty iterable
-  /// behaves like [Logger.noop].
+  /// The outputs are copied now. Each keeps its own threshold and error handler;
+  /// a backend failure does not skip later outputs. Flushing awaits every output
+  /// in the same order. Empty input creates a no-op logger.
   factory Logger.combine(
     Iterable<Logger> outputs, {
     LogLevel minLevel = LogLevel.trace,
@@ -141,7 +153,7 @@ final class Logger {
   /// Enqueues [record] and waits for its backend operation to finish.
   ///
   /// Records below [minLevel] and records sent to a no-op logger are discarded.
-  /// The returned Future succeeds even when the backend reports an error.
+  /// The returned future succeeds even when the backend reports an error.
   Future<void> write(LogRecord record) {
     if (!_accepts(record.level)) return Future<void>.value();
     return _enqueue(() => _output!(record));
@@ -149,8 +161,8 @@ final class Logger {
 
   /// Waits for earlier writes, then invokes the configured flush callback.
   ///
-  /// Later writes wait for this operation. Backend exceptions are reported with
-  /// the same policy as [write]; the returned Future still succeeds.
+  /// Later writes wait for this operation. The returned future succeeds even
+  /// when the backend reports an error.
   Future<void> flush() => _enqueue(_flush ?? () {});
 
   bool _accepts(LogLevel level) => !_noop && level.index >= minLevel.index;
@@ -177,7 +189,7 @@ final class Logger {
 
 final _fields = TaskLocal<Map<String, Object?>>(const {}, name: 'logFields');
 
-/// Structured logging fields local to a task execution.
+/// Structured logging context for tasks.
 extension TaskLoggingOperations<T, E> on Task<T, E> {
   /// Runs this task with [fields] added to its inherited log fields.
   ///
@@ -185,9 +197,8 @@ extension TaskLoggingOperations<T, E> on Task<T, E> {
   /// inherited fields with the same key, including explicit `null` values.
   /// Fields supplied directly to [Task.log] take precedence over both.
   ///
-  /// Forked tasks inherit the bindings present when they start. Nested overrides
-  /// are restored on exit; a child's overrides do not change its parent's.
-  /// Finalizers retain the fields present when they were registered.
+  /// Fields follow [TaskLocal] inheritance: children inherit them, nested
+  /// overrides stay local, and finalizers retain their registration context.
   Task<T, E> withLogFields(Map<String, Object?> fields) {
     final added = Map<String, Object?>.unmodifiable(fields);
     return _fields.get().withError<E>().flatMap(

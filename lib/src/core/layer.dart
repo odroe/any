@@ -6,36 +6,59 @@ import 'fiber.dart';
 import 'scope.dart';
 import 'task.dart';
 
-/// A reusable description of services and the resources used to build them.
+/// A reusable plan for building services and owning their resources.
 ///
-/// A layer builds a [Context] when supplied to Runtime.create or
-/// [TaskLayerOperations.provide]. Resources acquired during construction belong
-/// to that application or local scope. Constructing a layer runs no tasks.
+/// A layer produces a [Context] when supplied to `Runtime.create` or
+/// [TaskLayerOperations.provide]. Building a layer acquires its services; merely
+/// constructing a layer runs no tasks. Resources live for the receiving runtime
+/// or local computation.
 ///
-/// Within one build, the same layer object is acquired once, including when
-/// requested concurrently. Its first request supplies its input services and
-/// task-local values. Use [LayerOperations.fresh] for independent acquisitions.
+/// Create services with [ServiceLayerOperations.layer], connect dependencies
+/// with [LayerOperations.provide], and combine independent outputs with
+/// [LayerOperations.merge].
+///
+/// ```dart
+/// final greeting = ServiceKey<String>('greeting');
+/// final message = ServiceKey<String>('message');
+/// final greetings = Layer.value(greeting.bind('Hello'));
+/// final messages = message
+///     .layer(Task.service(greeting).map((value) => '$value, Any!'))
+///     .provide(greetings);
+/// final program = Task.service(message).provide(messages);
+/// final runtime = Runtime();
+/// try {
+///   final value = await runtime.runOrThrow(program);
+///   assert(value == 'Hello, Any!');
+/// } finally {
+///   await runtime.close();
+/// }
+/// ```
+///
+/// Within one build, reusing the same layer object shares one acquisition, even
+/// across concurrent branches. Its first use supplies the input services and
+/// task-local values. Separate builds are independent; use
+/// [LayerOperations.fresh] for an independent acquisition within a build.
 final class Layer<E> {
   const Layer._(this._create, [this._fresh = false]);
 
   final Task<Context, E> Function(_BuildSession) _create;
   final bool _fresh;
 
-  /// Provides an existing binding without taking ownership of its resource.
+  /// Creates a layer from an existing service [binding].
   ///
-  /// The caller remains responsible for releasing externally created objects.
+  /// The caller retains ownership of the value and is responsible for its cleanup.
   static Layer<Never> value(ServiceBinding<Object?> binding) =>
       Layer._((_) => Task.succeed(Context.from([binding])));
 
-  /// Combines [layers], building in declaration order by default.
+  /// Combines the services produced by [layers].
   ///
-  /// [concurrency] limits the number of these branches being built at once and
-  /// must be positive. Larger values allow independent branches to overlap;
-  /// nested merges apply their own limits. Output bindings are merged in
-  /// declaration order. A duplicate key produces a [DuplicateService] defect.
+  /// The input collection is copied immediately. Builds run in declaration order
+  /// by default; [concurrency] allows up to that many branches to build at once.
+  /// Nested merges have their own concurrency limits.
   ///
-  /// The inputs are copied when this method is called. An invalid concurrency
-  /// becomes a [RangeError] defect when building, before any branch starts.
+  /// Output bindings retain declaration order. Duplicate keys fail the build with
+  /// a [DuplicateService] defect. A nonpositive [concurrency] fails with a
+  /// [RangeError] defect before any branch starts.
   static Layer<E> mergeAll<E>(
     Iterable<Layer<E>> layers, {
     int concurrency = 1,
@@ -54,64 +77,70 @@ final class Layer<E> {
   }
 }
 
-/// Describes the acquisition of a service with this key's type.
+/// Service construction for a typed [ServiceKey].
 extension ServiceLayerOperations<T> on ServiceKey<T> {
-  /// Builds this service using [acquire] and publishes its binding.
+  /// Creates a layer that acquires the service identified by this key.
   ///
-  /// Use Task.acquireRelease inside [acquire] to register resource cleanup.
-  /// Reading dependencies uses Task.service and the current build context.
-  /// A value incompatible with the key's original type fails at binding, even
-  /// when this key has been accessed through a wider type or `dynamic`.
+  /// Read dependencies with [Task.service]. Use [Task.acquireRelease] within
+  /// [acquire] when the service needs cleanup at the end of its owning lifetime.
+  ///
+  /// The acquired value must match the key's original type, even when the key is
+  /// accessed through a wider type or `dynamic`; [ServiceKey.bind] enforces this.
   Layer<E> layer<E>(Task<T, E> acquire) =>
       Layer._((_) => acquire.map((value) => Context.from([bind(value)])));
 }
 
-/// Combines service descriptions without running their construction tasks.
+/// Composition and error handling for [Layer] descriptions.
 extension LayerOperations<E> on Layer<E> {
-  /// Combines this output with [other]'s distinct service bindings.
+  /// Creates a layer containing both this layer's and [other]'s services.
   ///
-  /// See [Layer.mergeAll] for ordering, concurrency, and duplicate-key rules.
+  /// The keys must be distinct. See [Layer.mergeAll] for ordering, concurrency,
+  /// and duplicate-key behavior.
   Layer<E> merge(Layer<E> other, {int concurrency = 1}) =>
       Layer.mergeAll([this, other], concurrency: concurrency);
 
-  /// Builds [dependencies] before this layer, exposing only this layer's output.
+  /// Supplies [dependencies] to this layer without adding them to its output.
   ///
-  /// Dependency bindings override matching input services. Other input services
-  /// remain available. Dependencies share the same build cache and resource
-  /// scope, so shared dependencies are acquired once and released after users.
+  /// Dependency bindings replace matching input services; other inputs remain
+  /// available. Shared dependencies are acquired once per build and kept alive
+  /// until the services that use them have been released.
   Layer<E> provide(Layer<E> dependencies) => Layer._(
     (session) => session
         .build(dependencies)
         .flatMap((context) => session.build(this).provideContext(context)),
   );
 
-  /// Maps business failures from construction while preserving other causes.
+  /// Transforms business errors produced while building this layer.
   ///
-  /// Exceptions thrown by [transform] become defects, following Task.mapError.
+  /// Defects, cancellation, and cause ordering are preserved, as in
+  /// [TaskOperations.mapError]. An exception from [transform] becomes a defect.
   Layer<F> mapError<F>(F Function(E error) transform) =>
       Layer._((session) => session.build(this).mapError(transform));
 
-  /// Builds this subtree with a new cache on every encounter of this wrapper.
+  /// Makes each use of this layer build its services independently.
   ///
-  /// Nodes within that subtree still share acquisitions. Resources retain the
-  /// enclosing application's or local computation's lifetime.
+  /// Sharing still applies within each independent build of the wrapped subtree.
+  /// Acquired resources retain the enclosing runtime's or computation's lifetime.
   Layer<E> fresh() => Layer._((session) => session.build(this), true);
 }
 
-/// Establishes an error type for a layer with no business failures.
+/// Error-type widening for layers without business failures.
 extension InfallibleLayerOperations on Layer<Never> {
   /// Gives this layer error type [E] without changing its identity or behavior.
   Layer<E> withError<E>() => this;
 }
 
-/// Provides resources for one computation and its owned children.
+/// Service provisioning for a task and its owned children.
 extension TaskLayerOperations<T, E> on Task<T, E> {
-  /// Builds [layer], runs this task with its services, then releases them.
+  /// Runs this task with services acquired from [layer].
   ///
-  /// Each execution has an independent build cache and scope. Services override
-  /// matching input bindings and inherit all others. Construction failure skips
-  /// this computation and releases acquired resources. Cancellation waits for
-  /// owned work and resource cleanup before this task finishes.
+  /// Each execution builds independently and owns the services until the task and
+  /// its children finish. Layer bindings replace matching input services; other
+  /// services remain available.
+  ///
+  /// If construction fails, the task does not start and acquired resources are
+  /// released. Success, failure, and cancellation all wait for owned work and
+  /// resource cleanup before returning.
   Task<T, E> provide(Layer<E> layer) => accessTaskEnvironment(
     (scope, _) => buildLayer(layer, scope).flatMap(provideContext),
   ).scoped();

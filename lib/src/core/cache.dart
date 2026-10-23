@@ -6,24 +6,44 @@ import 'option.dart';
 import 'scope.dart';
 import 'task.dart';
 
-/// A bounded cache that shares each in-flight load among its callers.
+/// A bounded cache for reusable values and shared in-flight loads.
 ///
-/// The creating scope owns the cache and its loaders. A loader inherits the
-/// services and task-local values of the request that starts it. Keys must
-/// therefore include any tenant or other request differences that affect the
-/// result. Keys follow Dart's equality and hash-code contract.
+/// Use a cache for data such as lookup results that remain valid after loading
+/// finishes. Loader resources are closed before a result is delivered; cached
+/// values do not carry a resource lease. Use `SharedResource` or `Pool` for
+/// connections and other objects that must stay open while in use.
 ///
-/// Capacity includes cached entries and unfinished loads, including invalidated
-/// or cancelling generations. Completed entries are evicted in least recently
-/// used order. If every slot is still loading, new entries wait in arrival
-/// order. The number of waiting callers is controlled by application concurrency,
-/// not by cache capacity.
+/// Create and use the cache within one owning scope. Closing that scope stops
+/// loaders and rejects further operations with a [StateError] defect.
 ///
-/// A loader must not await its own entry, or recursively wait for capacity that
-/// it occupies. Such dependencies cannot complete until the loader finishes.
+/// ```dart
+/// import 'package:any/any.dart';
 ///
-/// Cached values have no resource lease. Use a resource pool for connections or
-/// other values that must remain open while callers use them.
+/// Future<List<String>> loadNames() async {
+///   final runtime = Runtime();
+///   final program =
+///       Cache.create<int, String, Never>(
+///         capacity: 64,
+///         ttl: const Duration(minutes: 1),
+///         load: (id) => Task.succeed('Product $id'),
+///       ).flatMap(
+///         (cache) => Task.all([
+///           cache.get(1),
+///           cache.get(1),
+///           cache.get(2),
+///         ], concurrency: 3),
+///       );
+///   try {
+///     return await runtime.runOrThrow(program);
+///   } finally {
+///     await runtime.close();
+///   }
+/// }
+/// ```
+///
+/// Keys use Dart equality and must have stable hash codes. A load uses the
+/// services and task-local values of the caller that starts it: include tenant,
+/// authorization, or other result-changing context in the key.
 final class Cache<K, V, E> {
   Cache._(
     this._capacity,
@@ -46,18 +66,23 @@ final class Cache<K, V, E> {
   var _closed = false;
   var _draining = false;
 
-  /// Creates a cache owned by the current scope when this task executes.
+  /// Creates an empty cache owned by the executing scope.
   ///
-  /// [capacity] must be positive and [ttl] nonnegative. Invalid arguments become
-  /// argument defects. TTL starts when the loader and its cleanup have finished,
-  /// using the clock available at creation. Zero TTL shares unfinished loads
-  /// without retaining completed results.
+  /// [capacity] must be positive and [ttl] nonnegative; invalid arguments become
+  /// defects when the task runs. Each execution creates a separate cache.
   ///
-  /// Only successful values are cached by default. [cacheFailures] also retains
-  /// business failures and groups containing only business failures. Defects and
-  /// cancellation are never cached. Each execution creates independent state.
-  /// Expiration is checked on access and when a new entry needs capacity.
-  /// Returning the cache from a completed Runtime.run does not keep it alive.
+  /// Capacity includes stored results and loads still running or cleaning up,
+  /// even after invalidation. Completed entries are evicted least recently used
+  /// first. If all slots are loading, new loads wait in arrival order. Application
+  /// concurrency determines the number of waiting callers.
+  ///
+  /// TTL uses the creation-time clock and starts after a load and its cleanup
+  /// finish. Expiration is checked on access or when making room. Zero TTL shares
+  /// in-flight work without retaining results.
+  ///
+  /// [cacheFailures] also retains business failures, including groups made only
+  /// of business failures. Defects and cancellation are never cached. [load]
+  /// must not wait for its own entry or for capacity occupied by that load.
   static Task<Cache<K, V, E>, Never> create<K, V, E>({
     required int capacity,
     required Duration ttl,
@@ -348,22 +373,24 @@ final class Cache<K, V, E> {
   }).scoped();
 }
 
-/// Accesses a [Cache] using its statically known key, value, and error types.
+/// Reads, refreshes, and invalidates cached values.
 extension CacheOperations<K, V, E> on Cache<K, V, E> {
-  /// Gets a cached result or joins one shared load for [key].
+  /// Returns the result for [key], loading it if necessary.
   ///
-  /// A miss waits for capacity if every slot is loading. Cancelling a caller
-  /// removes only its wait. The last caller to leave an unfinished load cancels
-  /// it and waits for its cleanup; a new request cannot join that generation.
-  /// Cleanup defects and explicit cleanup cancellations are retained.
-  /// Closed caches fail with a [StateError] defect.
+  /// Concurrent callers share the same unfinished load. A miss waits for a slot
+  /// if all capacity is occupied by loads.
+  ///
+  /// Cancelling one caller leaves other callers waiting. The last caller cancels
+  /// an unfinished load and waits for cleanup; subsequent callers start a new
+  /// load. Cleanup defects and explicit cleanup cancellations are preserved.
   Task<V, E> get(K key) => Task.defer(() => _get(key));
 
-  /// Reads an unexpired completed entry without starting or waiting for a load.
+  /// Looks up a completed result without starting or waiting for a load.
   ///
-  /// Returns [OptionNone] for a miss or unfinished load. A cached success is
-  /// [OptionSome], including a nullable value. An explicitly cached business
-  /// failure fails this task with its original cause. Hits update recency.
+  /// Returns [OptionNone] for an absent, expired, or still-loading entry. A cached
+  /// success returns [OptionSome], even when its value is `null`; a cached
+  /// business failure fails this task with its original cause. A hit updates
+  /// recency.
   Task<Option<V>, E> getOption(K key) => Task.defer(() {
     final entry = _lookup(key);
     _drain();
@@ -372,10 +399,11 @@ extension CacheOperations<K, V, E> on Cache<K, V, E> {
     return taskFromEvaluation(result).map(Option.some);
   });
 
-  /// Removes the current generation without cancelling its existing callers.
+  /// Makes the next request for [key] start a new load.
   ///
-  /// Its result cannot be written back. A subsequent request gets a new
-  /// generation and may wait for capacity until the old loader finishes.
+  /// Existing callers still receive their original load's result, which cannot
+  /// repopulate the cache. That load occupies capacity until it finishes, so a
+  /// new request may need to wait. An absent key has no effect.
   Task<void, Never> invalidate(K key) => Task.sync(() {
     _checkOpen();
     final entry = _entries[key];
@@ -383,7 +411,10 @@ extension CacheOperations<K, V, E> on Cache<K, V, E> {
     _drain();
   });
 
-  /// Invalidates every current entry, retaining unfinished loads for callers.
+  /// Invalidates all entries without cancelling their existing callers.
+  ///
+  /// Unfinished loads retain their capacity until they finish, as with
+  /// [invalidate].
   Task<void, Never> invalidateAll() => Task.sync(() {
     _checkOpen();
     for (final entry in _entries.values.toList()) {
@@ -392,10 +423,10 @@ extension CacheOperations<K, V, E> on Cache<K, V, E> {
     _drain();
   });
 
-  /// Invalidates [key] and requests its next generation.
+  /// Invalidates [key] and returns a newly requested result.
   ///
-  /// This does not retain the old value while loading. The new request follows
-  /// the same sharing, capacity, and cancellation rules as [get].
+  /// The previous result is removed immediately. Loading, capacity, and
+  /// cancellation follow [get].
   Task<V, E> refresh(K key) =>
       invalidate(key).withError<E>().flatMap((_) => get(key));
 }

@@ -5,26 +5,51 @@ import 'exit.dart';
 import 'fiber.dart';
 import 'task.dart';
 
-/// Owns child scopes and resource finalizers.
+/// A lifetime boundary for resources and child fibers.
 ///
-/// Scopes are created and closed by the task runtime. Their lifecycle state is
-/// private; finalizers are executed by the runtime that registered them.
+/// Register cleanup with [Task.addFinalizer] or [Task.acquireRelease]. Prefer
+/// [TaskOperations.scoped] to give a computation a local lifetime. Use [open] and
+/// [close] when work needs an explicit owner, such as [TaskOperations.forkIn].
+///
+/// Closing a scope stops and waits for its child fibers before releasing
+/// resources. Child scopes close before their parent's finalizers; sibling
+/// scopes and finalizers close in reverse registration order. Every finalizer
+/// runs, with cancellation masked, even if another finalizer fails.
+///
+/// ```dart
+/// final events = <String>[];
+/// final program = Task.addFinalizer(
+///   (_) => Task.sync(() => events.add('released')),
+/// ).flatMap((_) => Task.sync(() => events.add('used'))).scoped();
+/// final runtime = Runtime();
+/// try {
+///   await runtime.runOrThrow(program);
+///   assert(events.join(', ') == 'used, released');
+/// } finally {
+///   await runtime.close();
+/// }
+/// ```
+///
+/// Cleanup failures join the computation's cause. They do not prevent remaining
+/// resources from being released.
 final class Scope {
   Scope._(this._parent);
 
-  /// Creates a child of the current task scope when the returned task runs.
+  /// Returns a task that opens a child of the current scope.
   ///
-  /// The parent closes the child if it has not already closed. Creating a child
-  /// in a closing scope fails with a [StateError] defect.
+  /// The parent closes the child automatically if it is still open. Opening a child
+  /// under a closing or closed scope fails with a [StateError] defect.
   static Task<Scope, Never> open() => openScopeTask();
 
-  /// Closes this scope with [exit], waiting for all registered cleanup.
+  /// Returns a task that closes this scope and waits for its cleanup.
   ///
-  /// The first close fixes the exit passed to finalizers; later closes observe
-  /// the same cleanup result. Only cleanup failures propagate from this task,
-  /// not the supplied body exit. Waiting on the task's active scope, an ancestor,
-  /// or an unfinished scope sharing its cleanup driver produces a [StateError]
-  /// defect instead of a self-wait.
+  /// [exit] is the outcome passed to finalizers. The first close fixes this outcome;
+  /// subsequent closes return the same cleanup result. The returned task propagates
+  /// cleanup failures only, not the supplied [exit].
+  ///
+  /// A scope cannot be closed by work whose completion it must await. Closing the
+  /// caller's active scope, an ancestor, or a scope waiting on that caller's cleanup
+  /// fails with a [StateError] defect instead of deadlocking.
   Task<void, Never> close(Exit<Object?, Object?> exit) =>
       closeScopeTask(this, exit);
 
@@ -103,9 +128,9 @@ TaskEvaluation<void, Never> scopeCleanupFor(
   );
 }
 
-/// Creates a root scope, or registers a child of [parent].
-///
-/// Throws a [StateError] when [parent] is closing or closed.
+// Creates a root scope, or registers a child of [parent].
+//
+// Throws a [StateError] when [parent] is closing or closed.
 Scope createScope({Scope? parent}) {
   if (parent?._closing != null) {
     throw StateError('Cannot create a child in a closing or closed scope.');
@@ -115,10 +140,10 @@ Scope createScope({Scope? parent}) {
   return scope;
 }
 
-/// Whether [descendant] belongs to the live subtree rooted at [ancestor].
-///
-/// Includes [ancestor] itself until it has closed. The executor uses this to
-/// reject self and ancestor waits before requesting closure.
+// Whether [descendant] belongs to the live subtree rooted at [ancestor].
+//
+// Includes [ancestor] itself until it has closed. The executor uses this to
+// reject self and ancestor waits before requesting closure.
 bool scopeContains(Scope ancestor, Scope descendant) {
   if (ancestor._closing?.completion.isCompleted ?? false) return false;
   for (Scope? scope = descendant; scope != null; scope = scope._parent) {
@@ -178,16 +203,16 @@ T inScopeFinalizer<T>(Scope scope, T Function() run) => runZoned(
   },
 );
 
-/// Registers [finalizer], or runs it immediately if [scope] has closed.
-///
-/// Open and closing scopes queue the finalizer synchronously and return `null`.
-/// A closed scope uses its original closing exit and returns the late
-/// finalizer's cleanup cause without changing the completed close result.
-///
-/// [runFinalizer] executes with cancellation masked and a temporary scope for
-/// resources used by cleanup. The supplied owning scope identifies self-waits.
-/// The executor captures the registration-time execution environment; Scope
-/// only manages ordering and failure accumulation.
+// Registers [finalizer], or runs it immediately if [scope] has closed.
+//
+// Open and closing scopes queue the finalizer synchronously and return `null`.
+// A closed scope uses its original closing exit and returns the late
+// finalizer's cleanup cause without changing the completed close result.
+//
+// [runFinalizer] executes with cancellation masked and a temporary scope for
+// resources used by cleanup. The supplied owning scope identifies self-waits.
+// The executor captures the registration-time execution environment; Scope
+// only manages ordering and failure accumulation.
 FutureOr<TaskEvaluation<void, Never>?> addScopeFinalizer(
   Scope scope,
   Task<void, Never> Function(Exit<Object?, Object?> exit) finalizer, {
@@ -206,17 +231,17 @@ FutureOr<TaskEvaluation<void, Never>?> addScopeFinalizer(
   return _runFinalizer(scope, entry, closing.exit);
 }
 
-/// Closes [scope], returning only its cleanup failures, or `null` on success.
-///
-/// The first call fixes [exit] and synchronously marks all open descendants as
-/// closing. Repeated calls share the same Future and result. Children finish
-/// before parent finalizers; sibling scopes and finalizers use reverse
-/// registration order. Every finalizer is attempted even after failures.
-///
-/// A child already closing independently is awaited, and its cleanup cause is
-/// included once. A child that closed before this call has detached and is not
-/// included again. The body's [exit] is passed to finalizers but never merged
-/// into the cleanup result.
+// Closes [scope], returning only its cleanup failures, or `null` on success.
+//
+// The first call fixes [exit] and synchronously marks all open descendants as
+// closing. Repeated calls share the same Future and result. Children finish
+// before parent finalizers; sibling scopes and finalizers use reverse
+// registration order. Every finalizer is attempted even after failures.
+//
+// A child already closing independently is awaited, and its cleanup cause is
+// included once. A child that closed before this call has detached and is not
+// included again. The body's [exit] is passed to finalizers but never merged
+// into the cleanup result.
 Future<Cause<Never>?> closeScope(Scope scope, Exit<Object?, Object?> exit) {
   final existing = scope._closing;
   if (existing != null) return existing.completion.future;

@@ -1,28 +1,31 @@
 import 'exit.dart';
 import 'task.dart';
 
-/// A reusable gate that lets tasks wait until it opens.
+/// A reusable gate that tasks can wait to pass through.
 ///
-/// [open] releases all current waiters and lets later waiters pass until [reset]
-/// closes the gate. Resetting does not retract a release already delivered to a
-/// waiter. Cancelling a wait removes only that waiter and leaves the gate alone.
+/// Use a latch to pause work until a readiness condition is met. [open]
+/// releases every current waiter and lets later waiters pass; [reset] closes
+/// the gate for future waits. Use a `Deferred` when waiting for a one-time
+/// result instead of a reusable signal.
+///
+/// Resetting cannot retract a release already delivered to a waiter.
+/// Cancelling a wait affects neither the gate nor other waiters.
 final class Latch {
   Latch._(this._open);
 
   bool _open;
   Set<void Function()> _waiters = {};
 
-  /// Creates an independent latch whenever the returned task executes.
+  /// Creates a latch that starts closed unless [open] is `true`.
   ///
-  /// The gate starts closed unless [open] is `true`.
+  /// Each execution creates an independent gate.
   static Task<Latch, Never> create({bool open = false}) =>
       Task.sync(() => Latch._(open));
 
-  /// Waits for the gate to open, or passes immediately if it is already open.
+  /// Waits until the gate opens, or completes immediately if already open.
   ///
-  /// Each execution registers its own wait. Cancellation stops only that wait;
-  /// it does not open or reset the latch. An open followed immediately by a reset
-  /// still releases waiters that were registered before the open.
+  /// An open followed immediately by a reset still releases existing waiters.
+  /// Each execution waits independently and can be cancelled.
   Task<void, Never> awaitOpen() => Task.fromCallback((complete) {
     if (_open) {
       complete(const Exit.success(null));
@@ -36,10 +39,10 @@ final class Latch {
     };
   });
 
-  /// Opens the gate and releases all registered waiters when executed.
+  /// Opens the gate and releases all current waiters.
   ///
-  /// Later waits pass until [reset] executes. Opening an already open gate has
-  /// no additional effect; it does not accumulate releases for future resets.
+  /// Later waits pass until [reset]. Opening an already open gate has no extra
+  /// effect and does not accumulate releases.
   Task<void, Never> open() => Task.sync(() {
     _open = true;
     final waiters = _waiters;
@@ -49,10 +52,10 @@ final class Latch {
     }
   });
 
-  /// Closes the gate for subsequent waits when executed.
+  /// Closes the gate for future waits.
   ///
-  /// Waiters already released by [open] remain released. Resetting an already
-  /// closed gate preserves its waiting tasks until a later open or cancellation.
+  /// Already released waiters remain released. Resetting a closed gate preserves
+  /// its waiting tasks.
   Task<void, Never> reset() => Task.sync(() {
     _open = false;
   });

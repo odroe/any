@@ -10,34 +10,76 @@ import 'scope.dart';
 import 'task.dart';
 import 'task_local.dart';
 
-/// Resolves keyed requests in bounded batches within one root execution.
+/// A reusable loader that combines keyed requests into bounded batches.
 ///
-/// Requests share work only when their resolver, root request scope, services,
-/// and task-local bindings match. Service and local values are compared by
-/// identity, not by their custom equality. Independent runtime runs and work
-/// forked into an external scope have separate request domains. Keys follow
-/// Dart's equality and hash-code contract and must remain stable while in use.
+/// Use a resolver to fetch many records in one database or service call. Calls
+/// to [RequestResolverOperations.request] batch automatically and share duplicate
+/// keys. Use [RequestResolverOperations.batch] when the complete key list is
+/// already known and individual failures should remain values.
 ///
-/// The resolver itself is reusable. Queues, loaders, and cached results belong
-/// to each request domain and are released when that domain closes. Values have
-/// no resource lease; use shared resources or a pool for owned connections.
+/// ```dart
+/// import 'package:any/any.dart';
+///
+/// Future<List<String>> userNames() async {
+///   final users = {1: 'Ada', 2: 'Linus'};
+///   final names = RequestResolver<int, String, String>(
+///     (ids) => Task.succeed([
+///       for (final id in ids)
+///         switch (users[id]) {
+///           final name? => Result.success(name),
+///           null => Result.failure('Unknown user $id'),
+///         },
+///     ]),
+///     maxBatchSize: 50,
+///   );
+///   final runtime = Runtime();
+///   try {
+///     return await runtime.runOrThrow(
+///       names
+///           .batch([1, 2, 1, 99])
+///           .map(
+///             (results) => [
+///               for (final result in results)
+///                 switch (result) {
+///                   ResultSuccess(:final value) => value,
+///                   ResultFailure(:final error) => error,
+///                 },
+///             ],
+///           ),
+///     );
+///   } finally {
+///     await runtime.close();
+///   }
+/// }
+/// ```
+///
+/// Sharing is local to a resolver and a root task execution. Different service
+/// or task-local bindings have separate batches and caches; binding values must
+/// be identical, regardless of their custom equality. Separate runtime runs and
+/// tasks forked into an external scope also have separate request domains. Keys
+/// use Dart equality and must have stable hash codes.
+///
+/// Each domain releases its pending work and cached values when it closes.
+/// Loader cleanup finishes before results are delivered. Returned values do not
+/// hold resource leases; use shared resources or a pool for open connections.
 final class RequestResolver<K, V, E> {
-  /// Creates a lazy resolver using [resolve] for each batch of distinct keys.
+  /// Creates a resolver that loads distinct keys with [resolve].
   ///
-  /// The returned list must have one [Result] per input key, in the same order.
-  /// A failed task, including its cleanup failure, fails every key in that
-  /// batch. A result-count mismatch is a defect for the entire batch. The
-  /// callback must not recursively wait for this same resolver.
+  /// [resolve] receives an immutable key list and must return one [Result] per
+  /// key in the same order. A [ResultFailure] affects only its key. A failed task
+  /// or failed cleanup affects the whole batch; a wrong result count is a defect.
+  /// Recursively waiting on this resolver fails with a [StateError] defect.
   ///
-  /// [maxBatchSize], [concurrency], and [cacheCapacity] must be positive.
-  /// Concurrency limits active batches across all environments in one request
-  /// domain, not across independent runtime runs. Pending callers are bounded
-  /// by application concurrency, not by these limits.
+  /// [maxBatchSize] limits keys per batch. [concurrency] limits active batches
+  /// across all environments in one request domain, not across runtime runs.
+  /// Neither setting bounds the number of waiting callers.
   ///
-  /// With [cache] enabled, successful values are retained in least recently
-  /// used order up to [cacheCapacity] across the domain's environments. Business
-  /// failures, defects, and cancellation are never cached. Disabling caching
-  /// still shares unfinished requests for the same key and environment.
+  /// With [cache] enabled, successful values are kept in least recently used
+  /// order up to [cacheCapacity] across the domain's environments. Failures are
+  /// never cached. Disabling caching still shares unfinished requests.
+  ///
+  /// Throws [RangeError] if [maxBatchSize], [concurrency], or [cacheCapacity] is
+  /// not positive.
   RequestResolver(
     Task<List<Result<V, E>>, E> Function(List<K> keys) resolve, {
     int maxBatchSize = 100,
@@ -111,35 +153,37 @@ final class RequestResolver<K, V, E> {
       });
 }
 
-/// Executes requests with their statically known key, value, and error types.
+/// Requests values and invalidates results in the current request domain.
 extension RequestResolverOperations<K, V, E> on RequestResolver<K, V, E> {
-  /// Gets [key], sharing a cached value or an unfinished compatible request.
+  /// Returns the value for [key], sharing compatible requests and cached results.
   ///
-  /// Newly queued requests are collected until the next batching microtask.
-  /// Use [batch] when a known set of keys must be submitted together. Cancelling
-  /// one caller leaves other callers running. If an entire sent batch loses
-  /// its callers, the last caller waits for cancellation and loader cleanup.
+  /// New requests collect until the next batching microtask. Use [batch] to
+  /// submit a known set of keys together.
+  ///
+  /// Cancelling one caller leaves other callers waiting. If a sent batch loses
+  /// all its callers, its last caller waits for cancellation and loader cleanup.
   Task<V, E> request(K key) => _submit([
     key,
   ], false).flatMap((results) => Task.fromResult(results.single));
 
-  /// Submits a finite set of [keys] together and preserves input order.
+  /// Resolves [keys] together and returns their results in input order.
   ///
-  /// Inputs are copied during execution before any requests are submitted.
-  /// Duplicate keys share work but retain their positions in the result. Newly
-  /// queued distinct keys form a submission group, split by the batch-size
-  /// limit; later keys are not appended to that group. Already queued, loading,
-  /// or cached keys can still be reused.
+  /// [keys] must be finite and is copied before submission. Duplicate keys share
+  /// work while keeping their positions. Newly queued keys form a batch group,
+  /// split by the size limit; later requests cannot add keys to that group.
+  /// Already pending or cached results may still be reused.
   ///
-  /// Waits for all submitted keys. Individual business errors remain [Result]
-  /// values. If any loader batch fails, this task fails with the combined batch
-  /// causes in completion order. The returned list is immutable.
+  /// Waits for every key and returns an immutable list. Individual business
+  /// errors remain [ResultFailure] values. Failed loader batches instead fail
+  /// this task, combining their causes in completion order. Cancellation follows
+  /// [request].
   Task<List<Result<V, E>>, E> batch(Iterable<K> keys) => _submit(keys, true);
 
-  /// Removes [key] from the current environment's reusable entries.
+  /// Makes the next compatible request for [key] load a fresh result.
   ///
-  /// Existing callers keep their original result; its completion cannot replace
-  /// the new generation. Other environments and root runs are unaffected.
+  /// Existing callers keep their original result, which cannot replace the new
+  /// one in the cache. Other environments and root runs are unaffected. A missing
+  /// key has no effect.
   Task<void, Never> invalidate(K key) => Task.uninterruptibleMask((_) {
     return _run().flatMap(
       (run) => captureTaskEnvironment().map((environment) {

@@ -1,66 +1,55 @@
 import 'task.dart';
 
-/// A mutable value accessed through tasks within one isolate.
+/// A mutable value read and updated through tasks within one isolate.
 ///
-/// [RefOperations.update] and [RefOperations.modify] perform a synchronous
-/// read and write without suspending between them. A separate [get] followed
-/// by [RefOperations.set] does not form one atomic operation.
+/// Use a ref for shared counters or application state. [RefOperations.update]
+/// and [RefOperations.modify] read and write in one synchronous operation;
+/// separate [get] and [RefOperations.set] calls are not atomic together. For
+/// example, `counter.modify((value) => (value, value + 1))` allocates an ID and
+/// advances the counter.
 ///
-/// Values are retained by reference. Mutating a stored object's fields is not
-/// tracked, copied, or rolled back by this ref.
+/// Use `SynchronizedRef` when computing a replacement requires a task. Values
+/// are stored by reference: changes to their fields are not tracked or rolled
+/// back. Cancellation cannot interrupt a synchronous update or undo its commit.
 final class Ref<T> {
   Ref._(this._value);
 
   T _value;
 
-  /// Creates a new ref containing [initial] whenever the returned task runs.
+  /// Creates a ref containing [initial].
   ///
-  /// Repeated executions create independent refs. The initial value itself is
-  /// retained unchanged, so refs created from one mutable object share that
-  /// object until one of them stores a different value.
+  /// Each execution creates a separate ref. The initial value is not copied, so
+  /// refs created from the same mutable object initially share that object.
   static Task<Ref<T>, Never> create<T>(T initial) =>
       Task.sync(() => Ref._(initial));
 
-  /// Reads the value when the returned task runs.
-  ///
-  /// Reusing the task reads the latest value on each execution.
+  /// Reads the current value each time the task executes.
   Task<T, Never> get() => Task.sync(() => _value);
 }
 
-/// Writes and transformations using a ref's statically known value type.
+/// Updates a ref without suspending between reading and writing.
 ///
-/// A ref keeps its original runtime type when viewed through a wider type.
-/// Attempting to store an incompatible value produces a [TypeError] defect
-/// when the task runs, and leaves the previous stored value in place.
+/// A wider static type does not change the ref's runtime value type. Storing an
+/// incompatible value fails with a [TypeError] defect and keeps the old value.
 extension RefOperations<T> on Ref<T> {
-  /// Stores [value] when the returned task runs.
+  /// Replaces the stored value with [value].
   Task<void, Never> set(T value) => Task.sync(() {
     _value = value;
   });
 
-  /// Replaces the current value with the result of [transform].
+  /// Replaces the value with the result of [transform].
   ///
-  /// [transform] runs once per execution, synchronously with no suspension
-  /// between reading and committing. If it throws, its exception becomes a
-  /// defect and the stored value is not replaced. Mutations to the old value's
-  /// own fields or other side effects are not undone.
-  ///
-  /// Cancellation is checked around this operation; it cannot interrupt the
-  /// callback or undo a value committed by it.
+  /// Calls [transform] once per execution. A thrown exception becomes a defect
+  /// without replacing the stored value; other side effects are not undone.
   Task<void, Never> update(T Function(T value) transform) => Task.sync(() {
     _value = transform(_value);
   });
 
-  /// Changes the value and returns a separate result in one synchronous step.
+  /// Changes the value and returns a result in one synchronous operation.
   ///
-  /// [change] returns `(result, newValue)`. The new value is committed before
-  /// the task succeeds with `result`. Exceptions become defects without
-  /// replacing the stored value; other side effects are not rolled back.
-  /// Cancellation cannot interrupt the callback or undo the commit.
-  ///
-  /// ```dart
-  /// final nextId = counter.modify((value) => (value, value + 1));
-  /// ```
+  /// [change] returns `(result, newValue)`. The value is stored before this task
+  /// succeeds with `result`. A thrown exception becomes a defect without replacing
+  /// the stored value; other side effects are not undone.
   Task<R, Never> modify<R>((R result, T value) Function(T value) change) =>
       Task.sync(() {
         final (result, value) = change(_value);

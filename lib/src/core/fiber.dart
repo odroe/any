@@ -9,11 +9,16 @@ import 'scope.dart';
 import 'task.dart';
 import 'task_local.dart';
 
-/// A running task whose owner waits for its work and cleanup to finish.
+/// A handle to one running [Task] and its eventual [Exit].
 ///
-/// Start a fiber with Runtime.start, Task.fork, or Task.forkIn. Its final exit
-/// includes resource cleanup and can be observed more than once. Cancelling a
-/// waiter does not cancel the fiber; use [requestCancel] or [cancel] explicitly.
+/// Create a fiber with `Runtime.start`, [TaskOperations.fork], or
+/// [TaskOperations.forkIn]. Its owning [Scope] keeps resources alive until the
+/// fiber stops and finishes cleanup.
+///
+/// Use [join] to continue with its value or failure, [awaitExit] to inspect either
+/// outcome, and [poll] to inspect without waiting. The same result can be observed
+/// more than once. Cancelling a waiter leaves the fiber running; use [cancel] to
+/// stop it and wait, or [requestCancel] to request cancellation without waiting.
 final class Fiber<T, E> {
   Fiber._(this._scope, this._report);
 
@@ -29,9 +34,10 @@ final class Fiber<T, E> {
   var _observed = false;
   var _defectsHandledByOwner = false;
 
-  /// Returns the completed exit, or absence while work or cleanup is running.
+  /// Returns the completed exit, or [OptionNone] if the fiber is still running.
   ///
-  /// Returning a completed exit counts as observing it for failure reporting.
+  /// A fiber remains running until its cleanup finishes. Returning [OptionSome]
+  /// counts as observing the result for unhandled-failure reporting.
   Option<Exit<T, E>> poll() {
     final exit = _exit;
     if (exit == null) return const Option.none();
@@ -39,16 +45,17 @@ final class Fiber<T, E> {
     return Option.some(exit);
   }
 
-  /// Waits for this fiber's complete exit when the returned task runs.
+  /// Returns a task that waits for this fiber's value or failure as an [Exit].
   ///
-  /// Waiting on yourself or a task that must wait for you fails with a
-  /// [StateError] defect. Cancelling the wait removes its subscription without
-  /// stopping this fiber or observing an exit that has not been delivered.
+  /// Cancelling the wait leaves the fiber running and does not mark an undelivered
+  /// result as observed. Waiting on oneself, or on work that must wait for the
+  /// caller, fails with a [StateError] defect instead of deadlocking.
   Task<Exit<T, E>, Never> awaitExit() => awaitFiberTask(this);
 
-  /// Waits for completion and propagates the successful value or full cause.
+  /// Returns a task that waits for this fiber and adopts its value or failure.
   ///
-  /// This has the same waiting and cancellation rules as [awaitExit].
+  /// Use [awaitExit] to inspect a failure as a value instead. Both operations share
+  /// the same cancellation and self-wait rules.
   Task<T, E> join() => joinFiberTask(this);
 
   /// Requests cancellation without waiting for work or cleanup to finish.
@@ -58,11 +65,11 @@ final class Fiber<T, E> {
     if (_active) _controller.requestCancel(reason: reason);
   }
 
-  /// Requests cancellation and waits for the complete exit when executed.
+  /// Returns a task that cancels this fiber and waits for its [Exit].
   ///
-  /// Resource cleanup and any in-flight, non-cancellable Future must finish
-  /// before this operation can return the exit. Self and ancestor waits fail
-  /// with a [StateError] defect before sending the cancellation request.
+  /// Completion includes resource cleanup. An in-flight, non-cancellable [Future]
+  /// can therefore delay the result. A self-wait or ancestor wait fails with a
+  /// [StateError] defect before requesting cancellation.
   Task<Exit<T, E>, Never> cancel({Object? reason}) =>
       awaitFiberTask(this, cancel: true, reason: reason);
 
@@ -112,10 +119,10 @@ final class Fiber<T, E> {
 // Internal execution and ownership operations, not exported by any.dart.
 final _currentFibers = Object();
 
-/// Starts an execution after synchronously registering it with [owner].
-///
-/// [deferStart] breaks recursive construction of independent build workers.
-/// Ownership and cancellation are installed before scheduling the first step.
+// Starts an execution after synchronously registering it with [owner].
+//
+// [deferStart] breaks recursive construction of independent build workers.
+// Ownership and cancellation are installed before scheduling the first step.
 Fiber<T, E> startFiber<T, E>(
   Task<T, E> task, {
   required Scope owner,
@@ -175,7 +182,7 @@ Fiber<T, E> startFiber<T, E>(
   return fiber;
 }
 
-/// Creates an already completed handle without starting or registering work.
+// Creates an already completed handle without starting or registering work.
 Fiber<T, E> completedFiber<T, E>(
   Exit<T, E> exit, {
   required void Function(Cause<Object?> cause) report,
@@ -199,7 +206,7 @@ List<FailureEvent> fiberFailureEvents(Fiber<Object?, Object?> fiber) =>
 List<Fiber<Object?, Object?>> currentFibers() =>
     Zone.current[_currentFibers] as List<Fiber<Object?, Object?>>? ?? const [];
 
-/// Subscribes to delivery; removing the subscription does not observe the exit.
+// Subscribes to delivery; removing the subscription does not observe the exit.
 void Function() listenFiber<T, E>(
   Fiber<T, E> fiber,
   void Function(Exit<T, E> exit) listener,
@@ -216,7 +223,7 @@ Future<Exit<T, E>> fiberCompletion<T, E>(
   });
 }
 
-/// Stops owned work and retains defects without converting business failures.
+// Stops owned work and retains defects without converting business failures.
 Future<List<FailureEvent>> stopFiber(
   Fiber<Object?, Object?> fiber, {
   Object? reason,
@@ -227,7 +234,7 @@ Future<List<FailureEvent>> stopFiber(
   return fiber._finalEvents;
 }
 
-/// One defect occurrence retained across internal ownership boundaries.
+// One defect occurrence retained across internal ownership boundaries.
 final class FailureEvent {
   const FailureEvent(this.cause, this.source);
 

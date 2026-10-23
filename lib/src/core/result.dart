@@ -1,10 +1,25 @@
 /// A successful value of type [T] or a business error of type [E].
 ///
-/// Use [ResultSuccess] and [ResultFailure] in an exhaustive switch to inspect
-/// the result. Either branch can contain `null` when its type permits it.
+/// Use a result to return an expected failure without throwing an exception.
+/// Either branch can contain `null` when its type permits it.
 ///
-/// A result is a value, not a computation. Its transformations run immediately
-/// and propagate thrown objects rather than turning them into business errors.
+/// Transformations run immediately. Callback exceptions propagate to the caller
+/// and are never converted into [ResultFailure].
+///
+/// ```dart
+/// Result<int, String> parsePort(String text) {
+///   final port = int.tryParse(text);
+///   return port != null && port > 0 && port <= 65535
+///       ? Result.success(port)
+///       : Result.failure('Expected a port between 1 and 65535.');
+/// }
+///
+/// final message = switch (parsePort('8080')) {
+///   ResultSuccess(:final value) => 'Listening on $value',
+///   ResultFailure(:final error) => error,
+/// };
+/// assert(message == 'Listening on 8080');
+/// ```
 sealed class Result<T, E> {
   const Result._();
 
@@ -33,21 +48,15 @@ final class ResultFailure<T, E> extends Result<T, E> {
   final E error;
 }
 
-/// Transforms and combines results using their static value and error types.
+/// Transformations and sequential composition for results.
 extension ResultOperations<T, E> on Result<T, E> {
   /// Transforms a successful value, leaving a business error unchanged.
-  ///
-  /// Calls [transform] immediately for success and skips it for failure.
-  /// Any object thrown by [transform] propagates to the caller.
   Result<U, E> map<U>(U Function(T value) transform) => switch (this) {
     ResultSuccess(:final value) => Result.success(transform(value)),
     ResultFailure(:final error) => Result.failure(error),
   };
 
   /// Transforms a business error, leaving a successful value unchanged.
-  ///
-  /// Calls [transform] immediately for failure and skips it for success.
-  /// Any object thrown by [transform] propagates to the caller.
   Result<T, F> mapError<F>(F Function(E error) transform) => switch (this) {
     ResultSuccess(:final value) => Result.success(value),
     ResultFailure(:final error) => Result.failure(transform(error)),
@@ -55,9 +64,7 @@ extension ResultOperations<T, E> on Result<T, E> {
 
   /// Continues a successful result with [next], leaving a failure unchanged.
   ///
-  /// Calls [next] immediately for success and returns its result. The next
-  /// result uses the same error type [E]; use [mapError] to adapt other errors.
-  /// Any object thrown by [next] propagates to the caller.
+  /// Use [mapError] first when the two results have different error types.
   Result<U, E> flatMap<U>(Result<U, E> Function(T value) next) =>
       switch (this) {
         ResultSuccess(:final value) => next(value),

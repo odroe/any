@@ -3,26 +3,29 @@ import 'exit.dart';
 import 'option.dart';
 import 'task.dart';
 
-/// A result that can be completed once and observed by multiple tasks.
+/// A result that one task completes and any number of tasks can await.
 ///
-/// The first executed completion wins. All current and future observers receive
-/// that result; cancelling an observer removes only its own wait. A deferred
-/// stores an [Exit], not a task that is executed again for each observer.
+/// Use a deferred to hand a value or failure from a producer to its consumers.
+/// Run [succeed] or [fail] to publish a result, then [join] to consume it. Use
+/// [awaitExit] when the consumer needs to inspect failure as a value.
+///
+/// The first executed completion wins. Current and future observers receive
+/// that stored [Exit]; observing it does not rerun any work. Cancelling an
+/// observer only stops its own wait.
 final class Deferred<T, E> {
   Deferred._();
 
   Exit<T, E>? _exit;
   Set<void Function(Exit<T, E>)>? _waiters = {};
 
-  /// Creates a new, incomplete deferred each time the returned task executes.
+  /// Creates an incomplete deferred, independent on each execution.
   static Task<Deferred<T, E>, Never> create<T, E>() =>
       Task.sync(Deferred<T, E>._);
 
-  /// Completes this deferred with [exit] when the returned task executes.
+  /// Publishes [exit] if no result has been stored yet.
   ///
-  /// Returns `true` if this completion won, or `false` if a result was already
-  /// stored. The original exit is retained unchanged. Constructing this task
-  /// does not complete the deferred.
+  /// Returns `true` if this completion wins, or `false` if already completed. The
+  /// original exit is retained unchanged. Completion happens when the task runs.
   Task<bool, Never> complete(Exit<T, E> exit) => Task.sync(() {
     if (_exit != null) return false;
     _exit = exit;
@@ -34,36 +37,29 @@ final class Deferred<T, E> {
     return true;
   });
 
-  /// Completes this deferred successfully with [value] when executed.
-  ///
-  /// Returns whether this completion won, following [complete]'s rules.
+  /// Publishes a successful [value], returning whether this completion wins.
   Task<bool, Never> succeed(T value) => complete(Exit.success(value));
 
-  /// Completes this deferred with the business [error] when executed.
+  /// Publishes a business [error], returning whether this completion wins.
   ///
-  /// Returns whether this completion won. Use [complete] to publish an exit
-  /// containing defects, cancellation, or multiple failure reasons.
+  /// Use [complete] for defects, cancellation, or combined failure causes.
   Task<bool, Never> fail(E error) =>
       complete(Exit.failure(Cause.failure(error)));
 
-  /// Waits for the stored exit and returns it as a successful value.
+  /// Waits for the result and returns its [Exit] as a successful value.
   ///
-  /// A failed stored exit does not fail this task. Cancellation of the waiting
-  /// task still terminates its wait without changing the deferred or other
-  /// observers.
+  /// A stored failure does not fail this task. Cancelling the waiting task still
+  /// ends its wait without changing the deferred.
   Task<Exit<T, E>, Never> awaitExit() => Task.fromCallback(
     (complete) => _listen((exit) => complete(Exit.success(exit))),
   );
 
-  /// Waits for success or propagates the stored exit's complete failure cause.
-  ///
-  /// Cancellation terminates only this task's wait. It does not complete the
-  /// deferred or affect other observers.
+  /// Waits for a value or propagates the stored failure's complete cause.
   Task<T, E> join() => Task.fromCallback(_listen);
 
-  /// Returns the stored exit, or [OptionNone] while still incomplete.
+  /// Returns the stored exit, or [OptionNone] if not yet completed.
   ///
-  /// This synchronous snapshot does not register an observer or start work.
+  /// This synchronous snapshot does not wait or register an observer.
   Option<Exit<T, E>> poll() => switch (_exit) {
     final exit? => Option.some(exit),
     null => const Option.none(),

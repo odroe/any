@@ -6,15 +6,35 @@ import 'clock.dart';
 import 'exit.dart';
 import 'task.dart';
 
-/// A FIFO token bucket using the clock captured when it is created.
+/// A rate limit on how often tasks may start, with a configurable burst allowance.
 ///
-/// Tokens refill continuously at the configured rate, up to the burst capacity.
-/// The bucket starts full. Acquiring tokens consumes them permanently; task
-/// completion, failure, and cancellation do not return committed tokens.
+/// Use [RateLimiterOperations.run] to delay work until tokens are available.
+/// The bucket starts full and refills continuously up to its burst capacity.
+/// Consumed tokens are not returned when work finishes or is cancelled; use a
+/// semaphore when the goal is to limit simultaneous work instead.
 ///
-/// This object is not scope-owned and needs no close operation. Each waiting
-/// acquisition owns its cancellation cleanup. At most one timer exists while
-/// requests wait for tokens, and idle limiters retain no timer.
+/// Instances can be shared across scopes and need no close operation. Waiting
+/// acquisitions can be cancelled; an idle limiter keeps no timer running.
+///
+/// ```dart
+/// final program =
+///     RateLimiter.create(
+///       permits: 10,
+///       interval: const Duration(seconds: 1),
+///       burst: 2,
+///     ).flatMap(
+///       (limiter) => Task.forEach([
+///         'first',
+///         'second',
+///       ], (message) => limiter.run(Task.sync(() => print(message)))),
+///     );
+/// final runtime = Runtime();
+/// try {
+///   await runtime.runOrThrow(program);
+/// } finally {
+///   await runtime.close();
+/// }
+/// ```
 final class RateLimiter {
   RateLimiter._(this._clock, this._rate, this._interval, this._burst)
     : _tokens = _burst.toDouble(),
@@ -65,16 +85,14 @@ final class RateLimiter {
 
   /// Waits for and consumes [permits] tokens when executed.
   ///
-  /// Requests are served in arrival order, including when a smaller request
-  /// could fit before the queue head. A wake-up reserves a turn; consumption is
-  /// committed only after this task resumes with cancellation masked. Cancelling
-  /// before that confirmation leaves the balance unchanged. Once committed,
-  /// cancellation does not refund tokens or guarantee a later callback runs.
+  /// Requests are served in arrival order, even if a smaller request could be
+  /// satisfied first. Cancellation before acquisition consumes no tokens.
+  /// After acquisition, tokens are not refunded; cancellation may still prevent
+  /// subsequent work from starting.
   ///
   /// [permits] must be positive and no greater than the burst capacity; invalid
-  /// counts become [RangeError] defects. Clock failures retain their original
-  /// defect information and wake affected waiters. Timer delays round upward to
-  /// microseconds, with a minimum positive delay when a retry is needed.
+  /// counts become [RangeError] defects. Clock failures are delivered to affected
+  /// waiters as defects. Waits round up to the next microsecond.
   Task<void, Never> acquire({int permits = 1}) =>
       Task.uninterruptibleMask<void, Never>((restore) {
         RangeError.checkValueInInterval(permits, 1, _burst, 'permits');

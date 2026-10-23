@@ -8,58 +8,61 @@ import 'option.dart';
 import 'scope.dart';
 import 'task.dart';
 
-/// Groups and regulates flow elements using the current [Clock].
+/// Batching and rate control for flows, timed by the current [Clock].
 extension FlowAggregationOperations<T, E> on Flow<T, E> {
-  /// Collects elements into immutable groups bounded by [size] and [duration].
+  /// Batches elements until [size] is reached or [duration] has elapsed.
   ///
-  /// The first element starts a monotonic deadline. A full group or an expired
-  /// deadline emits a nonempty group; an empty source emits nothing. Normal end
-  /// emits the last partial group. Failure discards a group still being built.
+  /// The first element starts the interval. Each output is a nonempty, immutable
+  /// list in input order. Normal completion emits a final partial group; failure
+  /// discards it. Both arguments must be positive or consumption fails with a
+  /// [RangeError] defect before source work starts.
   ///
-  /// At most [size] values and one source pull are retained, in addition to
-  /// groups retained downstream. A deadline never cancels a pending source pull:
-  /// its result belongs to the next group. No new pulls start while downstream
-  /// consumes a group. Input resources remain available until its group is
-  /// consumed, including when a pending pull advances to another producer.
+  /// Use this to bound batch size without waiting indefinitely for a full batch.
+  /// An empty source emits nothing, and no empty batches are emitted while idle.
+  /// A pending read survives the deadline and supplies the next batch.
   ///
-  /// Consumer cancellation stops pending work and waits for cleanup. Unfinished
-  /// source business failures and explicit cancellation are discarded; defects
-  /// and resource cleanup failures are retained. Both [size] and [duration] must
-  /// be positive; invalid values become [RangeError] defects before source work.
+  /// At most [size] values and one pending read are held, beyond groups still in
+  /// use downstream. No new reads start while downstream consumes a group. Input
+  /// resources remain alive until their group is consumed. Cancellation stops
+  /// pending work and waits for cleanup; late defects and cleanup failures still
+  /// propagate, but business failures or cancellation from unfinished reads do not.
   Flow<List<T>, E> groupedWithin(int size, Duration duration) =>
       _aggregate(this, size, duration);
 
-  /// Emits the latest element after no new element arrives for [duration].
+  /// Emits the latest element after [duration] without a new arrival.
   ///
-  /// Each new element restarts the monotonic deadline and releases the replaced
-  /// element's resources. Normal end emits the final element immediately;
-  /// failure discards a value still waiting for its deadline. A zero duration
-  /// delivers every element without delay. Negative durations become [RangeError]
-  /// defects before source work starts.
+  /// Use this to coalesce a burst of updates. Each arrival restarts the interval;
+  /// normal completion emits the final value immediately, while failure discards
+  /// it. Zero delivers every value; a negative duration causes a [RangeError]
+  /// defect before source work starts.
   ///
-  /// Downstream consumption pauses new source pulls. A pull already waiting when
-  /// a deadline expires remains active, and its result is kept for the next
-  /// demand. There is at most one candidate and one pending pull, in addition to
-  /// values retained downstream. The deadline uses the time the value was read,
-  /// so time spent waiting for the consumer does not restart the interval.
+  /// ```dart
+  /// final search = Flow.fromIterable(['d', 'da', 'dart'])
+  ///     .debounce(const Duration(milliseconds: 300))
+  ///     .toList();
+  /// // Running search produces ['dart']; end delivers the last value immediately.
+  /// ```
   ///
-  /// Each output has a scope for consuming callback resources. Its input stays
-  /// alive until that output is consumed. Cancellation follows [groupedWithin]'s
-  /// cleanup rules.
+  /// Slow downstream consumption pauses new reads, though one pending read may
+  /// finish. Its arrival time still counts toward the interval. This holds at
+  /// most one candidate and one pending read, beyond outputs retained downstream.
+  ///
+  /// Replacing a candidate releases its resources; delivered values and callback
+  /// resources remain alive until consumed. Cancellation follows [groupedWithin]'s
+  /// cleanup rules. Use [throttle] when every value must be delivered.
   Flow<T, E> debounce(Duration duration) =>
       _aggregate(this, null, duration).map((values) => values.single);
 
   /// Delivers every element with at least [duration] between deliveries.
   ///
-  /// The first element is immediate. Time spent producing the next element or
-  /// consuming the previous one counts toward the interval. End and failure
-  /// propagate without an interval delay. A zero duration preserves the source;
-  /// negative durations become [RangeError] defects before source work starts.
+  /// The first value is immediate. Source and consumer processing time count
+  /// toward the interval; completion and failure are never delayed. Unlike
+  /// [debounce], this does not discard values. Zero preserves the source; a
+  /// negative duration causes a [RangeError] defect before source work starts.
   ///
-  /// Pulling remains driven by downstream demand. At most one pulled element
-  /// waits for its deadline; no background producer or additional resource scope
-  /// is created. Waiting uses the current Clock's monotonic time, keeps the
-  /// element's resources alive, and is cancellable.
+  /// Reads happen only on downstream demand. A value waiting for its deadline
+  /// keeps its resources alive, and cancellation stops the wait. Timing uses the
+  /// current [Clock]'s monotonic time.
   Flow<T, E> throttle(Duration duration) => flowFromCursor(
     Task.defer(() {
       if (duration.isNegative) {

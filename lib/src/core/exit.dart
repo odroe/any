@@ -5,6 +5,18 @@ import 'cause.dart';
 /// [T] is the success value type and [E] is the business error type. An
 /// [ExitFailure] can also contain defects or cancellation, even when [E] is
 /// [Never]. Use pattern matching to distinguish success from failure.
+///
+/// Unlike a business result, an exit describes every way an execution can end.
+/// Its transformations run immediately and propagate callback exceptions.
+///
+/// ```dart
+/// const Exit<int, String> exit = Exit.success(42);
+/// final message = switch (exit) {
+///   ExitSuccess(:final value) => 'Completed: $value',
+///   ExitFailure(:final cause) => 'Failed: $cause',
+/// };
+/// assert(message == 'Completed: 42');
+/// ```
 sealed class Exit<T, E> {
   const Exit._();
 
@@ -20,7 +32,7 @@ final class ExitSuccess<T, E> extends Exit<T, E> {
   /// Creates a successful exit containing [value].
   const ExitSuccess(this.value) : super._();
 
-  /// The successful result, retained unchanged.
+  /// The successful result.
   final T value;
 }
 
@@ -29,15 +41,13 @@ final class ExitFailure<T, E> extends Exit<T, E> {
   /// Creates a failed exit containing [cause].
   const ExitFailure(this.cause) : super._();
 
-  /// The complete failure cause, retained unchanged.
+  /// The complete failure cause.
   final Cause<E> cause;
 }
 
 /// Success and business error transformations for [Exit].
 extension ExitMapping<T, E> on Exit<T, E> {
   /// Transforms a successful value, preserving a failed exit's cause.
-  ///
-  /// Errors thrown by [transform] propagate to the caller.
   Exit<U, E> map<U>(U Function(T value) transform) {
     final exit = this;
     return switch (exit) {
@@ -49,8 +59,7 @@ extension ExitMapping<T, E> on Exit<T, E> {
   /// Transforms business errors, preserving a successful exit's value.
   ///
   /// Delegates to [CauseMapping.mapError], preserving defects, cancellation,
-  /// and the order of failure reasons. Errors thrown by [transform] propagate
-  /// to the caller.
+  /// and the order of failure reasons.
   Exit<T, F> mapError<F>(F Function(E error) transform) {
     final exit = this;
     return switch (exit) {

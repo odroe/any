@@ -1,4 +1,4 @@
-/// Describes the reasons an execution failed.
+/// The business errors, defects, or cancellation behind a failed execution.
 ///
 /// A cause contains a business failure, an unexpected defect, a cancellation,
 /// or an ordered group of these reasons. [E] is the business error type; defects
@@ -6,6 +6,15 @@
 ///
 /// Use [Cause.combine] to preserve multiple failures, such as a business failure
 /// followed by failures while releasing resources.
+///
+/// ```dart
+/// final cause = Cause<String>.combine([
+///   const Cause.failure('Unable to save'),
+///   Cause.defect(StateError('Unable to close'), StackTrace.current),
+/// ]);
+/// final translated = cause.mapError((error) => 'Storage: $error');
+/// // Only the business error changes; the cleanup defect is preserved.
+/// ```
 sealed class Cause<E> {
   const Cause._();
 
@@ -55,7 +64,7 @@ final class CauseFailure<E> extends Cause<E> {
   /// Creates a business failure containing [error].
   const CauseFailure(this.error) : super._();
 
-  /// The business error, retained unchanged.
+  /// The business error.
   final E error;
 }
 
@@ -76,7 +85,7 @@ final class CauseCancelled extends Cause<Never> {
   /// Creates a cancellation with an optional [reason].
   const CauseCancelled([this.reason]) : super._();
 
-  /// Information about the cancellation request, retained unchanged.
+  /// Optional information about the cancellation request.
   final Object? reason;
 }
 

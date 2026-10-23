@@ -4,15 +4,23 @@ import 'random_source.dart';
 
 /// An immutable policy for deciding whether and when to run another attempt.
 ///
-/// A schedule governs executions after the initial attempt. Each execution of
-/// retry or repeat supplies its own iteration count and elapsed time; reusing a
-/// schedule does not share counters or consume the policy.
+/// Use a schedule with a task's `retry` or `repeat` operation. It governs attempts
+/// after the initial execution and can be reused without sharing counters.
+///
+/// For example, allow five retries with exponential backoff, capped at one
+/// second and randomized to avoid retrying clients waking together:
+///
+/// ```dart
+/// final policy = Schedule.exponential(const Duration(milliseconds: 100))
+///     .cap(const Duration(seconds: 1))
+///     .jitter()
+///     .limit(5);
+/// ```
 ///
 /// Combinators apply in call order. Delays are rounded to the nearest microsecond
-/// after all combinators have run. A final delay above `2^53 - 1` microseconds or
-/// a non-finite delay throws [RangeError], avoiding integer overflow and keeping
-/// the same supported range on native Dart and the web. Apply [cap] to bound an
-/// exponential delay before this conversion.
+/// after all combinators have run. A final delay must be finite and no greater
+/// than `2^53 - 1` microseconds; otherwise evaluation throws [RangeError]. Use
+/// [cap] to bound exponential growth before this conversion.
 final class Schedule {
   const Schedule._(this._delay);
 
@@ -57,9 +65,8 @@ final class Schedule {
 
   /// Continues only while both policies continue, using the longer delay.
   ///
-  /// Both policies receive the same iteration and elapsed time. This policy is
-  /// evaluated first; if it stops, [other] and its random draws are skipped.
-  /// A failure to evaluate either policy propagates to the caller.
+  /// Both policies receive the same iteration and elapsed time. If this policy
+  /// stops, [other] is not evaluated.
   Schedule and(Schedule other) => Schedule._((iteration, elapsed, random) {
     final left = _delay(iteration, elapsed, random);
     if (left == null) return null;
@@ -70,8 +77,8 @@ final class Schedule {
   /// Continues while either policy continues, using the shorter active delay.
   ///
   /// Both policies are evaluated from left to right with the same iteration
-  /// and elapsed time. If one stops, the other's delay is used. Evaluation
-  /// failures propagate even when the other policy could continue.
+  /// and elapsed time. If one stops, the other's delay is used. An evaluation
+  /// error still propagates even when the other policy could continue.
   Schedule or(Schedule other) => Schedule._((iteration, elapsed, random) {
     final left = _delay(iteration, elapsed, random);
     final right = other._delay(iteration, elapsed, random);
@@ -82,8 +89,8 @@ final class Schedule {
 
   /// Permits at most [count] additional executions under this policy.
   ///
-  /// The limit is checked before evaluating the underlying policy. It cannot
-  /// extend a policy that stops earlier. A negative [count] throws [RangeError].
+  /// A policy that stops earlier is not extended. Once the limit is reached,
+  /// the underlying policy is not evaluated. Negative counts throw [RangeError].
   Schedule limit(int count) {
     RangeError.checkNotNegative(count, 'count');
     return Schedule._(
@@ -94,10 +101,9 @@ final class Schedule {
 
   /// Limits this policy's delay to [maximum] without changing when it stops.
   ///
-  /// The cap is applied before conversion to [Duration], so it can bound an
-  /// exponential result even after the intermediate calculation overflows to
-  /// infinity. A later combinator can increase the delay again. A negative
-  /// [maximum] throws [RangeError].
+  /// Also bounds exponential overflow. Combinator order matters: a later
+  /// [jitter] can increase the delay beyond this cap when its multiplier exceeds
+  /// one. A negative [maximum] throws [RangeError].
   Schedule cap(Duration maximum) {
     _checkDuration(maximum, 'maximum');
     return Schedule._((iteration, elapsed, random) {
@@ -108,10 +114,10 @@ final class Schedule {
 
   /// Continues only when elapsed time at the decision is below [maximum].
   ///
-  /// This check happens before evaluating the underlying policy. It does not
-  /// shorten its delay or interrupt an attempt already running. An allowed
-  /// delay can therefore extend past [maximum]. Zero allows no additional
-  /// executions. A negative [maximum] throws [RangeError].
+  /// This is an admission limit, not a timeout: an allowed delay or attempt can
+  /// extend past [maximum]. Once the limit is reached, the underlying policy is
+  /// not evaluated. Zero allows no additional executions; negative durations
+  /// throw [RangeError].
   Schedule whileElapsed(Duration maximum) {
     _checkDuration(maximum, 'maximum');
     return Schedule._(
@@ -122,11 +128,10 @@ final class Schedule {
 
   /// Multiplies each continuing delay by a random factor between [min] and [max].
   ///
-  /// Both bounds must be finite and `0 <= min <= max`; otherwise this throws
-  /// [RangeError]. For unequal bounds, one draw `u` from [RandomSource.nextDouble]
-  /// gives the multiplier `min + (max - min) * u`, with `0 <= u < 1`. The lower
-  /// endpoint is included. Floating-point arithmetic and final microsecond
-  /// rounding can produce a delay equal to the rounded upper endpoint.
+  /// The default spreads retries from zero up to the original delay. Bounds
+  /// must be finite and satisfy `0 <= min <= max`, or this throws [RangeError].
+  /// The multiplier is sampled from `[min, max)`; floating-point arithmetic and
+  /// microsecond rounding can produce the rounded upper endpoint.
   ///
   /// Stopped policies, zero delays, and equal bounds consume no random draw.
   /// Equal bounds apply a fixed multiplier. An invalid random draw throws

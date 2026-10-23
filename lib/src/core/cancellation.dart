@@ -1,15 +1,18 @@
 import 'dart:async';
 
-/// Sends a cancellation request to a read-only [signal].
+/// The authority to request cancellation through a shared [signal].
 ///
-/// Cancellation is synchronous and cooperative. Requesting it notifies listeners;
-/// it does not wait for their work or resource cleanup to finish.
+/// Pass [signal] to work that should respond to cancellation, and keep the
+/// controller with the caller that decides when to stop. A request is cooperative:
+/// listeners are notified synchronously, but the request does not wait for work
+/// or resource cleanup to finish.
 final class CancellationController {
-  /// Creates a controller that has not been cancelled.
+  /// Creates a controller with an uncancelled signal.
   ///
-  /// Synchronous listener exceptions are passed to [onError]. When it is omitted,
-  /// the creating zone reports them through [Zone.handleUncaughtError]. If
-  /// [onError] throws, its exception is also reported to the creating zone.
+  /// [onError] receives synchronous exceptions from cancellation listeners. By
+  /// default, they are reported to the creating [Zone]. An exception thrown by
+  /// [onError] is also reported to that zone; it does not prevent other listeners
+  /// from being notified.
   CancellationController({
     void Function(Object error, StackTrace stackTrace)? onError,
   }) : _signal = _CancellationSignal(onError, Zone.current);
@@ -19,43 +22,44 @@ final class CancellationController {
   /// The read-only signal associated with this controller.
   CancellationSignal get signal => _signal;
 
-  /// Requests cancellation, notifying listeners synchronously.
+  /// Requests cancellation with an optional diagnostic [reason].
   ///
-  /// The first request fixes [reason], including `null`. Later requests have
-  /// no effect. The signal is marked cancelled before any listener is called.
-  /// Listener exceptions are reported without preventing later notifications.
+  /// Only the first request takes effect, including when its reason is `null`.
+  /// The signal is marked cancelled before listeners are notified synchronously.
+  /// Listener exceptions are reported through this controller's error handler;
+  /// remaining listeners still run.
   void requestCancel({Object? reason}) => _signal._requestCancel(reason);
 }
 
-/// A read-only cancellation signal created by a [CancellationController].
+/// A read-only view of a cancellation request.
 ///
-/// A `null` [reason] can mean either no cancellation or cancellation without a
-/// reason. Check [isCancelled] to distinguish them.
+/// Obtain a signal from [CancellationController.signal]. Consumers can inspect
+/// [isCancelled] or subscribe with [onCancel]; only the controller can request
+/// cancellation.
 sealed class CancellationSignal {
   const CancellationSignal._();
 
   /// Whether cancellation has been requested.
   bool get isCancelled;
 
-  /// The first cancellation reason, or `null` when no reason is available.
+  /// The reason supplied with the first cancellation request, if any.
   ///
-  /// Use [isCancelled] to determine whether cancellation has been requested.
+  /// A `null` reason may mean no request or a request without a reason. Check
+  /// [isCancelled] to distinguish them.
   Object? get reason;
 
-  /// Registers [listener] and returns a function that removes this subscription.
+  /// Subscribes to cancellation and returns an unsubscribe function.
   ///
-  /// Pending listeners are notified synchronously in registration order. If this
-  /// signal is already cancelled, [listener] is called before this method
-  /// returns. Each registration receives at most one notification, even when
-  /// the same callback is registered more than once.
+  /// [listener] is called synchronously in registration order. For an already
+  /// cancelled signal, it runs before this method returns. Each registration is
+  /// notified at most once, including duplicate registrations of one callback.
   ///
-  /// Removing a subscription is idempotent. It prevents a notification that
-  /// has not started, including removal by an earlier listener during
-  /// cancellation. It cannot stop a callback that is already running.
+  /// The unsubscribe function is safe to call repeatedly. It prevents any
+  /// notification that has not started, even when called by an earlier listener.
+  /// It cannot stop a listener that is already running.
   ///
-  /// Synchronous listener exceptions are reported through the controller's
-  /// error handler and do not prevent other notifications. Asynchronous work
-  /// started by [listener] is not awaited.
+  /// Listener exceptions go to the controller's error handler without preventing
+  /// other notifications. Asynchronous work started by a listener is not awaited.
   void Function() onCancel(void Function(Object? reason) listener);
 }
 

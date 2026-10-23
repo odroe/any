@@ -8,11 +8,34 @@ import 'redacted.dart';
 import 'result.dart';
 import 'task.dart';
 
-/// A lazy description of a value loaded from a [ConfigProvider].
+/// A typed configuration value to load from a [ConfigProvider].
 ///
 /// [load] reads the provider bound to [ConfigProvider.key] on each execution.
 /// Constructing and combining descriptions does not read or parse values.
 /// Names are single path segments; use [ConfigOperations.nested] for prefixes.
+/// Parsing problems are reported as [ConfigError]; unexpected exceptions are
+/// defects. Combine independent settings with [ConfigOperations.zip] or [all]
+/// to report their configuration problems together.
+///
+/// ```dart
+/// final server = Config.string('host')
+///     .withDefault('localhost')
+///     .zip(Config.int('port').withDefault(8080))
+///     .nested('server');
+/// final runtime = Runtime(
+///   context: Context.from([
+///     ConfigProvider.key.bind(
+///       ConfigProvider.fromMap({'server.port': '9090'}),
+///     ),
+///   ]),
+/// );
+/// try {
+///   final (host, port) = await runtime.runOrThrow(server.load());
+///   assert(host == 'localhost' && port == 9090);
+/// } finally {
+///   await runtime.close();
+/// }
+/// ```
 final class Config<T> {
   Config._(this._read);
 
@@ -37,11 +60,10 @@ final class Config<T> {
   /// Matching is case-sensitive; other spellings and numeric values are invalid.
   static Config<core.bool> bool(String name) => parse(name, _parseBool);
 
-  /// Reads [name] and parses its value with [parse].
+  /// Describes a field decoded by a custom [parse] callback.
   ///
-  /// Parser failures receive the full field path before their own relative
-  /// paths. Source errors already contain their paths and pass through unchanged.
-  /// Exceptions thrown by [parse] remain defects.
+  /// Return [ResultFailure] for invalid input. The field's full path is prepended
+  /// to the parser's error paths; source error paths are left unchanged.
   static Config<T> parse<T>(
     String name,
     Result<T, ConfigError> Function(String value) parse,
@@ -59,15 +81,14 @@ final class Config<T> {
         );
   });
 
-  /// Reads a delimited list and parses each element with [parse].
+  /// Describes an immutable list of values separated by [separator].
   ///
   /// An empty raw string produces an empty list. Other values are split on the
   /// literal [separator], retaining empty elements. Each element is trimmed
   /// when [trim] is `true`; its parser determines whether an empty element is
   /// valid. All parser failures are accumulated with zero-based index paths.
   ///
-  /// The result is immutable. An empty separator produces an [ArgumentError]
-  /// defect on execution, before reading. Parser exceptions remain defects.
+  /// An empty [separator] produces an [ArgumentError] defect when loaded.
   static Config<List<T>> list<T>(
     String name, {
     required Result<T, ConfigError> Function(String value) parse,
@@ -106,11 +127,10 @@ final class Config<T> {
     );
   }
 
-  /// Loads [configs] in order, accumulating their expected configuration errors.
+  /// Combines [configs] into an immutable list, collecting configuration errors.
   ///
-  /// Defects and cancellation stop loading and retain their original cause.
-  /// The descriptions are copied when this method is called. Each execution
-  /// reads them afresh, returning an immutable list, including for empty input.
+  /// Descriptions are copied now and loaded in order on each execution. Empty
+  /// input produces an empty list. Defects and cancellation stop loading.
   static Config<List<T>> all<T>(Iterable<Config<T>> configs) {
     final inputs = List<Config<T>>.unmodifiable(configs);
     return Config._(
@@ -149,16 +169,16 @@ final class Config<T> {
           .flatMap((provider) => _read(provider, const []));
 }
 
-/// Composes configurations using their statically known value types.
+/// Composition, defaults, and path prefixes for configuration values.
 extension ConfigOperations<T> on Config<T> {
-  /// Transforms a loaded value; exceptions from [transform] become defects.
+  /// Transforms a successfully loaded value.
   Config<U> map<U>(U Function(T value) transform) =>
       Config._((provider, prefix) => _read(provider, prefix).map(transform));
 
   /// Selects another configuration after successfully loading this value.
   ///
-  /// Both descriptions use the same provider and enclosing path prefix.
-  /// Exceptions from [next] become defects.
+  /// Both descriptions use the same provider and enclosing path prefix. Use
+  /// [zip] for independent fields whose errors should be collected together.
   Config<U> flatMap<U>(Config<U> Function(T value) next) => Config._(
     (provider, prefix) => _read(
       provider,
@@ -169,7 +189,7 @@ extension ConfigOperations<T> on Config<T> {
   /// Loads both descriptions in order and returns their values as a record.
   ///
   /// Expected configuration problems from both sides are accumulated in order.
-  /// A defect or cancellation stops loading without becoming a ConfigError.
+  /// A defect or cancellation stops loading without becoming a [ConfigError].
   Config<(T, U)> zip<U>(Config<U> other) => Config._(
     (provider, prefix) => _capture(_read(provider, prefix)).flatMap(
       (left) => _capture(other._read(provider, prefix)).flatMap(
@@ -192,10 +212,11 @@ extension ConfigOperations<T> on Config<T> {
   Config<T> nested(String name) =>
       Config._((provider, prefix) => _read(provider, [...prefix, name]));
 
-  /// Returns absence only when every reported problem is a missing value.
+  /// Makes missing configuration optional.
   ///
-  /// Invalid values, source errors, defects, and cancellation remain failures.
-  /// A present nullable value remains [OptionSome].
+  /// Produces [OptionNone] only when every reported problem is a missing value.
+  /// Invalid values, source errors, defects, and cancellation remain failures;
+  /// a present nullable value remains [OptionSome].
   Config<Option<T>> optional() => Config._(
     (provider, prefix) => _read(provider, prefix)
         .map<Option<T>>(Option.some)

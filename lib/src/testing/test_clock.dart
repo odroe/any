@@ -3,12 +3,23 @@ import 'dart:collection';
 
 import 'package:any/any.dart';
 
-/// A clock whose time and timers advance only when the test requests it.
+/// A manually advanced clock for deterministic tests of time-dependent behavior.
 ///
 /// Bind an instance to [Clock.key] when creating a [Runtime] or providing a
-/// [Context]. Timers run during [advance], in deadline order, with equal
-/// deadlines ordered by registration. Advancing does not wait for asynchronous
-/// work started by a timer; await the relevant task or registration separately.
+/// [Context]. Wait for the code under test to register its timers before calling
+/// [advance]. Advancing fires due timers synchronously but does not await any
+/// asynchronous work they start; await the relevant task separately.
+///
+/// ```dart
+/// final clock = TestClock();
+/// var expired = false;
+/// clock.schedule(const Duration(seconds: 30), () => expired = true);
+///
+/// clock.advance(const Duration(seconds: 29));
+/// assert(!expired);
+/// clock.advance(const Duration(seconds: 1));
+/// assert(expired);
+/// ```
 final class TestClock implements Clock {
   /// Creates a clock at [start], or the Unix epoch, with zero elapsed time.
   TestClock({DateTime? start})
@@ -56,15 +67,14 @@ final class TestClock implements Clock {
 
   /// Advances time by [duration] and synchronously fires every due timer.
   ///
-  /// Each callback observes its own deadline as the current time. Timers
-  /// registered by callbacks also fire if their deadline falls within this
-  /// advance. A zero duration fires timers already due, including zero-delay
-  /// timers; [schedule] itself never invokes a callback inline.
+  /// Callbacks run in deadline order, with registration order breaking ties.
+  /// Each observes its own deadline as the current time. Timers registered by
+  /// callbacks also fire if due within this advance. Use [Duration.zero] to fire
+  /// timers already due; [schedule] never invokes a callback inline.
   ///
   /// Throws [ArgumentError] for a negative duration, [RangeError] if elapsed
-  /// time would exceed the largest exactly representable JavaScript integer
-  /// (2^53 - 1 microseconds), or [StateError] for a reentrant call. Wall time
-  /// must remain within [DateTime]'s supported range. Callback exceptions go
+  /// time would exceed `2^53 - 1` microseconds, or [StateError] for a reentrant
+  /// call. Wall time must remain within [DateTime]'s supported range. Errors go
   /// to the registration zone and do not prevent other timers from firing.
   void advance(Duration duration) {
     if (_advancing) throw StateError('TestClock.advance is not reentrant.');

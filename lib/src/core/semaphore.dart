@@ -3,11 +3,15 @@ import 'dart:collection';
 import 'exit.dart';
 import 'task.dart';
 
-/// A fixed set of permits shared by tasks in the same isolate.
+/// A fixed number of permits for limiting concurrent work within an isolate.
 ///
-/// [SemaphoreOperations.withPermits] waits for all requested permits, runs a
-/// task, and returns them after its scoped resources finish closing. Requests
-/// are served in arrival order; smaller requests cannot bypass the queue head.
+/// Use [SemaphoreOperations.withPermits] to run tasks under a shared limit.
+/// Requesting one permit limits the number of concurrent operations; requesting
+/// several lets more expensive operations consume a larger share of capacity.
+/// Permits remain held until the task's scoped resources finish closing.
+///
+/// Requests are served in arrival order. A smaller request waits behind an
+/// earlier request even when enough permits are available for the smaller one.
 final class Semaphore {
   Semaphore._(this._capacity) : _available = _capacity;
 
@@ -16,11 +20,10 @@ final class Semaphore {
   final _waiting = Queue<_PermitRequest>();
   var _draining = false;
 
-  /// Creates a semaphore with [permits] available on each execution.
+  /// Creates a semaphore with [permits] available.
   ///
-  /// [permits] must be positive. An invalid value becomes a [RangeError] defect
-  /// when the returned task executes. Repeated executions create independent
-  /// semaphores.
+  /// [permits] must be positive; otherwise execution fails with a [RangeError]
+  /// defect. Each execution creates an independent semaphore.
   static Task<Semaphore, Never> create(int permits) => Task.sync(() {
     if (permits <= 0) throw RangeError.range(permits, 1, null, 'permits');
     return Semaphore._(permits);
@@ -53,20 +56,21 @@ final class Semaphore {
   }
 }
 
-/// Runs tasks while holding permits from a [Semaphore].
+/// Runs tasks within a semaphore's capacity.
 extension SemaphoreOperations on Semaphore {
-  /// Waits for [count] permits and holds them until [task] and its cleanup finish.
+  /// Runs [task] with [count] permits and releases them after cleanup.
   ///
-  /// Waiting and task execution respect the caller's cancellation state. A
-  /// cancelled waiter leaves the queue without affecting other requests. Once
-  /// granted, permits are returned on success, failure, or cancellation,
-  /// including cancellation during the handoff to [task].
+  /// Waits for enough permits, then returns the task's result or failure.
+  /// [count] must be positive and no greater than capacity; an invalid value
+  /// fails with a [RangeError] defect before [task] starts.
   ///
-  /// [count] must be positive and no greater than this semaphore's capacity.
-  /// An invalid value becomes a [RangeError] defect when executed, before
-  /// [task] starts. Each execution makes a separate request. Requests do not
-  /// inherit permits already held by the caller: a nested request waits in
-  /// the same queue and can deadlock if the caller holds permits it needs.
+  /// Waiting and execution respect the caller's cancellation state. A cancelled
+  /// waiter leaves other requests unaffected. Granted permits are returned on
+  /// success, failure, or cancellation, including cancellation before [task]
+  /// starts.
+  ///
+  /// Nested requests do not reuse permits held by the caller. They can wait
+  /// forever when the caller holds permits they need.
   Task<T, E> withPermits<T, E>(int count, Task<T, E> task) =>
       Task.uninterruptibleMask<T, E>((restore) {
         RangeError.checkValueInInterval(count, 1, _capacity, 'count');

@@ -15,123 +15,156 @@ import 'schedule.dart';
 import 'scope.dart';
 import 'task_local.dart';
 
-/// A lazy computation producing a value of type [T] or a business error [E].
+/// A reusable description of work that produces a value or a typed error.
 ///
-/// Constructing and combining tasks does not run their callbacks. Each execution
-/// starts with independent state. Unexpected exceptions become defects, and
-/// cancellation remains separate from business errors, including when [E] is
-/// [Never]. Cancellation is observed only while enabled; [uninterruptibleMask]
-/// can defer it across a critical section.
+/// [T] is the success value and [E] is the expected business error. Constructing
+/// or combining tasks does not execute their callbacks. A runtime starts an
+/// execution; each run evaluates the description independently.
+///
+/// ```dart
+/// var calls = 0;
+/// final next = Task.sync(() => ++calls).map((value) => value * 10);
+/// assert(calls == 0);
+/// final runtime = Runtime();
+/// try {
+///   final first = await runtime.runOrThrow(next);
+///   final second = await runtime.runOrThrow(next);
+///   assert(first == 10);
+///   assert(second == 20);
+/// } finally {
+///   await runtime.close();
+/// }
+/// ```
+///
+/// Use [TaskOperations.map] to transform a value and [TaskOperations.flatMap] to
+/// continue with another task. [sync], [fromFuture], and [fromCallback] bridge
+/// Dart operations; [acquireRelease] gives resources a scoped lifetime.
+///
+/// An execution ends with an [Exit]. Its [Cause] distinguishes business failures,
+/// unexpected exceptions (defects), and cancellation. [Never] rules out business
+/// errors, not defects or cancellation. Callback exceptions become defects unless
+/// an operation explicitly maps them to business errors.
+///
+/// Cancellation is cooperative: it stops further work when enabled and waits for
+/// owned resources to be cleaned up. [uninterruptibleMask] can defer cancellation
+/// across a critical section.
 final class Task<T, E> {
   const Task._(this._node);
 
   final _Node _node;
 
-  /// Writes a structured log event through the current [Logger].
+  /// Writes a structured event through the current [Logger].
   ///
-  /// [fields] are shallow-copied now and override inherited log fields when
-  /// this task runs. Records below the logger's threshold are skipped before
-  /// reading the clock. Backend errors are reported independently and do not
-  /// fail this task. An accepted write is awaited, including during cancellation.
+  /// [fields] are copied when this method is called and override inherited fields.
+  /// Events below the configured threshold are skipped without reading the clock.
+  ///
+  /// An accepted write is awaited even if cancellation arrives. Backend errors are
+  /// reported separately and do not fail the task.
   static Task<void, Never> log(
     String message, {
     LogLevel level = LogLevel.info,
     Map<String, Object?> fields = const {},
   }) => logTask(message, level: level, fields: fields);
 
-  /// Waits for [duration] using the clock in the current context.
+  /// Waits for [duration] using the current context's clock.
   ///
-  /// The timer is registered only when this task runs. Nonpositive durations
-  /// schedule a zero-delay timer. Cancellation removes the timer and stops the
-  /// wait. Use [yieldNow] to yield directly to the host event loop instead.
+  /// Nonpositive durations use a zero-delay timer. Cancellation removes the timer
+  /// and ends the wait. Use [yieldNow] to let other event-loop work advance without
+  /// specifying a delay.
   static Task<void, Never> sleep(Duration duration) => sleepTask(duration);
 
-  /// Runs [tasks] with at most [concurrency] active executions.
+  /// Collects successful task results in input order.
   ///
-  /// The default runs sequentially. Results are immutable and retain input
-  /// order. Input is read lazily as capacity becomes available; use a finite
-  /// iterable because all results are retained. An empty input succeeds with
-  /// an empty list. Nonpositive concurrency becomes an [ArgumentError] defect.
+  /// [concurrency] limits active executions and defaults to sequential execution.
+  /// The iterable is read as capacity becomes available and must be finite. The
+  /// returned list is immutable; empty input produces an empty list. Nonpositive
+  /// concurrency fails with an [ArgumentError] defect.
   ///
-  /// A failure stops new work, cancels active siblings, and waits for their
-  /// cleanup. Already observed failures are combined in completion order;
-  /// cancellation requested by this operation does not add a separate cause.
-  /// Owner cancellation follows the usual Task rules and preserves defects.
+  /// A failure stops new work, cancels active siblings, and waits for cleanup.
+  /// Observed failures are combined in completion order. Cancellation used to stop
+  /// siblings adds no separate cause. Owner cancellation also waits for cleanup
+  /// and retains defects from interrupted work.
   static Task<List<T>, E> all<T, E>(
     Iterable<Task<T, E>> tasks, {
     int concurrency = 1,
   }) => computeAll(tasks, concurrency: concurrency);
 
-  /// Applies [action] lazily to [values], preserving input order in the results.
+  /// Applies [action] to each value and collects results in input order.
   ///
-  /// At most [concurrency] actions run at once. Each action is created only
-  /// when its execution starts. Iteration and action exceptions become defects.
-  /// Failure, cancellation, finite-input, and cleanup rules are those of [all].
+  /// Each action is created only when a concurrency slot is available. Iteration
+  /// and callback exceptions become defects. Input must be finite; concurrency,
+  /// failure, cancellation, and immutable-result behavior follow [all].
   static Task<List<T>, E> forEach<A, T, E>(
     Iterable<A> values,
     Task<T, E> Function(A value) action, {
     int concurrency = 1,
   }) => computeForEach(values, action, concurrency: concurrency);
 
-  /// Runs every input and collects its complete exit in input order.
+  /// Collects every task's [Exit], allowing individual inputs to fail.
   ///
-  /// Individual failures, including defects and cancellation, are values in
-  /// the returned immutable list and do not stop other inputs. Input iteration
-  /// errors still fail the operation. Owner cancellation stops remaining work
-  /// and waits for cleanup, preserving defects that have not been delivered.
-  /// Concurrency, lazy input, and empty-input rules are those of [all].
+  /// Results form an immutable list in input order. Business failures, defects,
+  /// and explicit cancellation are represented as exits and do not stop other
+  /// inputs. Iteration errors still fail the operation.
+  ///
+  /// Concurrency and input requirements follow [all]. Owner cancellation stops
+  /// remaining work and waits for cleanup; defects that have not been delivered
+  /// in the result remain in the cancellation cause.
   static Task<List<Exit<T, E>>, Never> allSettled<T, E>(
     Iterable<Task<T, E>> tasks, {
     int concurrency = 1,
   }) => computeAllSettled(tasks, concurrency: concurrency);
 
-  /// Uses the first completed execution from a finite iterable of [tasks].
+  /// Returns the outcome of the first task to complete.
   ///
-  /// Participants run concurrently. Once an exit is observed, no new inputs
-  /// start; active losers are cancelled and their cleanup is awaited. The
-  /// winner's value or cause determines the result, but any loser defect is
-  /// retained and can turn a winning success into failure. Loser business errors
-  /// and this operation's cancellation requests do not replace the winner.
-  /// Empty input becomes an [ArgumentError] defect when executed.
+  /// The finite input is started concurrently. Once a winner is observed, no more
+  /// inputs start, and active losers are cancelled and cleaned up before returning.
+  /// Empty input fails with an [ArgumentError] defect.
+  ///
+  /// Loser business failures do not change the winner. Loser defects, including
+  /// cleanup defects, are retained and can turn a winning success into failure.
+  /// Cancellation used to stop losers adds no separate cause.
   static Task<T, E> race<T, E>(Iterable<Task<T, E>> tasks) =>
       computeRace(tasks);
 
-  /// Uses the first successful execution, or combines failures if all fail.
+  /// Returns the first successful result, or fails if every task fails.
   ///
-  /// A success recovers other participants' business failures. Defects are
-  /// always retained, including failures during loser cleanup. Active losers
-  /// are cancelled and fully cleaned up before returning. All-failure causes
-  /// follow completion order. Input must be finite; empty input becomes an
-  /// [ArgumentError] defect. As with [race], a decision stops further input.
+  /// Tasks run concurrently. The first success stops further input, cancels active
+  /// losers, and waits for their cleanup. Input must be finite and nonempty; empty
+  /// input fails with an [ArgumentError] defect.
+  ///
+  /// A winner recovers other participants' business failures. Defects are always
+  /// retained, including loser cleanup failures, and can prevent success. If all
+  /// participants fail, their causes are combined in completion order.
   static Task<T, E> firstSuccess<T, E>(Iterable<Task<T, E>> tasks) =>
       computeFirstSuccess(tasks);
 
-  /// Runs two tasks and returns their values as a record in argument order.
+  /// Combines two successful results into a Dart record.
   ///
-  /// The default executes [left] before [right]. A [concurrency] of two or more
-  /// runs both concurrently; other validation and failure rules follow [all].
+  /// The record contains [left]'s value followed by [right]'s value. The default
+  /// runs left then right; [concurrency] of two or more runs both concurrently.
+  /// Validation, failure, and cleanup follow [all].
   static Task<(A, B), E> zip<A, B, E>(
     Task<A, E> left,
     Task<B, E> right, {
     int concurrency = 1,
   }) => computeZip(left, right, concurrency: concurrency);
 
-  /// Reads [key] from the services available when this task executes.
+  /// Returns a task that reads the service identified by [key].
   ///
-  /// Runtime installs the application's services. A local [provideContext]
-  /// can replace bindings for a computation and its children. A missing key
-  /// produces a [MissingService] defect; nullable service values are preserved.
+  /// Services come from the runtime or a local [TaskOperations.provideContext].
+  /// A missing binding fails with a [MissingService] defect. A nullable service
+  /// bound to `null` is still present and succeeds with that value.
   static Task<T, Never> service<T>(ServiceKey<T> key) =>
       Task._(_Service((context) => context.read(key)));
 
-  /// Describes a computation that succeeds with [value].
+  /// Creates a task that succeeds with the already available [value].
   static Task<T, Never> succeed<T>(T value) => Task._(_Success(value));
 
-  /// Runs [task] only when [condition] returns true during this execution.
+  /// Runs [task] conditionally, returning its value as an [Option].
   ///
-  /// A skipped computation succeeds with [OptionNone]; a computed value,
-  /// including `null`, is wrapped in [OptionSome]. The condition is checked once
-  /// per execution, and exceptions from it become defects.
+  /// [condition] is evaluated once per execution. A false result skips the task
+  /// and returns [OptionNone]; a successful task produces [OptionSome], including
+  /// for a `null` value. An exception from the condition becomes a defect.
   static Task<Option<T>, E> when<T, E>(
     bool Function() condition,
     Task<T, E> task,
@@ -141,15 +174,14 @@ final class Task<T, E> {
         : Task.succeed(const Option.none()),
   );
 
-  /// Repeatedly applies [step] while [whileTrue] accepts the current state.
+  /// Updates a state with [step] until [whileTrue] returns false.
   ///
-  /// Each execution begins with [initial]. The condition is checked before
-  /// every step; the first state it rejects is returned. Failures stop the loop,
-  /// and exceptions in either callback become defects. Synchronous loops are
-  /// stack safe and use the executor's cooperative cancellation checks.
+  /// Each execution starts at [initial]. The condition is checked before each
+  /// step; the first rejected state is the result. Failures stop the loop.
+  /// Synchronous loops are stack safe and respond to cooperative cancellation.
   ///
-  /// Steps share the current resource scope. Apply [TaskOperations.scoped] to a
-  /// step when its resources must be released before the next iteration.
+  /// Steps share one resource scope. Wrap a step in [TaskOperations.scoped] to
+  /// release its resources before the next iteration.
   static Task<S, E> loop<S, E>(
     S initial, {
     required bool Function(S state) whileTrue,
@@ -161,12 +193,14 @@ final class Task<T, E> {
         : Task.succeed(initial),
   );
 
-  /// Reduces [values] sequentially with a task-producing [combine] callback.
+  /// Reduces [values] to one state through sequential tasks.
   ///
-  /// Each execution creates a new iterator and starts with [initial]. The next
-  /// element is read only after the preceding task succeeds. Empty input
-  /// returns [initial]; iteration or callback exceptions become defects.
-  /// Combiner tasks share the current resource scope, like [flatMap].
+  /// Starts with [initial] and reads the next element only after [combine]'s
+  /// previous task succeeds. Empty input returns [initial]. Each execution creates
+  /// a new iterator; iteration and callback exceptions become defects.
+  ///
+  /// Combiner tasks share the current scope. Use [TaskOperations.scoped] for
+  /// resources that should be released after each element.
   static Task<S, E> fold<A, S, E>(
     Iterable<A> values,
     S initial,
@@ -181,48 +215,54 @@ final class Task<T, E> {
     return next(initial);
   });
 
-  /// Describes a computation that fails with the business [error].
+  /// Creates a task that fails with the expected business [error].
   static Task<Never, E> fail<E>(E error) =>
       Task._(_Failure(Cause.failure(error)));
 
-  /// Describes a computation that fails with the complete [cause].
+  /// Creates a task that fails with a complete [cause].
+  ///
+  /// Use [fail] for one business error. This constructor also accepts defects,
+  /// explicit cancellation, and grouped failures.
   static Task<Never, E> failCause<E>(Cause<E> cause) => Task._(_Failure(cause));
 
-  /// Calls [body] on each execution, treating thrown objects as defects.
+  /// Creates a task that evaluates synchronous [body] on each run.
+  ///
+  /// Thrown objects become defects. Use [trySync] to map expected exceptions into
+  /// business errors.
   static Task<T, Never> sync<T>(T Function() body) => Task._(_Sync(body));
 
-  /// Calls [body] on each execution and maps its exceptions with [onError].
+  /// Creates a synchronous task whose exceptions become business errors.
   ///
-  /// If [onError] itself throws, its exception and stack trace become a defect.
+  /// [body] runs once per execution. [onError] receives a thrown object and its
+  /// original stack trace. An exception from [onError] becomes a defect.
   static Task<T, E> trySync<T, E>(
     T Function() body, {
     required E Function(Object error, StackTrace stackTrace) onError,
   }) => Task._(_Sync(body, onError));
 
-  /// Calls [create] on each execution and continues with the returned task.
+  /// Defers task construction until execution.
   ///
-  /// Use this to defer a choice or describe recursion without building the
-  /// entire computation up front. Exceptions from [create] become defects.
+  /// [create] runs on each execution, and its returned task supplies the result.
+  /// Use this for choices that depend on current state or for lazy recursion.
+  /// An exception from [create] becomes a defect.
   static Task<T, E> defer<T, E>(Task<T, E> Function() create) =>
       Task._(_Suspend(() => create()._node));
 
-  /// Defers cancellation while executing the task returned by [body].
+  /// Protects a critical section from cancellation.
   ///
-  /// [body] runs lazily on each execution with cancellation disabled. Its
-  /// `restore` function wraps a task with the cancellation state that was active
-  /// before this mask. Nested masks therefore cannot enable cancellation that
-  /// was already disabled. Leaving either region restores its enclosing state,
-  /// including when a callback throws.
+  /// [body] receives a [RestoreCancellation] function and runs with cancellation
+  /// disabled. Wrap interruptible work with `restore` to use the cancellation
+  /// state from before this mask. A nested mask cannot restore cancellation that
+  /// was already disabled.
   ///
-  /// Pending cancellation is observed when cancellation becomes enabled again.
-  /// Defects already produced by the body are retained alongside cancellation.
-  /// A task that never completes while masked can indefinitely delay
-  /// cancellation; use `restore` around work that should remain cancellable.
-  /// Cancellation observed before this mask starts prevents [body] from running.
+  /// Pending cancellation takes effect when cancellation becomes enabled again,
+  /// retaining defects produced in the protected region. Work that never finishes
+  /// while masked can delay cancellation indefinitely. A request observed before
+  /// entry prevents the body from starting.
   ///
-  /// `restore` only captures a cancellation state, not an execution or signal.
-  /// Tasks it returns are lazy and may be reused, including in another execution,
-  /// where they use that execution's signal with the captured state.
+  /// Cancellation state is restored when a region ends, including on failure.
+  /// The `restore` function captures that state, not a particular execution or
+  /// signal, so tasks built with it remain reusable.
   static Task<T, E> uninterruptibleMask<T, E>(
     Task<T, E> Function(RestoreCancellation restore) body,
   ) => Task._(
@@ -234,84 +274,88 @@ final class Task<T, E> {
     ),
   );
 
-  /// Describes the already available business [result].
+  /// Creates a task from an already available business [result].
+  ///
+  /// A [ResultSuccess] becomes task success; a [ResultFailure] becomes a business
+  /// failure. Use [defer] if the result itself must be calculated on each run.
   static Task<T, E> fromResult<T, E>(Result<T, E> result) =>
       Task._(switch (result) {
         ResultSuccess(:final value) => _Success(value),
         ResultFailure(:final error) => _Failure(Cause.failure(error)),
       });
 
-  /// Starts a new Future on each execution and maps exceptions with [onError].
+  /// Creates a task from an asynchronous Dart operation.
   ///
-  /// Both synchronous exceptions from [create] and errors completing its Future
-  /// are mapped. An exception thrown by [onError] becomes a defect.
+  /// [create] starts a new [Future] on each run. [onError] maps synchronous throws
+  /// and future errors into business errors; an exception from the mapper becomes
+  /// a defect.
   ///
-  /// A Future cannot be cancelled. If enabled cancellation arrives after it
-  /// starts, execution waits for it to settle before returning. No subsequent
-  /// business callback runs. A Future error observed after cancellation is
-  /// retained as a defect with its original stack trace alongside cancellation;
-  /// [onError] is skipped. This also applies to a synchronous exception from
-  /// [create] if it requests cancellation before throwing. While cancellation is
-  /// masked, [onError] and subsequent callbacks run normally.
+  /// A future cannot be cancelled. If enabled cancellation arrives after the
+  /// operation starts, the task waits for it to settle and skips subsequent
+  /// business callbacks. A late error is retained as a defect with its original
+  /// stack trace, alongside cancellation, without calling [onError]. This also
+  /// applies if [create] requests cancellation before throwing synchronously.
+  /// While cancellation is masked, normal error mapping and callbacks continue.
   static Task<T, E> fromFuture<T, E>(
     Future<T> Function() create, {
     required E Function(Object error, StackTrace stackTrace) onError,
   }) => Task._(_FromFuture(create, onError));
 
-  /// Registers a callback operation each time this task executes.
+  /// Creates a cancellable task from a callback-based operation.
   ///
-  /// [register] receives a completion callback and synchronously returns a
-  /// cancellation function. The first completion wins; duplicate and late
-  /// completions are ignored. A registration exception becomes a defect, even
-  /// if completion was already called synchronously. If that completion failed,
-  /// its cause is retained before the registration defect.
+  /// [register] receives a completion callback and must synchronously return a
+  /// cancellation function. Complete with an [Exit] to deliver the result. The
+  /// first completion wins; duplicate and late completions are ignored.
   ///
-  /// Enabled cancellation waits for the returned function to stop using resources
-  /// and finish cleanup. Cancellation during registration waits for [register] to
-  /// return before calling that function. An operation that completed before
-  /// cancellation does not receive a cancellation call. Cleanup exceptions keep
-  /// their original object and stack trace alongside cancellation. Cleanup runs
-  /// in the Zone where registration executed, including after asynchronous gaps.
-  /// A masked operation waits for completion without calling its cancellation
-  /// function.
+  /// When enabled cancellation arrives first, the task calls the cancellation
+  /// function and awaits its cleanup. A request during registration waits until
+  /// [register] returns. An already completed operation is not cancelled; a masked
+  /// operation keeps waiting for completion.
+  ///
+  /// A registration exception becomes a defect even after synchronous completion.
+  /// If that completion failed, its cause precedes the registration defect.
+  /// Cancellation cleanup runs in the registration [Zone]; thrown objects retain
+  /// their original stack traces as defects alongside cancellation.
   static Task<T, E> fromCallback<T, E>(
     FutureOr<void> Function() Function(void Function(Exit<T, E> exit) complete)
     register,
   ) => Task._(_FromCallback((complete) => register(complete)));
 
-  /// Checks for owner cancellation when this task executes.
+  /// Stops at this point if enabled cancellation has been requested.
   ///
-  /// Succeeds with no value if cancellation has not been requested or is masked.
-  /// An enabled request terminates execution before the next business callback.
+  /// Otherwise succeeds with no value. A masked request is deferred until
+  /// cancellation becomes enabled.
   static Task<void, Never> checkCancelled() => const Task._(_Success(null));
 
-  /// Yields to the event loop before continuing with the next task.
+  /// Lets timers and other ready event-loop work run before continuing.
   ///
-  /// Timers and other ready work can advance. Enabled cancellation received
-  /// while yielding terminates execution before the next business callback.
+  /// An enabled cancellation request received while yielding stops execution
+  /// before the next business callback.
   static Task<void, Never> yieldNow() => const Task._(_Yield());
 
-  /// Registers cleanup in the current scope when this task executes.
+  /// Registers a finalizer to run when the current [Scope] closes.
   ///
-  /// Finalizers receive the scope's body exit and run in reverse registration
-  /// order with cancellation masked. Every finalizer is attempted. Cleanup
-  /// failures are appended to the body's cause before the scope returns.
-  /// Cleanup has its own temporary scope, so it can register further cleanup
-  /// and use scoped resources before the enclosing scope continues closing.
+  /// [finalizer] receives the scope's exit. Finalizers run in reverse registration
+  /// order with cancellation masked, and all are attempted even after failures.
+  /// Cleanup failures are appended to the computation's cause.
+  ///
+  /// A finalizer can acquire resources or register further cleanup in its own
+  /// temporary scope. That scope closes before the next finalizer runs.
   static Task<void, Never> addFinalizer(
     Task<void, Never> Function(Exit<Object?, Object?> exit) finalizer,
   ) => Task._(_AddFinalizer(finalizer));
 
-  /// Acquires a resource and registers its release in the current scope.
+  /// Acquires a resource that will be released when the current [Scope] closes.
   ///
-  /// Acquisition and registration are masked from cancellation. A pending
-  /// request is handled only after a successful resource has its release
-  /// registered. An acquisition that never finishes therefore cannot be
-  /// cancelled promptly. A failed acquisition does not call [release].
+  /// [release] receives the acquired resource and the scope's exit, and runs with
+  /// cancellation masked. Complete all uses within that scope; returning a resource
+  /// from `Runtime.run` does not extend its lifetime. Use [using] for a resource
+  /// whose lifetime should end immediately after one computation.
   ///
-  /// [release] runs with cancellation masked and observes the scope's exit.
-  /// Use [using] for a local lifetime, or complete all uses within this scope.
-  /// Returning a resource from Runtime.run does not extend its lifetime.
+  /// Acquisition and release registration are masked together, so cancellation
+  /// cannot leave a successfully acquired resource without cleanup. A failed
+  /// acquisition does not call [release]. An acquisition that never finishes can
+  /// therefore delay cancellation indefinitely.
   static Task<T, E> acquireRelease<T, E>(
     Task<T, E> acquire, {
     required Task<void, Never> Function(T resource, Exit<Object?, Object?> exit)
@@ -325,11 +369,14 @@ final class Task<T, E> {
     ),
   );
 
-  /// Acquires, uses, and releases a resource within one local scope.
+  /// Uses a resource for one computation, then releases it before returning.
   ///
-  /// Returns [use]'s result after [release] finishes, including on failure or
-  /// cancellation. Release observes the use exit; release failures follow body
-  /// failures in the final cause. Thrown callback exceptions become defects.
+  /// Returns [use]'s value after [release] completes. Release also runs after
+  /// failure or cancellation and receives the use's exit. Cleanup failures follow
+  /// body failures in the resulting cause.
+  ///
+  /// Acquisition and release use the cancellation guarantees of [acquireRelease].
+  /// Thrown callback exceptions become defects.
   static Task<T, E> using<R, T, E>(
     Task<R, E> acquire, {
     required Task<T, E> Function(R resource) use,
@@ -340,89 +387,92 @@ final class Task<T, E> {
   ).flatMap(use).scoped();
 }
 
-/// Wraps a task with the cancellation state captured by an enclosing mask.
+/// A wrapper that restores the cancellation state preceding a mask.
 ///
-/// The wrapper is lazy. Repeated executions use their own cancellation signals
-/// and the same captured state; no execution or signal is retained.
+/// Provided by [Task.uninterruptibleMask]. The wrapped task is lazy and uses its
+/// own execution's signal on every run; the wrapper retains only the captured
+/// cancellation state.
 typedef RestoreCancellation = Task<T, E> Function<T, E>(Task<T, E> task);
 
-/// Transforms and combines tasks using their static value and error types.
+/// Composition, resource lifetimes, and error handling for [Task].
 extension TaskOperations<T, E> on Task<T, E> {
-  /// Limits this computation's time and maps expiration into its error type.
+  /// Fails with a business error if this computation exceeds [duration].
   ///
-  /// Timing uses the current clock and includes resource cleanup. If the timer
-  /// wins, this cancels the computation and waits for it to finish before
-  /// calling [onTimeout]. Cleanup defects remain alongside the timeout error;
-  /// an exception in [onTimeout] becomes a defect without hiding those failures.
+  /// The deadline uses the current context's clock and includes resource cleanup.
+  /// On expiration, the computation is cancelled and fully cleaned up before
+  /// [onTimeout] supplies the error. Cleanup defects remain alongside that error,
+  /// or alongside a defect if [onTimeout] throws.
   ///
-  /// This is a cooperative deadline. Non-cancellable Futures must settle before
-  /// this task returns. Nonpositive durations schedule a zero-delay timer;
-  /// synchronous work may finish before that timer is observed. Completion or
-  /// owner cancellation removes the timer and waits for all owned work.
+  /// This is a cooperative deadline: a non-cancellable [Future] can delay the
+  /// result past the deadline. Nonpositive durations use a zero-delay timer, so
+  /// synchronous work may still finish first. Completion or owner cancellation
+  /// removes the timer and waits for owned work.
   Task<T, E> timeout(Duration duration, {required E Function() onTimeout}) =>
       timeoutTask(this, duration, onTimeout: onTimeout);
 
-  /// Runs [fallback] if this computation exceeds [duration] without defects.
+  /// Switches to [fallback] when this computation times out without defects.
   ///
-  /// The timed computation is cancelled and fully cleaned up before [fallback]
-  /// is called. Any defect, including cleanup failure, prevents the fallback
-  /// from starting. An ordinary business failure is propagated directly.
-  /// The fallback has no deadline of its own unless explicitly wrapped.
-  /// Timing and cancellation boundaries are those of [timeout].
+  /// The timed computation is cancelled and cleaned up before the fallback starts.
+  /// Any defect, including cleanup failure, prevents fallback. A business failure
+  /// before timeout propagates directly.
+  ///
+  /// Timing and cancellation follow [timeout]. The fallback has no deadline of its
+  /// own unless explicitly wrapped.
   Task<T, E> timeoutOrElse(Duration duration, Task<T, E> Function() fallback) =>
       timeoutOrElseTask(this, duration, fallback);
 
-  /// Waits for [duration] before starting this computation.
+  /// Delays the start of this task by [duration].
   ///
-  /// Uses [Task.sleep], including its clock and cancellation rules. Cancelling
-  /// the delay prevents the computation from starting.
+  /// Uses [Task.sleep]; cancelling the wait prevents this task from starting.
   Task<T, E> delay(Duration duration) =>
       Task.sleep(duration).withError<E>().flatMap((_) => this);
 
-  /// Retries single business failures according to [schedule].
+  /// Retries recoverable business failures according to [schedule].
   ///
-  /// The first attempt starts immediately. `Schedule.recurs(3)` allows three
-  /// further attempts. [when], if supplied, must return true to retry; a thrown
-  /// exception becomes a defect. Defects, cancellation, and grouped failures
-  /// are never retried. Exhaustion returns the last business failure.
+  /// The first attempt starts immediately; `Schedule.recurs(3)` permits three more.
+  /// Only a single business failure is eligible. Defects, cancellation, and grouped
+  /// failures propagate without retry. [when], if supplied, must also return true;
+  /// an exception from it becomes a defect. Exhaustion returns the last failure.
   ///
-  /// Each attempt has its own scope and completes cleanup before another
-  /// attempt or delay begins. Cleanup failures prevent retry. Counting and
-  /// elapsed time start fresh on each execution; elapsed time includes attempts,
-  /// cleanup, and waits. Waiting uses the current clock and is cancellable.
+  /// Each attempt has its own resource scope and finishes cleanup before the next
+  /// attempt or delay. Cleanup failures prevent retry. Schedule state is fresh per
+  /// execution, and elapsed time includes attempts, cleanup, and waits. Delays use
+  /// the current clock and are cancellable.
   Task<T, E> retry(Schedule schedule, {bool Function(E error)? when}) =>
       retryTask(this, schedule, when: when);
 
-  /// Repeats successful attempts and returns the last successful value.
+  /// Repeats successful executions and returns the last value.
   ///
-  /// The first attempt starts immediately. After each success, [until] can stop
-  /// repetition by returning true; otherwise [schedule] decides whether and
-  /// when to continue. A failed attempt stops immediately, and an exception in
-  /// [until] becomes a defect. Each attempt finishes its scoped resources before
-  /// the next begins, including the last attempt before returning its value.
+  /// The first execution starts immediately. After each success, [until] can stop
+  /// by returning true; otherwise [schedule] decides whether and when to repeat.
+  /// A failed attempt stops repetition. An exception from [until] becomes a defect.
   ///
-  /// Policy state is independent per execution. Time includes attempts and
-  /// cleanup, and waits use the current clock. Cancellation stops future
-  /// attempts and waits for current work and cleanup under the usual Task rules.
+  /// Each attempt finishes its own resource scope before another begins, including
+  /// cleanup of the last attempt before returning. Schedule state is fresh per
+  /// execution, elapsed time includes attempts and cleanup, and delays use the
+  /// current clock. Cancellation stops further attempts and awaits current cleanup.
   Task<T, E> repeat(Schedule schedule, {bool Function(T value)? until}) =>
       repeatTask(this, schedule, until: until);
 
-  /// Runs this computation with [context] overlaid on its current services.
+  /// Supplies local service bindings for this task and its children.
   ///
-  /// Provided bindings replace matching keys and leave all other services
-  /// available. The enclosing context is restored on success or failure.
-  /// Child fibers inherit the local bindings, and finalizers retain the
-  /// services present when they were registered. This does not acquire or
-  /// release the supplied service objects.
+  /// [context] replaces matching keys and leaves other services available. The
+  /// outer bindings are restored when the task ends. Child fibers inherit the
+  /// local bindings; finalizers retain the services present at registration.
+  ///
+  /// The supplied objects remain externally owned. This operation neither acquires
+  /// nor releases them.
   Task<T, E> provideContext(Context context) =>
       Task._(_ProvideContext(_node, context));
 
-  /// Starts this task as a child owned by the current task scope.
+  /// Starts a child fiber owned by the current [Scope].
   ///
-  /// Parent cancellation reaches the child. The scope cancels and waits for
-  /// unfinished children before releasing resources. A child's business error
-  /// is propagated by joining it; an unobserved failure is reported by Runtime.
-  /// Each execution starts a fresh fiber.
+  /// Each execution starts a new fiber. Parent cancellation reaches the child, and
+  /// the scope stops and waits for unfinished children before releasing resources.
+  ///
+  /// Use [Fiber.join] to propagate the child's value or business failure. An
+  /// unobserved failure is reported by the runtime; starting a child does not by
+  /// itself make its business failure the parent's result.
   Task<Fiber<T, E>, Never> fork() => Task._(
     _Fork(
       (scope, parent, context, locals, signal, runScope) => startFiber(
@@ -437,11 +487,11 @@ extension TaskOperations<T, E> on Task<T, E> {
     ),
   );
 
-  /// Starts this task with its lifetime owned by [scope].
+  /// Starts a fiber whose lifetime belongs to an explicit [scope].
   ///
-  /// The scope must still be open. Its closure cancels and waits for this fiber.
-  /// Cancellation of the task creating the fiber does not cancel it; this is
-  /// useful for work whose explicit owner outlives the creating task.
+  /// Use this when the owner should outlive the task that starts the fiber. The
+  /// scope must be open; closing it cancels the fiber and waits for cleanup.
+  /// Cancellation of the creating task does not cancel the fiber.
   Task<Fiber<T, E>, Never> forkIn(Scope scope) => Task._(
     _Fork(
       (_, parent, context, locals, _, runScope) => startFiber(
@@ -456,33 +506,35 @@ extension TaskOperations<T, E> on Task<T, E> {
     ),
   );
 
-  /// Runs this task in a child scope, waiting for its cleanup before continuing.
+  /// Gives this task a local resource lifetime.
   ///
-  /// Every execution creates a fresh scope. Child scopes close before parent
-  /// resources, and cleanup failures follow the body's cause without wrapping
-  /// or repeating that cause.
+  /// Each execution creates a child [Scope] and closes it before returning the
+  /// result. Child scopes close before their parent's resources. Cleanup failures
+  /// follow the body's cause without wrapping or repeating it.
   Task<T, E> scoped() => Task._(_Scoped(_node));
 
-  /// Runs [cleanup] after this task, including failure and cancellation.
+  /// Runs [cleanup] after this task on success, failure, or cancellation.
   ///
-  /// Cleanup is registered before starting this task and runs with cancellation
-  /// masked. Its failures are retained alongside the body's failure.
+  /// Cleanup is registered before this task starts and runs with cancellation
+  /// masked. Its failures are retained alongside any body failure. Use [onExit]
+  /// when cleanup needs to inspect the outcome.
   Task<T, E> ensuring(Task<void, Never> cleanup) => onExit((_) => cleanup);
 
-  /// Runs [cleanup] with this task's exit before continuing to the caller.
+  /// Runs [cleanup] with this task's outcome before returning its result.
   ///
-  /// The callback is registered in a local scope before starting this task.
-  /// Both the callback and returned cleanup task run in the registration Zone
-  /// with cancellation masked. Their exceptions become cleanup defects.
+  /// Cleanup is registered before the task starts. The callback and its returned
+  /// task run with cancellation masked in the registration [Zone]. Their exceptions
+  /// become cleanup defects, retained alongside any body failure.
   Task<T, E> onExit(Task<void, Never> Function(Exit<T, E> exit) cleanup) =>
       Task.addFinalizer((exit) => cleanup(_typedExit<T, E>(exit)))
           .withError<E>()
           .flatMap((_) => this)
           .scoped();
 
-  /// Transforms the successful value when this task runs.
+  /// Transforms this task's successful value.
   ///
-  /// Failures skip [transform]. Exceptions from [transform] become defects.
+  /// A failure skips [transform]. Use [flatMap] when the transformation itself
+  /// returns a task.
   Task<U, E> map<U>(U Function(T value) transform) => Task._(
     _Continue(
       _node,
@@ -490,24 +542,26 @@ extension TaskOperations<T, E> on Task<T, E> {
     ),
   );
 
-  /// Continues with [next] after success, using the same business error type.
+  /// Continues with the task returned by [next] after success.
   ///
-  /// Both tasks run in the same execution. A failure skips [next]; use
-  /// [mapError] to adapt a different business error type before composing.
+  /// Both tasks share the execution and resource scope. A failure skips [next].
+  /// Use [mapError] to align different business error types before composing.
   Task<U, E> flatMap<U>(Task<U, E> Function(T value) next) => Task._(
     _Continue(_node, _Frame(success: (value) => next(value as T)._node)),
   );
 
-  /// Runs [action] after success and retains the original successful value.
+  /// Runs [action] on success and preserves the original value.
   ///
-  /// A failure from [action] becomes the result of the combined task.
+  /// A failure from the action fails the combined task.
   Task<T, E> tap(Task<void, E> Function(T value) action) =>
       flatMap((value) => action(value).map((_) => value));
 
-  /// Transforms every business failure, retaining other reasons and their order.
+  /// Changes the business error type by transforming each business failure.
   ///
-  /// Exceptions from [transform] become defects. External cancellation stops
-  /// transformations that have not started, including later group members.
+  /// This includes failures inside a [CauseGroup]. Defects, stack traces,
+  /// cancellation reasons, and cause ordering are preserved. Exceptions from
+  /// [transform] become defects. Owner cancellation stops transformations that
+  /// have not started, including later members of a group.
   Task<T, F> mapError<F>(F Function(E error) transform) => Task._(
     _Continue(
       _node,
@@ -520,10 +574,10 @@ extension TaskOperations<T, E> on Task<T, E> {
     ),
   );
 
-  /// Recovers a single business failure using the same business error type.
+  /// Handles a single business failure with a replacement task.
   ///
   /// Defects, cancellation, and groups bypass [recover]. Use [recoverCause] to
-  /// explicitly handle a complete cause. External cancellation stops recovery.
+  /// handle a complete cause. Owner cancellation stops recovery.
   Task<T, E> recover(Task<T, E> Function(E error) recover) => Task._(
     _Continue(
       _node,
@@ -536,11 +590,11 @@ extension TaskOperations<T, E> on Task<T, E> {
     ),
   );
 
-  /// Recovers a complete failure with [recover].
+  /// Handles a complete failure cause with a replacement task.
   ///
-  /// [recover] receives all business failures, defects, and explicit
-  /// cancellation reasons. It cannot override cancellation requested by the
-  /// running task's owner. Exceptions from [recover] become defects.
+  /// [recover] can inspect business failures, defects, and explicit cancellation.
+  /// It cannot override cancellation requested by the execution's owner. An
+  /// exception from the callback becomes a defect.
   Task<T, F> recoverCause<F>(Task<T, F> Function(Cause<E> cause) recover) =>
       Task._(
         _Continue(
@@ -551,10 +605,10 @@ extension TaskOperations<T, E> on Task<T, E> {
         ),
       );
 
-  /// Transforms the complete failure cause when this task fails.
+  /// Replaces a failure's complete cause with [transform]'s result.
   ///
-  /// External cancellation skips [transform]. Exceptions from [transform]
-  /// become defects.
+  /// Use [mapError] to change business errors while preserving other reasons.
+  /// Owner cancellation skips [transform]; an exception from it becomes a defect.
   Task<T, F> mapCause<F>(Cause<F> Function(Cause<E> cause) transform) => Task._(
     _Continue(
       _node,
@@ -565,10 +619,11 @@ extension TaskOperations<T, E> on Task<T, E> {
     ),
   );
 
-  /// Captures this computation's complete [Exit] as a successful value.
+  /// Turns this task's success or failure into an [Exit] value.
   ///
-  /// Explicit failure and cancellation causes can be inspected this way.
-  /// Cancellation requested by the owner still terminates the enclosing task.
+  /// This allows inspection of business failures, defects, and explicit
+  /// cancellation without propagating them. Cancellation requested by the owner
+  /// still terminates the enclosing task.
   Task<Exit<T, E>, Never> exit() => Task._(
     _Continue(
       _node,
@@ -580,11 +635,12 @@ extension TaskOperations<T, E> on Task<T, E> {
     ),
   );
 
-  /// Converts every business failure into a defect at this conversion boundary.
+  /// Treats business failures as defects instead of recoverable errors.
   ///
-  /// Non-null errors are retained unchanged. For a null business error, the
-  /// original [CauseFailure] is retained as the defect's non-null error object.
-  /// Existing defects, their stack traces, and cancellation remain unchanged.
+  /// Converted errors receive a stack trace at this boundary. Non-null errors are
+  /// retained as the defect object; a `null` error retains its original
+  /// [CauseFailure] as the non-null object. Existing defects, their stack traces,
+  /// and cancellation remain unchanged.
   Task<T, Never> orDie() => Task._(
     _Continue(
       _node,
@@ -596,11 +652,12 @@ extension TaskOperations<T, E> on Task<T, E> {
   );
 }
 
-/// Establishes a business error type for a task that has no business failures.
+/// Error-type widening for tasks without business failures.
 extension InfallibleTaskOperations<T> on Task<T, Never> {
-  /// Gives this task error type [F] so it can begin a flow using that type.
+  /// Allows this task to participate in a computation with business error [F].
   ///
-  /// This does not run the task or change its behavior.
+  /// Returns the same task with a wider static error type. It neither runs the task
+  /// nor changes its behavior.
   Task<T, F> withError<F>() => this;
 }
 

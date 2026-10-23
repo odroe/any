@@ -1,20 +1,32 @@
 import 'task.dart';
 
-/// An identity key for a value local to a task execution.
+/// A value binding that follows one task execution and its child fibers.
 ///
-/// Use [locally] to override a value for one computation and [get] to read it.
-/// Forked tasks inherit the bindings present when they start. Their overrides
-/// do not change the parent's bindings or merge back when the child finishes.
-/// Independently started runtime executions begin with the defaults.
+/// Use [get] to read the current value and [locally] to override it for a task.
+/// Children inherit the bindings present when they start; changes in a child do
+/// not change the parent. Independent runtime executions use the default value.
 ///
-/// Bindings are isolated, but their values are retained by reference. Mutable
-/// objects are not copied. Two keys with the same type, default, and [name] still
-/// identify distinct values.
+/// Each [TaskLocal] has its own identity, regardless of its type, default value,
+/// or [name]. Bindings are isolated, but mutable values are shared by reference.
+///
+/// ```dart
+/// final requestId = TaskLocal('unknown', name: 'requestId');
+/// final program = requestId.locally('request-42', requestId.get());
+/// final runtime = Runtime();
+/// try {
+///   final local = await runtime.runOrThrow(program);
+///   final outside = await runtime.runOrThrow(requestId.get());
+///   assert(local == 'request-42');
+///   assert(outside == 'unknown');
+/// } finally {
+///   await runtime.close();
+/// }
+/// ```
 final class TaskLocal<T> {
-  /// Creates a distinct key with [defaultValue] and an optional diagnostic name.
+  /// Creates a local binding with [defaultValue] as its fallback.
   ///
-  /// [defaultValue] is used whenever the running task has no override for this
-  /// key. It is retained unchanged and may be `null` when [T] permits it.
+  /// The default is retained by reference and is returned whenever no override is
+  /// active. [name] is an optional diagnostic label, not the binding's identity.
   TaskLocal(T defaultValue, {this.name}) : _defaultValue = defaultValue;
 
   final T _defaultValue;
@@ -22,22 +34,20 @@ final class TaskLocal<T> {
   /// An optional label for diagnostics; it does not determine key identity.
   final String? name;
 
-  /// Reads this execution's current value when the returned task runs.
+  /// Returns a task that reads the current value of this binding.
   ///
-  /// Without a local override, returns the default supplied to the constructor.
-  /// An explicit `null` override remains distinct from the absence of a binding.
+  /// Uses the constructor's default when no [locally] override is active. An
+  /// explicit `null` override is a value, not an absent binding.
   Task<T, Never> get() => readTaskLocal<T>(this, _defaultValue);
 
-  /// Runs [task] with this key bound to [value], then restores the outer binding.
+  /// Runs [task] with a local [value] for this binding.
   ///
-  /// The override is lazy and lasts across asynchronous boundaries. It is
-  /// restored on success or failure; cancellation does not leak the override
-  /// into another execution. Finalizers registered inside the override retain
-  /// that registration-time value, even when they run after it has ended.
+  /// The override lasts across asynchronous work and ends on success, failure, or
+  /// cancellation. Finalizers registered within it retain that value even when
+  /// cleanup happens after the override ends.
   ///
-  /// [value] must match this key's original type, including when the key is
-  /// accessed through a wider type or `dynamic`. A mismatch throws [TypeError]
-  /// when this method is called. The task's value and error types are unchanged.
+  /// [value] must match this key's original type, even through a wider type or
+  /// `dynamic`. A mismatch throws [TypeError] when [locally] is called.
   Task<R, E> locally<R, E>(T value, Task<R, E> task) =>
       provideTaskLocal<T, R, E>(this, value, task);
 }

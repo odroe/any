@@ -9,37 +9,41 @@ import 'option.dart';
 import 'scope.dart';
 import 'task.dart';
 
-/// Shares one production among independently scoped consumers.
+/// Shared production with independently scoped consumers.
 extension FlowSharingOperations<T, E> on Flow<T, E> {
-  /// Creates a shared flow owned by the scope executing this task.
+  /// Creates a scoped flow whose consumers share one source execution.
   ///
-  /// The first consumer starts production using the services and task-local
-  /// values captured here. Consumer callbacks use their own environments. Each
-  /// consumer receives subsequent elements in order, preceded by up to [replay]
-  /// previously produced elements. Slow consumers apply backpressure.
+  /// The first consumer starts the source. Each consumer receives live values in
+  /// order, preceded by up to [replay] recent values. The source uses services and
+  /// task-local values from this task; callbacks use their consumer's environment.
+  /// Use sharing when multiple consumers should observe the same production.
   ///
-  /// [capacity] bounds shared transport slots, including the last delivery
-  /// until a consumer requests another. One in-flight pull or candidate value
-  /// may be retained in addition. Downstream buffering holds its own resource
-  /// leases separately.
-  /// [capacity] must be positive and [replay] must be between zero and capacity;
-  /// invalid arguments become [RangeError] defects when this task executes.
+  /// ```dart
+  /// final work = Flow.fromIterable([1, 2, 3])
+  ///     .share(capacity: 3, replay: 3)
+  ///     .flatMap(
+  ///       (shared) => shared.toList().flatMap(
+  ///         (first) => shared.toList().map((second) => (first, second)),
+  ///       ),
+  ///     );
+  /// // Running work produces ([1, 2, 3], [1, 2, 3]); the second list uses replay.
+  /// ```
   ///
-  /// Production runs once. When the last consumer leaves, it is stopped and
-  /// awaited. Later consumers receive only the retained replay and terminal
-  /// result. This flow never restarts its source. Already accepted elements are
-  /// delivered before a source failure.
+  /// Slow consumers apply backpressure. [capacity] counts shared buffered values,
+  /// including a delivery until its consumer requests another; one additional
+  /// read or value may be pending. Values retained by downstream operators are
+  /// separate. [capacity] must be positive and [replay] between zero and [capacity],
+  /// or execution fails with a [RangeError] defect.
   ///
-  /// Replay and values still in use keep their source resources alive. Finishing
-  /// one consumption therefore does not necessarily finish source cleanup.
-  /// Delayed cleanup failures belong to the final release or the owning scope;
-  /// subsequent consumers also observe them in the terminal result.
+  /// The source never restarts. Its last consumer stops production and waits for
+  /// pending reads. Later consumers receive only retained replay and the terminal
+  /// result. Accepted values precede source failure.
   ///
-  /// Closing the owner rejects further consumption, stops production, discards
-  /// buffered values, and waits for outstanding resource leases. Consumers in
-  /// another runtime may finish using their current value; their next pull
-  /// fails with a [StateError] defect. Returning the shared flow from a completed
-  /// Runtime.run does not keep it alive.
+  /// Replay and values still in use keep their resources alive. Delayed cleanup
+  /// failures reach the final release or owning scope and later consumers. Closing
+  /// the owner rejects new consumption and waits for all outstanding uses. A
+  /// consumer in another runtime may finish its current value, then fails with a
+  /// [StateError] defect. Keep all uses within the creating scope's lifetime.
   Task<Flow<T, E>, Never> share({required int capacity, int replay = 0}) =>
       Task.defer(() {
         if (capacity < 1) {

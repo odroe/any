@@ -2,17 +2,21 @@ import 'context.dart';
 import 'option.dart';
 import 'task.dart';
 
-/// Reads configuration values without assuming an environment or file system.
+/// A source of configuration strings addressed by path segments.
 ///
-/// Absence is [OptionNone]; a present empty string is [OptionSome]. Read failures
-/// use [ConfigError] with the full requested path. Unexpected exceptions remain
-/// defects. Implementations should defer their work until the task executes.
+/// Use [ConfigProvider.fromMap] for in-memory settings and
+/// [ConfigProvider.fallback] to layer sources in priority order. Platform
+/// adapters can implement this interface for environment variables or files.
+///
+/// Reads are deferred until the returned task executes. Absence is [OptionNone];
+/// an empty string is still a present value. Expected source errors use
+/// [ConfigError] with the full requested path; unexpected exceptions are defects.
 abstract interface class ConfigProvider {
   /// Copies [values] into an immutable, in-memory configuration source.
   ///
-  /// Paths are joined with [separator] to find a map key. A separator must be
-  /// nonempty; otherwise this constructor throws [ArgumentError]. Later changes
-  /// to the input map do not affect the provider.
+  /// Paths are joined with [separator], which defaults to `'.'`. For example,
+  /// `['server', 'port']` reads `'server.port'`. Throws [ArgumentError] for an
+  /// empty separator. Later map changes do not affect the provider.
   factory ConfigProvider.fromMap(
     Map<String, String> values, {
     String separator,
@@ -26,7 +30,7 @@ abstract interface class ConfigProvider {
   factory ConfigProvider.fallback(Iterable<ConfigProvider> providers) =
       _FallbackConfigProvider;
 
-  /// The service key used by Config.load.
+  /// The service key used by `Config.load`.
   static final key = ServiceKey<ConfigProvider>('config');
 
   /// Reads the value at [path] when the returned task executes.
@@ -88,7 +92,7 @@ final class _FallbackConfigProvider implements ConfigProvider {
   }
 }
 
-/// Distinguishes absence, invalid content, and an unavailable source.
+/// The category of a configuration problem.
 enum ConfigIssueKind {
   /// No value exists at the requested path.
   missing,
@@ -100,7 +104,7 @@ enum ConfigIssueKind {
   source,
 }
 
-/// One configuration problem with an immutable path and diagnostic message.
+/// A configuration problem with a path and diagnostic message.
 ///
 /// Instances are created by [ConfigError]'s factories. The default text excludes
 /// [cause] and [stackTrace], which may contain sensitive source information.
@@ -132,7 +136,7 @@ final class ConfigIssue {
   String toString() => '${path.isEmpty ? '<root>' : path.join('.')}: $message';
 }
 
-/// One or more ordered configuration problems.
+/// One or more configuration problems in reporting order.
 ///
 /// Built-in diagnostics never include raw configuration values. Custom parsers
 /// should also omit such values from the messages they provide. Source errors
@@ -153,7 +157,7 @@ final class ConfigError implements Exception {
 
   /// Describes invalid content using a value-free [message].
   ///
-  /// A custom Config parser supplies a relative [path]; its field path is
+  /// A custom `Config` parser supplies a relative [path]; its field path is
   /// prepended during loading.
   factory ConfigError.invalid(
     String message, {

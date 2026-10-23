@@ -4,7 +4,7 @@
 /// [OptionNone] represents absence. Use a nullable type directly when there is
 /// no need to distinguish a present `null` from an absent value.
 ///
-/// Match both cases with a switch:
+/// Use an exhaustive switch to handle presence and absence:
 ///
 /// ```dart
 /// const Option<String?> name = Option.some(null);
@@ -38,13 +38,12 @@ final class OptionNone<T> extends Option<T> {
   const OptionNone() : super._();
 }
 
-/// Operations on an [Option] using its statically known value type.
+/// Transformations and fallbacks for optional values.
 extension OptionOperations<T> on Option<T> {
   /// Transforms a present value, preserving absence.
   ///
-  /// Calls [transform] once for [OptionSome], including a present `null`, and
-  /// does not call it for [OptionNone]. Exceptions from [transform] propagate
-  /// to the caller.
+  /// A present `null` is passed to [transform]. Exceptions propagate to the
+  /// caller.
   Option<R> map<R>(R Function(T value) transform) => switch (this) {
     OptionSome<T>(:final value) => Option<R>.some(transform(value)),
     OptionNone<T>() => const Option<Never>.none(),
@@ -52,9 +51,8 @@ extension OptionOperations<T> on Option<T> {
 
   /// Transforms a present value into another option, preserving absence.
   ///
-  /// Calls [transform] once for [OptionSome] and returns its option unchanged.
-  /// Does not call [transform] for [OptionNone]. Exceptions from [transform]
-  /// propagate to the caller.
+  /// Use this when [transform] can itself return an absent value. Exceptions
+  /// from the callback propagate to the caller.
   Option<R> flatMap<R>(Option<R> Function(T value) transform) => switch (this) {
     OptionSome<T>(:final value) => transform(value),
     OptionNone<T>() => const Option<Never>.none(),

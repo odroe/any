@@ -4,7 +4,7 @@ import 'option.dart';
 import 'semaphore.dart';
 import 'task.dart';
 
-/// Handles updates that would exceed a subscription ref's shared buffer.
+/// The policy for updates that fill a [SubscriptionRef]'s shared buffer.
 enum SubscriptionOverflowStrategy {
   /// Keeps the most recent updates, skipping older unread updates as needed.
   latest,
@@ -13,22 +13,38 @@ enum SubscriptionOverflowStrategy {
   backPressure,
 }
 
-/// A serialized mutable value with a scoped flow of committed changes.
+/// A mutable value with serialized writes and a flow of committed updates.
 ///
-/// Reads return the latest committed value without waiting for pending writes.
-/// Every consumption of [changes] first receives its registration-time value,
-/// followed by updates committed after registration. Registration and that
-/// snapshot are atomic; no update can fall between them.
+/// Use a subscription ref when consumers need both the current state and future
+/// changes. [get] reads the latest committed value without waiting for a writer.
+/// Each consumption of [changes] starts with a current snapshot, then receives
+/// updates without a gap between the snapshot and registration.
 ///
-/// Writes share one FIFO semaphore. A candidate and its resource cleanup must
-/// succeed before it can commit. The value and all subscription notifications
-/// commit together; a backpressured candidate has changed neither. Even setting
-/// the same value publishes an update. Values are retained by reference, so
-/// mutations to their fields and external side effects are not rolled back.
+/// ```dart
+/// import 'package:any/any.dart';
 ///
-/// The ref has no independent resource lifetime. Each flow consumption owns its
-/// subscription and releases it on completion, failure, or cancellation. Writes
-/// are not reentrant: a modification must not wait for another write to this ref.
+/// Future<void> main() async {
+///   final runtime = Runtime();
+///   try {
+///     final work = SubscriptionRef.create(0).flatMap((count) {
+///       return count
+///           .update((value) => value + 1)
+///           .flatMap((_) => count.changes.take(1).toList());
+///     });
+///     print(await runtime.runOrThrow(work)); // [1]
+///   } finally {
+///     await runtime.close();
+///   }
+/// }
+/// ```
+///
+/// Writes commit the value and notifications together, in arrival order. Setting
+/// an equal value still publishes an update. Values are held by reference;
+/// mutating their fields or performing external effects cannot be rolled back.
+/// A write must not wait for another write to the same ref.
+///
+/// The ref has no independent resource lifetime. Each consumption owns and closes
+/// its subscription when it ends or is cancelled.
 final class SubscriptionRef<T> {
   SubscriptionRef._(
     this._value,
@@ -47,17 +63,16 @@ final class SubscriptionRef<T> {
   var _next = 0;
   _Commit<T>? _pending;
 
-  /// Creates an independent ref containing [initial] on each execution.
+  /// Creates a new ref holding [initial].
   ///
-  /// [capacity] bounds the shared buffer of updates, not the number of
-  /// subscriptions. Each subscription additionally retains its initial snapshot
-  /// until it is consumed. Invalid capacity becomes a [RangeError] defect.
+  /// [capacity] bounds shared updates, not subscriptions or their initial
+  /// snapshots. It must be positive or execution fails with a [RangeError] defect.
+  /// Each execution creates an independent ref without copying [initial].
   ///
-  /// The default retains only the latest update for a slow subscription. With
-  /// a larger capacity, [SubscriptionOverflowStrategy.latest] retains up to
-  /// that many recent updates. [SubscriptionOverflowStrategy.backPressure]
-  /// instead waits before committing whenever an active subscription still
-  /// needs the oldest buffered update. No history is kept without subscribers.
+  /// By default, slow readers skip older updates and receive the latest.
+  /// Increasing [capacity] retains more recent updates. Choose
+  /// [SubscriptionOverflowStrategy.backPressure] to wait for slow readers before
+  /// committing writes instead. No update history is kept without subscribers.
   static Task<SubscriptionRef<T>, Never> create<T>(
     T initial, {
     int capacity = 1,
@@ -72,16 +87,15 @@ final class SubscriptionRef<T> {
   /// Reads the latest committed value without waiting for a pending write.
   Task<T, Never> get() => Task.sync(() => _value);
 
-  /// Observes the current state followed by updates, with an independent cursor.
+  /// The current state followed by committed updates.
   ///
-  /// Each consumption registers lazily and always receives its initial snapshot
-  /// first, even when later updates overwrite the shared buffer before the
-  /// first pull. Stopping consumption unsubscribes and frees buffer occupancy
-  /// for waiting writers. Other subscriptions and the ref remain usable.
+  /// Each consumption registers independently and receives its initial snapshot
+  /// first, even if later updates replace buffered history before it is read.
+  /// Stopping consumption unsubscribes and frees space for waiting writers.
   ///
-  /// This flow has no natural end. Bound consumption with an operator such as
-  /// `take`, or cancel its consuming task. In backpressure mode, a consumer that
-  /// waits for a write while keeping the buffer full can deadlock that write.
+  /// The flow never ends on its own; use [FlowOperations.take] or cancel its task.
+  /// With [SubscriptionOverflowStrategy.backPressure], a consumer must not wait
+  /// for a write that needs it to free buffer space.
   Flow<T, Never> get changes =>
       Flow.fromTask(
         Task.acquireRelease(
@@ -149,30 +163,31 @@ final class SubscriptionRef<T> {
   }
 }
 
-/// Writes using a subscription ref's statically known value type.
+/// Atomic writes to a [SubscriptionRef].
 ///
-/// A widened ref retains its original runtime value type. An incompatible
-/// replacement produces a [TypeError] defect without changing the value or
-/// notifying any subscription.
+/// A widened ref still enforces its original runtime value type. An incompatible
+/// replacement fails with a [TypeError] defect without changing the value or
+/// publishing an update.
 extension SubscriptionRefOperations<T> on SubscriptionRef<T> {
-  /// Stores [value] and publishes it atomically after preceding writes.
+  /// Stores [value] and publishes an update after preceding writes.
   ///
-  /// Cancellation before commitment removes this write without publishing.
-  /// Cancellation after commitment cannot undo the value or its notifications.
+  /// Cancellation before commitment leaves the state unchanged. After commitment,
+  /// cancellation cannot undo the value or notification.
   Task<void, Never> set(T value) =>
       _semaphore.withPermits(1, Task.defer(() => _commit(value)));
 
-  /// Computes and publishes a replacement after preceding writes.
+  /// Replaces the value with [transform]'s result and publishes an update.
   ///
-  /// [transform] runs once with the latest committed value. Exceptions and
-  /// cancellation before commitment leave the value and notifications unchanged.
-  /// In backpressure mode, the candidate can wait for space after computation.
+  /// Runs [transform] once with the latest value after preceding writes finish.
+  /// Exceptions or cancellation before commitment leave state and notifications
+  /// unchanged. Backpressure can delay commitment after computation.
   Task<void, Never> update(T Function(T value) transform) =>
       _semaphore.withPermits(1, Task.defer(() => _commit(transform(_value))));
 
-  /// Computes `(result, newValue)`, commits the value, then returns the result.
+  /// Commits the new value from [change] and returns its result.
   ///
-  /// The same ordering, exception, and cancellation rules as [update] apply.
+  /// [change] returns `(result, newValue)` and follows [update]'s ordering and
+  /// failure rules.
   Task<R, Never> modify<R>((R result, T value) Function(T value) change) =>
       _semaphore.withPermits(
         1,
@@ -182,17 +197,16 @@ extension SubscriptionRefOperations<T> on SubscriptionRef<T> {
         }),
       );
 
-  /// Runs a candidate task while excluding other writes, then publishes it.
+  /// Runs [change], commits its new value, and returns its result.
   ///
-  /// [change] receives the latest committed value and returns a task producing
-  /// `(result, newValue)`. Its local scope and resources close before commitment.
-  /// Business failure, defects, cleanup failure, or enabled cancellation before
-  /// the commit leave the stored value and all subscriptions unchanged.
+  /// [change] receives the latest value and returns `(result, newValue)`. Other
+  /// writes wait until this task finishes, while reads remain available. The
+  /// candidate's resources close before commitment; failure or enabled
+  /// cancellation leaves stored state and notifications unchanged.
   ///
-  /// Cancellation waits for any in-flight non-cancellable Future and resource
-  /// cleanup before releasing the write permit. Reads remain available while a
-  /// candidate is running or waiting for buffer space. External side effects
-  /// and mutations to retained objects are not undone.
+  /// Cancellation waits for pending non-cancellable Futures and cleanup before
+  /// allowing the next writer. External effects and in-place mutations to retained
+  /// objects cannot be undone.
   Task<R, E> modifyTask<R, E>(
     Task<(R result, T value), E> Function(T value) change,
   ) => _semaphore.withPermits(
