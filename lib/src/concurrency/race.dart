@@ -31,70 +31,76 @@ import 'package:any/any.dart';
 /// ]);
 /// final exit = await fastest.run(()); // ExitSuccess('second') after both finish.
 /// ```
-Task<T, E, R> race<T, E, R>(Iterable<Task<T, E, R>> tasks) => Task((
-  context,
-) async {
-  final controller = CancellationController();
-  final removeListener = context.cancellation.onCancel(
-    (reason) => controller.cancel(reason: reason),
-  );
-  Exit<T, E>? winner;
-  final cleanup = <Cause<E>?>[];
-  final running = <Future<void>>[];
+Task<T, E, R> race<T, E, R>(Iterable<Task<T, E, R>> tasks) =>
+    Task((context) async {
+      final controllers = <CancellationController>[];
+      final removeListener = context.cancellation.onCancel((reason) {
+        for (final controller in controllers) {
+          controller.cancel(reason: reason);
+        }
+      });
+      Exit<T, E>? winner;
+      final cleanup = <Cause<E>?>[];
+      final running = <Future<void>>[];
 
-  void win(Exit<T, E> exit) {
-    if (winner != null) return;
-    winner = exit;
-    controller.cancel();
-  }
-
-  Future<void> runChild(Task<T, E, R> task, int index) async {
-    final scope = Scope();
-    final exit = await task.runIn(
-      Context(
-        scope: scope,
-        dependencies: context.dependencies,
-        cancellation: controller.token,
-      ),
-    );
-    win(exit);
-    try {
-      await scope.close(exit: exit);
-    } on ScopeCloseException catch (error) {
-      cleanup[index] = error.cause;
-    } catch (error, stackTrace) {
-      cleanup[index] = Cause.defect(error, stackTrace);
-    }
-  }
-
-  try {
-    try {
-      final iterator = tasks.iterator;
-      while (!controller.token.isCancelled && iterator.moveNext()) {
-        if (controller.token.isCancelled) break;
-        final task = iterator.current;
-        if (controller.token.isCancelled) break;
-        final index = cleanup.length;
-        cleanup.add(null);
-        running.add(runChild(task, index));
+      void win(Exit<T, E> exit, [int? winnerIndex]) {
+        if (winner != null) return;
+        winner = exit;
+        for (var index = 0; index < controllers.length; index++) {
+          if (index != winnerIndex) controllers[index].cancel();
+        }
       }
-      if (running.isEmpty && !controller.token.isCancelled) {
-        throw ArgumentError('tasks must contain at least one task.');
-      }
-    } catch (error, stackTrace) {
-      win(Exit.failure(Cause.defect(error, stackTrace)));
-    }
 
-    await Future.wait(running);
-    final exit =
-        winner ??
-        Exit<T, E>.failure(Cause.cancelled(reason: controller.token.reason));
-    final causes = [
-      if (exit case ExitFailure(:final cause)) cause,
-      for (final cause in cleanup) ?cause,
-    ];
-    return causes.isEmpty ? exit : Exit.failure(Cause.combine(causes));
-  } finally {
-    removeListener();
-  }
-});
+      Future<void> runChild(Task<T, E, R> task, int index) async {
+        final scope = Scope();
+        final exit = await task.runIn(
+          Context(
+            scope: scope,
+            dependencies: context.dependencies,
+            cancellation: controllers[index].token,
+          ),
+        );
+        win(exit, index);
+        try {
+          await scope.close(exit: exit);
+        } on ScopeCloseException catch (error) {
+          cleanup[index] = error.cause;
+        } catch (error, stackTrace) {
+          cleanup[index] = Cause.defect(error, stackTrace);
+        }
+      }
+
+      try {
+        try {
+          final iterator = tasks.iterator;
+          while (!context.cancellation.isCancelled && iterator.moveNext()) {
+            if (context.cancellation.isCancelled) break;
+            final task = iterator.current;
+            if (context.cancellation.isCancelled) break;
+            final index = cleanup.length;
+            cleanup.add(null);
+            controllers.add(CancellationController());
+            running.add(runChild(task, index));
+          }
+          if (running.isEmpty && !context.cancellation.isCancelled) {
+            throw ArgumentError('tasks must contain at least one task.');
+          }
+        } catch (error, stackTrace) {
+          win(Exit.failure(Cause.defect(error, stackTrace)));
+        }
+
+        await Future.wait(running);
+        final exit =
+            winner ??
+            Exit<T, E>.failure(
+              Cause.cancelled(reason: context.cancellation.reason),
+            );
+        final causes = [
+          if (exit case ExitFailure(:final cause)) cause,
+          for (final cause in cleanup) ?cause,
+        ];
+        return causes.isEmpty ? exit : Exit.failure(Cause.combine(causes));
+      } finally {
+        removeListener();
+      }
+    });

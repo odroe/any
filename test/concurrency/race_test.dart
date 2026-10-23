@@ -5,6 +5,30 @@ import 'package:any/concurrency.dart';
 import 'package:test/test.dart';
 
 void main() {
+  test('selecting a winner cancels only the losing tokens', () async {
+    final loserReady = Completer<void>();
+    final release = Completer<void>();
+    CancellationToken? winningToken;
+    CancellationToken? losingToken;
+    final tasks = [
+      Task<int, Never, ()>((context) async {
+        losingToken = context.cancellation;
+        context.cancellation.onCancel((_) => release.complete());
+        loserReady.complete();
+        await release.future;
+        return const Exit.success(0);
+      }),
+      Task<int, Never, ()>((context) async {
+        winningToken = context.cancellation;
+        await loserReady.future;
+        return const Exit.success(1);
+      }),
+    ];
+    expect((await race(tasks).run(()) as ExitSuccess).value, 1);
+    expect(losingToken!.isCancelled, isTrue);
+    expect(winningToken!.isCancelled, isFalse);
+  });
+
   test(
     'first body wins, cancels losers, and waits for their cleanup',
     () async {
