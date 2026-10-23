@@ -5,6 +5,7 @@ import 'cause.dart';
 import 'context.dart';
 import 'exit.dart';
 import 'fiber.dart';
+import 'internal/task_concurrency.dart';
 import 'internal/task_timing.dart';
 import 'result.dart';
 import 'schedule.dart';
@@ -29,6 +30,76 @@ final class Task<T, E> {
   /// schedule a zero-delay timer. Cancellation removes the timer and stops the
   /// wait. Use [yieldNow] to yield directly to the host event loop instead.
   static Task<void, Never> sleep(Duration duration) => sleepTask(duration);
+
+  /// Runs [tasks] with at most [concurrency] active executions.
+  ///
+  /// The default runs sequentially. Results are immutable and retain input
+  /// order. Input is read lazily as capacity becomes available; use a finite
+  /// iterable because all results are retained. An empty input succeeds with
+  /// an empty list. Nonpositive concurrency becomes an [ArgumentError] defect.
+  ///
+  /// A failure stops new work, cancels active siblings, and waits for their
+  /// cleanup. Already observed failures are combined in completion order;
+  /// cancellation requested by this operation does not add a separate cause.
+  /// Owner cancellation follows the usual Task rules and preserves defects.
+  static Task<List<T>, E> all<T, E>(
+    Iterable<Task<T, E>> tasks, {
+    int concurrency = 1,
+  }) => computeAll(tasks, concurrency: concurrency);
+
+  /// Applies [action] lazily to [values], preserving input order in the results.
+  ///
+  /// At most [concurrency] actions run at once. Each action is created only
+  /// when its execution starts. Iteration and action exceptions become defects.
+  /// Failure, cancellation, finite-input, and cleanup rules are those of [all].
+  static Task<List<T>, E> forEach<A, T, E>(
+    Iterable<A> values,
+    Task<T, E> Function(A value) action, {
+    int concurrency = 1,
+  }) => computeForEach(values, action, concurrency: concurrency);
+
+  /// Runs every input and collects its complete exit in input order.
+  ///
+  /// Individual failures, including defects and cancellation, are values in
+  /// the returned immutable list and do not stop other inputs. Input iteration
+  /// errors still fail the operation. Owner cancellation stops remaining work
+  /// and waits for cleanup, preserving defects that have not been delivered.
+  /// Concurrency, lazy input, and empty-input rules are those of [all].
+  static Task<List<Exit<T, E>>, Never> allSettled<T, E>(
+    Iterable<Task<T, E>> tasks, {
+    int concurrency = 1,
+  }) => computeAllSettled(tasks, concurrency: concurrency);
+
+  /// Uses the first completed execution from a finite iterable of [tasks].
+  ///
+  /// Participants run concurrently. Once an exit is observed, no new inputs
+  /// start; active losers are cancelled and their cleanup is awaited. The
+  /// winner's value or cause determines the result, but any loser defect is
+  /// retained and can turn a winning success into failure. Loser business errors
+  /// and this operation's cancellation requests do not replace the winner.
+  /// Empty input becomes an [ArgumentError] defect when executed.
+  static Task<T, E> race<T, E>(Iterable<Task<T, E>> tasks) =>
+      computeRace(tasks);
+
+  /// Uses the first successful execution, or combines failures if all fail.
+  ///
+  /// A success recovers other participants' business failures. Defects are
+  /// always retained, including failures during loser cleanup. Active losers
+  /// are cancelled and fully cleaned up before returning. All-failure causes
+  /// follow completion order. Input must be finite; empty input becomes an
+  /// [ArgumentError] defect. As with [race], a decision stops further input.
+  static Task<T, E> firstSuccess<T, E>(Iterable<Task<T, E>> tasks) =>
+      computeFirstSuccess(tasks);
+
+  /// Runs two tasks and returns their values as a record in argument order.
+  ///
+  /// The default executes [left] before [right]. A [concurrency] of two or more
+  /// runs both concurrently; other validation and failure rules follow [all].
+  static Task<(A, B), E> zip<A, B, E>(
+    Task<A, E> left,
+    Task<B, E> right, {
+    int concurrency = 1,
+  }) => computeZip(left, right, concurrency: concurrency);
 
   /// Reads [key] from the services available when this task executes.
   ///

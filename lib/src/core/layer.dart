@@ -1,6 +1,5 @@
 import 'dart:async';
 
-import 'cause.dart';
 import 'context.dart';
 import 'exit.dart';
 import 'fiber.dart';
@@ -189,118 +188,15 @@ Task<Context, E> _parallel<E>(
   List<Layer<E>> layers,
   _BuildSession session,
   int concurrency,
-) => Task.defer(() {
-  final outputs = List<Context?>.filled(layers.length, null);
-  final workers = <Fiber<void, E>>[];
-  final failures = <FailureEvent>[];
-  final recorded = <Object>{};
-  final causes = <Cause<E>>[];
-  final coordinationCancellation = Object();
-  var next = 0;
-  var stopping = false;
-  var failed = false;
-  var finished = 0;
-  void Function(Exit<void, Never>)? notify;
-
-  Task<void, E> work() => Task.defer(() {
-    if (stopping || next == layers.length) return Task.succeed(null);
-    final index = next++;
-    return session
-        .build(layers[index])
-        .flatMap((context) {
-          outputs[index] = context;
-          return work();
-        })
-        .mapCause((cause) {
-          stopping = true;
-          return cause;
-        });
-  });
-
-  void completed(Fiber<void, E> worker, Exit<void, E> exit) {
-    if (exit case ExitFailure(:final cause)) {
-      final events = fiberFailureEvents(worker).iterator;
-      final reasons = switch (cause) {
-        CauseGroup(:final causes) => causes,
-        _ => [cause],
-      };
-      for (final reason in reasons) {
-        if (reason is CauseDefect) {
-          events.moveNext();
-          final event = events.current;
-          if (!recorded.add(event.source)) continue;
-          failures.add(event);
-        } else if (reason is CauseCancelled &&
-            identical(reason.reason, coordinationCancellation)) {
-          continue;
-        }
-        causes.add(reason);
+) =>
+    Task.forEach<Layer<E>, Context, E>(
+      layers,
+      session.build,
+      concurrency: concurrency,
+    ).map((outputs) {
+      var context = Context.from(const []);
+      for (final output in outputs) {
+        context = context.merge(output);
       }
-      if (!failed) {
-        failed = true;
-        stopping = true;
-        for (final other in workers) {
-          if (!identical(other, worker)) {
-            other.requestCancel(reason: coordinationCancellation);
-          }
-        }
-      }
-    }
-    finished++;
-    if (finished == workers.length) notify?.call(const Exit.success(null));
-  }
-
-  Task<Context, E> start(int remaining) => Task.defer(() {
-    if (remaining == 0) {
-      for (final worker in workers) {
-        listenFiber(worker, (exit) => completed(worker, exit));
-      }
-      return Task.fromCallback<void, Never>((complete) {
-        notify = complete;
-        if (finished == workers.length) complete(const Exit.success(null));
-        // The enclosing scope stops and waits for workers on cancellation.
-        // Their listeners remain until completion to retain cleanup defects.
-        return () {
-          notify = null;
-        };
-      }).withError<E>().flatMap((_) {
-        if (causes.isNotEmpty) {
-          return taskFromEvaluation(
-            TaskEvaluation<Context, E>(
-              Exit.failure(Cause.combine(causes)),
-              failures,
-            ),
-          );
-        }
-        return Task.sync(() {
-          var result = Context.from(const []);
-          for (final output in outputs) {
-            result = result.merge(output!);
-          }
-          return result;
-        });
-      });
-    }
-    return work().fork().withError<E>().flatMap((worker) {
-      workers.add(worker);
-      return start(remaining - 1);
+      return context;
     });
-  });
-
-  return Task.addFinalizer(
-        (_) => Task.defer(() {
-          if (failures.isEmpty) return Task.succeed(null);
-          return taskFromEvaluation(
-            TaskEvaluation<void, Never>(
-              Exit.failure(Cause.combine(failures.map((event) => event.cause))),
-              failures,
-            ),
-          );
-        }),
-      )
-      .withError<E>()
-      .flatMap(
-        (_) => start(concurrency < layers.length ? concurrency : layers.length),
-      )
-      .scoped();
-});
