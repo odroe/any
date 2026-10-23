@@ -46,3 +46,4 @@ export 'src/core/layer.dart'
 export 'src/core/metric.dart'
     show Metric, Counter, Gauge, Histogram, MetricRegistry, MetricSnapshot;
 export 'src/core/schedule.dart' show Schedule;
+export 'src/core/rate_limiter.dart' show RateLimiter, RateLimiterOperations;
