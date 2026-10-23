@@ -23,3 +23,4 @@ export 'src/core/redacted.dart' show Redacted;
 export 'src/core/clock.dart' show Clock;
 export 'src/core/scope.dart' show Scope;
 export 'src/core/ref.dart' show Ref, RefOperations;
+export 'src/core/deferred.dart' show Deferred;
