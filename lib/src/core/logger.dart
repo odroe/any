@@ -4,6 +4,7 @@ import 'clock.dart';
 import 'context.dart';
 import 'task.dart';
 import 'task_local.dart';
+import 'tracer.dart';
 
 /// The severity of a log record, ordered from least to most severe.
 enum LogLevel {
@@ -208,24 +209,28 @@ Task<void, Never> logTask(
   return Task.service(Logger.key).flatMap((logger) {
     if (!logger._accepts(level)) return Task.succeed(null);
     return Task.service(Clock.key).flatMap(
-      (clock) => _fields.get().flatMap((inherited) {
-        late LogRecord record;
-        try {
-          record = LogRecord(
-            level: level,
-            timestamp: clock.now(),
-            message: message,
-            fields: {...inherited, ...explicit},
+      (clock) => _fields.get().flatMap(
+        (inherited) => currentSpanContext().flatMap((span) {
+          late LogRecord record;
+          try {
+            record = LogRecord(
+              level: level,
+              timestamp: clock.now(),
+              message: message,
+              fields: {...inherited, ...explicit},
+              traceId: span?.traceId,
+              spanId: span?.spanId,
+            );
+          } catch (error, stackTrace) {
+            logger._report(error, stackTrace);
+            return Task.succeed(null);
+          }
+          return Task.fromFuture(
+            () => logger.write(record),
+            onError: Error.throwWithStackTrace,
           );
-        } catch (error, stackTrace) {
-          logger._report(error, stackTrace);
-          return Task.succeed(null);
-        }
-        return Task.fromFuture(
-          () => logger.write(record),
-          onError: Error.throwWithStackTrace,
-        );
-      }),
+        }),
+      ),
     );
   });
 }

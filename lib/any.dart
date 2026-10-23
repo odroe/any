@@ -64,3 +64,11 @@ export 'src/core/subscription_ref.dart'
         SubscriptionRef,
         SubscriptionRefOperations,
         SubscriptionOverflowStrategy;
+export 'src/core/tracer.dart'
+    show
+        Tracer,
+        Span,
+        SpanContext,
+        SpanRecord,
+        SpanEvent,
+        TaskTracingOperations;
