@@ -22,3 +22,4 @@ export 'src/core/random_source.dart' show RandomSource;
 export 'src/core/redacted.dart' show Redacted;
 export 'src/core/clock.dart' show Clock;
 export 'src/core/scope.dart' show Scope;
+export 'src/core/ref.dart' show Ref, RefOperations;
