@@ -3,7 +3,7 @@ import 'dart:collection';
 
 import 'package:any/any.dart';
 
-/// A shared limit on concurrently running tasks, including their cleanup.
+/// A shared limit on concurrently running task bodies.
 ///
 /// Share one instance across workflows to enforce a common limit. Waiting
 /// tasks acquire permits in registration order. A capacity of one serializes
@@ -38,10 +38,13 @@ final class Semaphore {
   /// removes that waiter without starting [task]. A granted permit is always
   /// released, including when cancellation races with acquisition.
   ///
-  /// The wrapped task owns a fresh [Scope] and shares the caller's dependencies
-  /// and cancellation token. Its cleanup finishes before the permit is reused.
-  /// Returned resources have therefore already been released; acquire and use
-  /// them inside [task]. The caller's own scope stays open.
+  /// The wrapped task shares the caller's context and resource lifetime. This
+  /// wrapper does not close that scope: acquired resources remain available to
+  /// later steps. The permit is released when the body ends.
+  ///
+  /// To retain a permit through local resource cleanup, wrap the body with
+  /// `scoped` from `package:any/resource.dart` before passing it here:
+  /// `semaphore.withPermit(scoped(task))`.
   Task<T, E, R> withPermit<T, E, R>(Task<T, E, R> task) =>
       Task((context) async {
         if (_available > 0) {
@@ -67,11 +70,7 @@ final class Semaphore {
         }
 
         try {
-          return await task.run(
-            context.dependencies,
-            cancellation: context.cancellation,
-            yieldEvery: context.yieldEvery,
-          );
+          return await task.runIn(context);
         } finally {
           if (_waiting.isEmpty) {
             _available++;

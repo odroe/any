@@ -1,5 +1,6 @@
 import 'package:any/any.dart';
 import 'package:any/concurrency.dart';
+import 'package:any/resource.dart';
 
 /// Processes a bounded queue with scoped workers and a shared concurrency limit.
 ///
@@ -46,7 +47,7 @@ Task<List<int>, Object, ()> processJobs(
                   return Exit.failure(cause);
                 case ExitSuccess(:final value):
                   final exit = await semaphore
-                      .withPermit(process(value))
+                      .withPermit(scoped(process(value)))
                       .runIn(context);
                   switch (exit) {
                     case ExitSuccess(:final value):

@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:any/any.dart';
 import 'package:any/concurrency.dart';
+import 'package:any/resource.dart';
 import 'package:test/test.dart';
 
 void main() {
@@ -10,16 +11,15 @@ void main() {
     expect(() => Semaphore(-1), throwsRangeError);
   });
 
-  test(
-    'limits independent batches and retains permits through cleanup',
-    () async {
-      final semaphore = Semaphore(2);
-      final release = Completer<void>();
-      final started = Completer<void>();
-      var active = 0;
-      var peak = 0;
-      var completed = 0;
-      final task = semaphore.withPermit(
+  test('explicit scopes retain shared permits through cleanup', () async {
+    final semaphore = Semaphore(2);
+    final release = Completer<void>();
+    final started = Completer<void>();
+    var active = 0;
+    var peak = 0;
+    var completed = 0;
+    final task = semaphore.withPermit(
+      scoped(
         Task<int, Never, ()>((context) {
           active++;
           if (active > peak) peak = active;
@@ -31,22 +31,22 @@ void main() {
           });
           return const Exit.success(1);
         }),
-      );
-      final batches = [
-        for (var i = 0; i < 2; i++)
-          all(List.filled(5, task), concurrency: 5).run(()),
-      ];
-      await started.future;
-      await Future<void>.delayed(Duration.zero);
-      expect(active, 2);
-      expect(completed, 0);
-      release.complete();
-      expect(await Future.wait(batches), everyElement(isA<ExitSuccess>()));
-      expect(peak, 2);
-      expect(completed, 10);
-      expect(active, 0);
-    },
-  );
+      ),
+    );
+    final batches = [
+      for (var i = 0; i < 2; i++)
+        all(List.filled(5, task), concurrency: 5).run(()),
+    ];
+    await started.future;
+    await Future<void>.delayed(Duration.zero);
+    expect(active, 2);
+    expect(completed, 0);
+    release.complete();
+    expect(await Future.wait(batches), everyElement(isA<ExitSuccess>()));
+    expect(peak, 2);
+    expect(completed, 10);
+    expect(active, 0);
+  });
 
   test('waiters are FIFO and cancellation removes a queued waiter', () async {
     final semaphore = Semaphore(1);
@@ -105,12 +105,14 @@ void main() {
     var cancelAtHandoff = false;
     final first = semaphore
         .withPermit(
-          Task<void, Never, ()>((context) async {
-            context.scope.addFinalizer((_) => cancelAtHandoff = true);
-            started.complete();
-            await gate.future;
-            return const Exit.success(null);
-          }),
+          scoped(
+            Task<void, Never, ()>((context) async {
+              context.scope.addFinalizer((_) => cancelAtHandoff = true);
+              started.complete();
+              await gate.future;
+              return const Exit.success(null);
+            }),
+          ),
         )
         .run(());
     await started.future;
@@ -136,29 +138,31 @@ void main() {
     expect(await next.run(()), isA<ExitSuccess>());
   });
 
-  test('shares dependencies but owns a separate scope on each run', () async {
-    final semaphore = Semaphore(1);
-    final scope = Scope();
-    final dependencies = Object();
-    final children = <Scope>[];
-    final task = semaphore.withPermit(
-      Task<Object, Never, Object>((context) {
-        children.add(context.scope);
-        return Exit.success(context.dependencies);
-      }),
-    );
-    final context = Context(scope: scope, dependencies: dependencies);
-    for (var i = 0; i < 2; i++) {
-      expect(
-        (await task.runIn(context) as ExitSuccess).value,
-        same(dependencies),
+  test(
+    'preserves the context and leaves resource ownership with the caller',
+    () async {
+      final semaphore = Semaphore(1);
+      final scope = Scope();
+      final dependencies = Object();
+      final children = <Context<Object>>[];
+      final task = semaphore.withPermit(
+        Task<Object, Never, Object>((context) {
+          children.add(context);
+          return Exit.success(context.dependencies);
+        }),
       );
-    }
-    expect(children.toSet(), hasLength(2));
-    expect(children.every((s) => s.isClosed), isTrue);
-    expect(scope.isClosed, isFalse);
-    await scope.close();
-  });
+      final context = Context(scope: scope, dependencies: dependencies);
+      for (var i = 0; i < 2; i++) {
+        expect(
+          (await task.runIn(context) as ExitSuccess).value,
+          same(dependencies),
+        );
+      }
+      expect(children, everyElement(same(context)));
+      expect(scope.isClosed, isFalse);
+      await scope.close();
+    },
+  );
 
   test('ten thousand queued runs complete without leaking permits', () async {
     final semaphore = Semaphore(1);
