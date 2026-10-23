@@ -28,3 +28,5 @@ export 'src/core/latch.dart' show Latch;
 export 'src/core/semaphore.dart' show Semaphore, SemaphoreOperations;
 export 'src/core/synchronized_ref.dart'
     show SynchronizedRef, SynchronizedRefOperations;
+export 'src/core/async_queue.dart'
+    show AsyncQueue, QueueOverflowStrategy, QueueClosed;
