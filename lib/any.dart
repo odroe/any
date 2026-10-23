@@ -80,3 +80,4 @@ export 'src/core/request_resolver.dart'
     show RequestResolver, RequestResolverOperations;
 export 'src/core/pool.dart' show Pool, PoolOperations;
 export 'src/core/flow_timing.dart' show FlowTimingOperations;
+export 'src/core/flow_combination.dart' show FlowCombinationOperations;
