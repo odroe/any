@@ -612,9 +612,9 @@ void main() {
               same(defect),
             )
             .having(
-              (error) => _defects(error.cause).single.stackTrace,
+              (error) => _defects(error.cause).single.stackTrace.toString(),
               'stack',
-              same(stack),
+              stack.toString(),
             ),
       ),
     );

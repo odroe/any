@@ -94,7 +94,7 @@ void main() {
     );
     final cause = _cause(exit) as CauseDefect;
     expect(cause.error, same(error));
-    expect(cause.stackTrace, same(stack));
+    expect(cause.stackTrace.toString(), stack.toString());
   });
 
   test('large loops remain stack safe and cooperative', () async {

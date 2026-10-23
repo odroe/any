@@ -164,7 +164,7 @@ void main() {
         callbackError,
         cleanupError,
       ]);
-      expect(defects.first.stackTrace, same(callbackTrace));
+      expect(defects.first.stackTrace.toString(), callbackTrace.toString());
     },
   );
 

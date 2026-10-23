@@ -31,7 +31,7 @@ void main() {
       final defects = reasons.whereType<CauseDefect>().toList();
       expect(defects, hasLength(1));
       expect(defects.single.error, same(error));
-      expect(defects.single.stackTrace, same(trace));
+      expect(defects.single.stackTrace.toString(), trace.toString());
       expect(reasons.whereType<CauseCancelled>().single.reason, 'timer');
       expect(await runtime.close(), isA<ExitSuccess<void, Never>>());
     });

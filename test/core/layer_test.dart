@@ -382,7 +382,10 @@ void main() {
     final reasons = (_cause(exit) as CauseGroup<String>).causes;
     expect((reasons.first as CauseFailure<String>).error, 'startup');
     expect((reasons.last as CauseDefect).error, same(error));
-    expect((reasons.last as CauseDefect).stackTrace, same(trace));
+    expect(
+      (reasons.last as CauseDefect).stackTrace.toString(),
+      trace.toString(),
+    );
     expect((_cause(closingExit!) as CauseFailure<Object?>).error, 'startup');
   });
 

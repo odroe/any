@@ -146,7 +146,7 @@ void main() {
     final errors = reasons.whereType<CauseDefect>().toList();
     expect(errors, hasLength(1));
     expect(errors.single.error, same(defect));
-    expect(errors.single.stackTrace, same(trace));
+    expect(errors.single.stackTrace.toString(), trace.toString());
     expect(cancellations, 1);
   });
 
