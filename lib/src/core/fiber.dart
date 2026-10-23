@@ -113,6 +113,9 @@ final class Fiber<T, E> {
 final _currentFibers = Object();
 
 /// Starts an execution after synchronously registering it with [owner].
+///
+/// [deferStart] breaks recursive construction of independent build workers.
+/// Ownership and cancellation are installed before scheduling the first step.
 Fiber<T, E> startFiber<T, E>(
   Task<T, E> task, {
   required Scope owner,
@@ -120,6 +123,7 @@ Fiber<T, E> startFiber<T, E>(
   Map<TaskLocal<Object?>, Object?> locals = const {},
   required void Function(Cause<Object?> cause) report,
   bool inheritHost = true,
+  bool deferStart = false,
   CancellationSignal? signal,
 }) {
   final fiber = Fiber<T, E>._(createScope(), report);
@@ -132,7 +136,7 @@ Fiber<T, E> startFiber<T, E>(
     fiber,
   ];
 
-  unawaited(
+  void start() => unawaited(
     runZoned(
       () async {
         TaskEvaluation<T, E> result;
@@ -161,6 +165,11 @@ Fiber<T, E> startFiber<T, E>(
       },
     ),
   );
+  if (deferStart) {
+    scheduleMicrotask(start);
+  } else {
+    start();
+  }
   return fiber;
 }
 

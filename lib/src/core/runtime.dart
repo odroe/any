@@ -6,6 +6,7 @@ import 'clock.dart';
 import 'context.dart';
 import 'exit.dart';
 import 'fiber.dart';
+import 'layer.dart';
 import 'scope.dart';
 import 'random_source.dart';
 import 'task.dart';
@@ -50,9 +51,57 @@ final class Runtime {
   }
 
   final _scope = createScope();
-  final Context _context;
+  Context _context;
   late final void Function(Cause<Object?>) _report;
   Future<Exit<void, Never>>? _closing;
+
+  /// Builds application [services] and returns a runtime that owns them.
+  ///
+  /// Construction uses [context] and the default services as its inputs. The
+  /// resulting bindings override matching inputs for subsequent executions.
+  /// Acquired resources remain alive until [close], after all owned tasks stop.
+  /// Existing objects supplied through [context] keep their external ownership.
+  ///
+  /// A construction failure or startup cancellation releases acquired services
+  /// before returning its complete cause, including cleanup defects. [signal]
+  /// affects startup only; use [close] to stop a successfully created runtime.
+  static Future<Exit<Runtime, E>> create<E>(
+    Layer<E> services, {
+    Context? context,
+    CancellationSignal? signal,
+    void Function(Cause<Object?> cause)? onUnhandledError,
+  }) async {
+    final runtime = Runtime(
+      context: context,
+      onUnhandledError: onUnhandledError,
+    );
+    final building = runtime.run(
+      buildLayer(services, runtime._scope),
+      signal: signal,
+    );
+    final unsubscribe = signal?.onCancel((reason) {
+      unawaited(runtime._beginClose(Exit.failure(Cause.cancelled(reason))));
+    });
+    final built = await building;
+    unsubscribe?.call();
+    Cause<E>? failure;
+    switch (built) {
+      case ExitSuccess(:final value):
+        if (signal?.isCancelled ?? false) {
+          failure = Cause.cancelled(signal!.reason);
+        } else {
+          runtime._context = overlayContexts(runtime._context, value);
+          return Exit.success(runtime);
+        }
+      case ExitFailure(:final cause):
+        failure = cause;
+    }
+    final closed = await runtime._beginClose(Exit.failure(failure));
+    return Exit.failure(switch (closed) {
+      ExitSuccess() => failure,
+      ExitFailure(:final cause) => Cause.combine([failure, cause]),
+    });
+  }
 
   /// Starts an independent root fiber owned by this runtime.
   ///
@@ -122,16 +171,23 @@ final class Runtime {
         ),
       );
     }
+    return _beginClose(const Exit.success(null));
+  }
+
+  Future<Exit<void, Never>> _beginClose(Exit<Object?, Object?> exit) {
     final closing = _closing;
     if (closing != null) return closing;
     final completion = Completer<Exit<void, Never>>();
     _closing = completion.future;
-    unawaited(_close(completion));
+    unawaited(_close(completion, exit));
     return completion.future;
   }
 
-  Future<void> _close(Completer<Exit<void, Never>> completion) async {
-    final cause = await closeScope(_scope, const Exit.success(null));
+  Future<void> _close(
+    Completer<Exit<void, Never>> completion,
+    Exit<Object?, Object?> exit,
+  ) async {
+    final cause = await closeScope(_scope, exit);
     completion.complete(
       cause == null ? const Exit.success(null) : Exit.failure(cause),
     );

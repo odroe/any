@@ -36,3 +36,10 @@ export 'src/core/config.dart' show Config, ConfigOperations;
 export 'src/core/config_provider.dart'
     show ConfigProvider, ConfigError, ConfigIssue, ConfigIssueKind;
 export 'src/core/task_local.dart' show TaskLocal;
+export 'src/core/layer.dart'
+    show
+        Layer,
+        LayerOperations,
+        InfallibleLayerOperations,
+        ServiceLayerOperations,
+        TaskLayerOperations;

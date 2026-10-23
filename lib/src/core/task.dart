@@ -482,6 +482,36 @@ Task<R, E> provideTaskLocal<T, R, E>(
   Task<R, E> task,
 ) => Task._(_ProvideLocal(task._node, local, value));
 
+// Layer construction borrows resource ownership without changing the root
+// scope that this execution must close before it finishes.
+Task<T, E> inTaskScope<T, E>(Task<T, E> task, Scope scope) =>
+    Task._(_InScope(task._node, scope));
+
+Task<Fiber<T, E>, Never> forkTaskIn<T, E>(Task<T, E> task, Scope scope) =>
+    Task._(
+      _Fork(
+        (_, parent, context, locals, _) => startFiber(
+          task,
+          owner: scope,
+          inheritHost: false,
+          deferStart: true,
+          context: context,
+          locals: locals,
+          report: fiberReport(parent),
+        ),
+      ),
+    );
+
+Task<T, E> accessTaskEnvironment<T, E>(
+  Task<T, E> Function(Scope scope, Context context) use,
+) => Task._(_Environment((scope, context) => use(scope, context)._node));
+
+Task<T, E> taskFromEvaluation<T, E>(TaskEvaluation<T, E> result) =>
+    Task._(switch (result.exit) {
+      ExitSuccess(:final value) => _Success(value),
+      ExitFailure(:final cause) => _Failure(cause, result.events),
+    });
+
 Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
   Task<T, E> task, {
   required Scope scope,
@@ -527,6 +557,12 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
     try {
       if (evaluating) {
         switch (current) {
+          case _Environment(:final use):
+            current = use(currentScope, currentContext);
+          case _InScope(:final source, scope: final borrowed):
+            frames.add(_Frame(scope: currentScope));
+            currentScope = borrowed;
+            current = source;
           case _ReadLocal(:final read):
             value = read(currentLocals);
             failure = null;
@@ -705,7 +741,12 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
             evaluating = false;
           case _Scoped(:final source):
             final parent = currentScope;
-            final child = createScope(parent: parent);
+            // Borrowed application scopes can outlive this execution. A local
+            // scope still belongs to the execution, so its owner cannot claim
+            // its cleanup tree and then wait for this same fiber to close it.
+            final child = createScope(
+              parent: scopeContains(scope, parent) ? parent : scope,
+            );
             currentScope = child;
             frames.add(
               _Frame(
@@ -777,6 +818,10 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
       }
 
       final frame = frames.removeLast();
+      if (frame.scope case final restored?) {
+        currentScope = restored;
+        continue;
+      }
       if (frame.locals case final restored?) {
         currentLocals = restored;
         continue;
@@ -1027,6 +1072,17 @@ final class _Service extends _Node {
   final Object? Function(Context) read;
 }
 
+final class _Environment extends _Node {
+  const _Environment(this.use);
+  final _Node Function(Scope, Context) use;
+}
+
+final class _InScope extends _Node {
+  const _InScope(this.source, this.scope);
+  final _Node source;
+  final Scope scope;
+}
+
 final class _ReadLocal extends _Node {
   const _ReadLocal(this.read);
   final Object? Function(Map<TaskLocal<Object?>, Object?>) read;
@@ -1146,6 +1202,7 @@ final class _Frame {
     this.interruptible,
     this.context,
     this.locals,
+    this.scope,
   });
   final _Node Function(Object?)? success;
   final _Node Function(Cause<Object?>, List<FailureEvent>, CancellationSignal?)?
@@ -1153,4 +1210,5 @@ final class _Frame {
   final bool? interruptible;
   final Context? context;
   final Map<TaskLocal<Object?>, Object?>? locals;
+  final Scope? scope;
 }
