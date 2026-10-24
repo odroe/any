@@ -15,6 +15,10 @@ import 'task_local.dart';
 /// [TaskOperations.forkIn]. Its owning [Scope] keeps resources alive until the
 /// fiber stops and finishes cleanup.
 ///
+/// Ownership and cancellation are registered before work starts. Deeply nested
+/// starts may be deferred to keep execution stack safe; cancellation before startup
+/// prevents the task body from running.
+///
 /// Use [join] to continue with its value or failure, [awaitExit] to inspect either
 /// outcome, and [poll] to inspect without waiting. The same result can be observed
 /// more than once. Cancelling a waiter leaves the fiber running; use [cancel] to
@@ -118,11 +122,15 @@ final class Fiber<T, E> {
 
 // Internal execution and ownership operations, not exported by any.dart.
 final _currentFibers = Object();
+// Limit the synchronous call stack across separate fiber evaluators.
+const _maxStartupDepth = 32;
+var _startupDepth = 0;
 
 // Starts an execution after synchronously registering it with [owner].
 //
-// [deferStart] breaks recursive construction of independent build workers.
-// Ownership and cancellation are installed before scheduling the first step.
+// Deeply nested starts are deferred so separate evaluators cannot recursively
+// exhaust the stack. [deferStart] also lets owners finish installing workers
+// before their first step. Ownership and cancellation are installed first.
 Fiber<T, E> startFiber<T, E>(
   Task<T, E> task, {
   required Scope owner,
@@ -144,37 +152,47 @@ Fiber<T, E> startFiber<T, E>(
     fiber,
   ];
 
-  void start() => unawaited(
-    runZoned(
-      () async {
-        TaskEvaluation<T, E> result;
-        try {
-          result = await evaluateTask(
-            task,
-            signal: fiber._controller.signal,
-            scope: fiber._scope,
-            runScope: runScope,
-            fiber: fiber,
-            context: context,
-            locals: locals,
-          );
-        } catch (error, stackTrace) {
-          result = TaskEvaluation.fresh(
-            Exit.failure(Cause.defect(error, stackTrace)),
-          );
-        }
-        unsubscribe?.call();
-        // Detach before publishing the exit: a joining parent must not collect
-        // the same failure again when it subsequently closes its own scope.
-        detachScopeFiber(owner, fiber);
-        fiber._finish(result);
-      },
-      zoneValues: {
-        _currentFibers: List<Fiber<Object?, Object?>>.unmodifiable(ancestors),
-      },
-    ),
-  );
-  if (deferStart) {
+  void start() {
+    _startupDepth++;
+    try {
+      unawaited(
+        runZoned(
+          () async {
+            TaskEvaluation<T, E> result;
+            try {
+              result = await evaluateTask(
+                task,
+                signal: fiber._controller.signal,
+                scope: fiber._scope,
+                runScope: runScope,
+                fiber: fiber,
+                context: context,
+                locals: locals,
+              );
+            } catch (error, stackTrace) {
+              result = TaskEvaluation.fresh(
+                Exit.failure(Cause.defect(error, stackTrace)),
+              );
+            }
+            unsubscribe?.call();
+            // Detach before publishing the exit: a joining parent must not collect
+            // the same failure again when it subsequently closes its own scope.
+            detachScopeFiber(owner, fiber);
+            fiber._finish(result);
+          },
+          zoneValues: {
+            _currentFibers: List<Fiber<Object?, Object?>>.unmodifiable(
+              ancestors,
+            ),
+          },
+        ),
+      );
+    } finally {
+      _startupDepth--;
+    }
+  }
+
+  if (deferStart || _startupDepth >= _maxStartupDepth) {
     scheduleMicrotask(start);
   } else {
     start();
