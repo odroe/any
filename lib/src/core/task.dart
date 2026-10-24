@@ -530,7 +530,10 @@ extension TaskOperations<T, E> on Task<T, E> {
   Task<U, E> map<U>(U Function(T value) transform) => Task._(
     _Continue(
       _node,
-      _Frame(success: (value) => _Success(transform(value as T))),
+      _Frame(
+        consumesValue: true,
+        success: (value) => _Success(transform(value as T)),
+      ),
     ),
   );
 
@@ -539,7 +542,10 @@ extension TaskOperations<T, E> on Task<T, E> {
   /// Both tasks share the execution and resource scope. A failure skips [next].
   /// Use [mapError] to align different business error types before composing.
   Task<U, E> flatMap<U>(Task<U, E> Function(T value) next) => Task._(
-    _Continue(_node, _Frame(success: (value) => next(value as T)._node)),
+    _Continue(
+      _node,
+      _Frame(consumesValue: true, success: (value) => next(value as T)._node),
+    ),
   );
 
   /// Runs [action] on success and preserves the original value.
@@ -695,7 +701,7 @@ Future<TaskEvaluation<T, E>> evaluateTask<T, E>(
   List<Scope> closingScopes = const [],
 }) async {
   final ownedScope = scope ?? createScope();
-  final (evaluated, cancelled, observed) = await _evaluate(
+  final (evaluated, cancelled, observed, observation) = await _evaluate(
     task,
     interruptible: interruptible,
     signal: signal,
@@ -719,13 +725,23 @@ Future<TaskEvaluation<T, E>> evaluateTask<T, E>(
     cancellationObserved = true;
   }
   await closeScope(ownedScope, result.exit);
-  result = _appendEvaluation(
-    result,
-    scopeCleanupFor(ownedScope, {
-      ...observed,
-      for (final event in result.events) event.source,
-    }),
-  );
+  final excluded = {
+    ...observed,
+    for (final event in result.events) event.source,
+  };
+  var cleanup = scopeCleanupFor(ownedScope, {
+    ...excluded,
+    ...?observation?.sources,
+  });
+  // Pending exits can be returned only if cleanup and cancellation preserve the
+  // successful value. Otherwise retain their defects in the owner cleanup.
+  if (observation != null &&
+      (result.exit is ExitFailure<T, E> ||
+          cleanup.exit is ExitFailure<void, Never> ||
+          (interruptible && (signal?.isCancelled ?? false)))) {
+    cleanup = scopeCleanupFor(ownedScope, excluded);
+  }
+  result = _appendEvaluation(result, cleanup);
   if (interruptible &&
       !cancellationObserved &&
       (signal?.isCancelled ?? false)) {
@@ -735,6 +751,10 @@ Future<TaskEvaluation<T, E>> evaluateTask<T, E>(
       cleanupCancellations: result.cleanupCancellations,
     );
   }
+  if (result.exit is ExitFailure<T, E>) {
+    result = _prependPendingCleanup(result, observation?.cleanup ?? const []);
+  }
+  observation?.complete(result.exit is ExitSuccess<T, E>);
   return result;
 }
 
@@ -849,7 +869,14 @@ Task<T, E> taskFromEvaluation<T, E>(TaskEvaluation<T, E> result) =>
       ),
     });
 
-Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
+typedef _FiberObservation = ({
+  Set<Object> sources,
+  List<FailureEvent> cleanup,
+  void Function(bool) complete,
+});
+
+Future<(TaskEvaluation<T, E>, bool, Set<Object>, _FiberObservation?)>
+_evaluate<T, E>(
   Task<T, E> task, {
   required Scope scope,
   required Scope runScope,
@@ -865,6 +892,9 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
   // Observation affects automatic cleanup merging within this execution only.
   // Finalizers have independent executions, even when they belong to this fiber.
   final observed = <Object>{};
+  // A captured fiber exit is still only a pending value until a continuation
+  // consumes it, or the execution returns it after cleanup.
+  _FiberObservation? observation;
   var evaluating = true;
   var currentScope = scope;
   var currentContext = context;
@@ -875,9 +905,35 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
   var cleanupCancellations = const <CauseCancelled>[];
   var remaining = 2048;
 
+  void finishObservation(bool consumed) {
+    final pending = observation;
+    if (pending == null) return;
+    if (consumed) {
+      observed.addAll(pending.sources);
+    } else {
+      final completed = _prependPendingCleanup(
+        TaskEvaluation<Object?, Object?>(
+          failure == null ? Exit.success(value) : Exit.failure(failure!),
+          events,
+          cleanupCancellations: cleanupCancellations,
+        ),
+        pending.cleanup,
+      );
+      failure = switch (completed.exit) {
+        ExitFailure(:final cause) => cause,
+        _ => null,
+      };
+      events = completed.events;
+      cleanupCancellations = completed.cleanupCancellations;
+    }
+    pending.complete(consumed);
+    observation = null;
+  }
+
   while (true) {
     final effectiveSignal = interruptible ? signal : null;
     if (effectiveSignal?.isCancelled ?? false) {
+      finishObservation(false);
       return (
         TaskEvaluation(
           Exit<T, E>.failure(_cancelled(failure, effectiveSignal!.reason)),
@@ -886,6 +942,7 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
         ),
         true,
         observed,
+        null,
       );
     }
     if (--remaining == 0) {
@@ -971,13 +1028,25 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
             if (cancel) target.requestCancel(reason: reason);
             var delivered = const <FailureEvent>[];
             var deliveredCleanups = const <CauseCancelled>[];
+            if (!join) {
+              observation = (
+                sources: <Object>{},
+                cleanup: <FailureEvent>[],
+                complete: reserveFiberObservation(target),
+              );
+            }
             final pending = _runCallback(
               (complete) => listenFiber(target, (exit) {
                 delivered = fiberFailureEvents(target);
                 deliveredCleanups = fiberCleanupCancellations(target);
-                observed.addAll(delivered.map((event) => event.source));
+                final sources = delivered.map((event) => event.source);
+                if (join) {
+                  observed.addAll(sources);
+                } else {
+                  observation!.sources.addAll(sources);
+                }
                 complete(join ? exit : Exit.success(exit));
-              }),
+              }, observe: join),
               effectiveSignal,
             );
             final exit = pending is Future<Exit<Object?, Object?>>
@@ -1018,7 +1087,7 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
                   onError == null || (effectiveSignal?.isCancelled ?? false)
                   ? Cause.defect(error, stackTrace)
                   : Cause.failure(onError(error, stackTrace));
-              events = _failureEvents(failure);
+              events = _failureEvents(failure!);
               cleanupCancellations = const [];
               evaluating = false;
             }
@@ -1043,7 +1112,7 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
               failure = effectiveSignal?.isCancelled ?? false
                   ? Cause.defect(error, stackTrace)
                   : Cause.failure(onError(error, stackTrace));
-              events = _failureEvents(failure);
+              events = _failureEvents(failure!);
               cleanupCancellations = const [];
             }
             evaluating = false;
@@ -1152,16 +1221,35 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
             cleanupCancellations: final bodyCleanups,
           ):
             await closeScope(scope, exit);
+            final excluded = {
+              ...observed,
+              for (final event in bodyEvents) event.source,
+            };
+            final fullCleanup = scopeCleanupFor(scope, excluded);
+            final filteredCleanup = scopeCleanupFor(scope, {
+              ...excluded,
+              ...?observation?.sources,
+            });
+            final canDeliver =
+                exit is ExitSuccess &&
+                filteredCleanup.exit is ExitSuccess<void, Never> &&
+                !(effectiveSignal?.isCancelled ?? false);
+            if (observation case final pending? when canDeliver) {
+              // This scope detaches after closing. Keep the excluded occurrences
+              // until delivery so a later cancellation or failure can retain them.
+              pending.cleanup.addAll(
+                fullCleanup.events.where(
+                  (event) => pending.sources.contains(event.source),
+                ),
+              );
+            }
             final completed = _appendEvaluation(
               TaskEvaluation(
                 exit,
                 bodyEvents,
                 cleanupCancellations: bodyCleanups,
               ),
-              scopeCleanupFor(scope, {
-                ...observed,
-                for (final event in bodyEvents) event.source,
-              }),
+              canDeliver ? filteredCleanup : fullCleanup,
             );
             switch (completed.exit) {
               case ExitSuccess(value: final result):
@@ -1172,6 +1260,7 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
             }
             events = completed.events;
             cleanupCancellations = completed.cleanupCancellations;
+            if (!canDeliver) finishObservation(false);
             evaluating = false;
           case _CloseScope(:final scope, :final exit):
             if (scopeCloseWouldDeadlock(scope, currentScope) ||
@@ -1204,7 +1293,7 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
       if (frames.isEmpty) {
         final Exit<T, E> exit = failure == null
             ? Exit.success(value as T)
-            : Exit.failure(_typedCause<E>(failure));
+            : Exit.failure(_typedCause<E>(failure!));
         return (
           TaskEvaluation(
             exit,
@@ -1213,6 +1302,7 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
           ),
           false,
           observed,
+          observation,
         );
       }
 
@@ -1236,10 +1326,17 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
       if (failure case final cause?) {
         final resume = frame.failure;
         if (resume == null) continue;
-        current = resume(cause, events, cleanupCancellations, effectiveSignal);
+        finishObservation(false);
+        current = resume(
+          failure ?? cause,
+          events,
+          cleanupCancellations,
+          effectiveSignal,
+        );
       } else {
         final resume = frame.success;
         if (resume == null) continue;
+        if (frame.consumesValue) finishObservation(true);
         current = resume(value);
       }
       // A continuation has already produced this failure. Record it before the
@@ -1272,7 +1369,7 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
       }
     } catch (error, stackTrace) {
       failure = Cause.defect(error, stackTrace);
-      events = _failureEvents(failure);
+      events = _failureEvents(failure!);
       cleanupCancellations = const [];
       evaluating = false;
     }
@@ -1322,6 +1419,29 @@ _Failure _preserveFailure(
     for (final cancellation in _cancellations(cause))
       if (available.remove(cancellation)) cancellation,
   ]);
+}
+
+TaskEvaluation<T, E> _prependPendingCleanup<T, E>(
+  TaskEvaluation<T, E> result,
+  List<FailureEvent> pending,
+) {
+  if (pending.isEmpty) return result;
+  final sources = {for (final event in result.events) event.source};
+  final events = [
+    for (final event in pending)
+      if (sources.add(event.source)) event,
+  ];
+  if (events.isEmpty) return result;
+  return TaskEvaluation(
+    Exit.failure(
+      Cause<E>.combine([
+        for (final event in events) event.cause,
+        if (result.exit case ExitFailure(:final cause)) cause,
+      ]),
+    ),
+    [...events, ...result.events],
+    cleanupCancellations: result.cleanupCancellations,
+  );
 }
 
 TaskEvaluation<T, E> _appendEvaluation<T, E>(
@@ -1652,12 +1772,14 @@ final class _Frame {
   const _Frame({
     this.success,
     this.failure,
+    this.consumesValue = false,
     this.interruptible,
     this.context,
     this.locals,
     this.scope,
   });
   final _Node Function(Object?)? success;
+  final bool consumesValue;
   final _Node Function(
     Cause<Object?>,
     List<FailureEvent>,

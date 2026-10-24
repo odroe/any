@@ -37,6 +37,8 @@ final class Fiber<T, E> {
   Exit<T, E>? _exit;
   var _active = true;
   var _observed = false;
+  var _pendingObservations = 0;
+  var _reportReady = false;
   var _defectsHandledByOwner = false;
 
   /// Returns the completed exit, or [OptionNone] if the fiber is still running.
@@ -53,8 +55,10 @@ final class Fiber<T, E> {
   /// Returns a task that waits for this fiber's value or failure as an [Exit].
   ///
   /// Cancelling the wait leaves the fiber running and does not mark an undelivered
-  /// result as observed. Waiting on oneself, or on work that must wait for the
-  /// caller, fails with a [StateError] defect instead of deadlocking.
+  /// result as observed. The result is observed when a continuation receives it
+  /// or the waiting execution returns it. Waiting on oneself, or on work that
+  /// must wait for the caller, fails with a [StateError] defect instead of
+  /// deadlocking.
   Task<Exit<T, E>, Never> awaitExit() => awaitFiberTask(this);
 
   /// Returns a task that waits for this fiber and adopts its value or failure.
@@ -78,15 +82,22 @@ final class Fiber<T, E> {
   Task<Exit<T, E>, Never> cancel({Object? reason}) =>
       awaitFiberTask(this, cancel: true, reason: reason);
 
-  void Function() _listen(void Function(Exit<T, E>) listener) {
+  void Function() _listen(
+    void Function(Exit<T, E>) listener, {
+    required bool observe,
+  }) {
+    void notify(Exit<T, E> exit) {
+      if (observe) _observed = true;
+      listener(exit);
+    }
+
     final exit = _exit;
     if (exit != null) {
-      _observed = true;
-      listener(exit);
+      notify(exit);
       return () {};
     }
     final token = Object();
-    _listeners[token] = Zone.current.bindUnaryCallbackGuarded(listener);
+    _listeners[token] = Zone.current.bindUnaryCallbackGuarded(notify);
     return () => _listeners.remove(token);
   }
 
@@ -99,10 +110,7 @@ final class Fiber<T, E> {
     _completion.complete(exit);
     for (final token in _listeners.keys.toList()) {
       final listener = _listeners.remove(token);
-      if (listener != null) {
-        _observed = true;
-        listener(exit);
-      }
+      if (listener != null) listener(exit);
     }
 
     if (exit case ExitFailure(:final cause)) {
@@ -110,15 +118,22 @@ final class Fiber<T, E> {
       if (!reasons.any((reason) => reason is! CauseCancelled)) return;
       _zone.run(() {
         Timer.run(() {
-          if (_observed) return;
-          final unhandled = _defectsHandledByOwner
-              ? reasons.whereType<CauseFailure<E>>().toList()
-              : reasons;
-          if (unhandled.isEmpty) return;
-          _zone.runGuarded(() => _report(Cause.combine(unhandled)));
+          _reportReady = true;
+          _reportUnhandled();
         });
       });
     }
+  }
+
+  void _reportUnhandled() {
+    if (!_reportReady || _observed || _pendingObservations != 0) return;
+    _reportReady = false;
+    final reasons = _reasons((_exit as ExitFailure<T, E>).cause);
+    final unhandled = _defectsHandledByOwner
+        ? reasons.whereType<CauseFailure<E>>().toList()
+        : reasons;
+    if (unhandled.isEmpty) return;
+    _zone.runGuarded(() => _report(Cause.combine(unhandled)));
   }
 }
 
@@ -231,11 +246,26 @@ List<CauseCancelled> fiberCleanupCancellations(Fiber<Object?, Object?> fiber) =>
 List<Fiber<Object?, Object?>> currentFibers() =>
     Zone.current[_currentFibers] as List<Fiber<Object?, Object?>>? ?? const [];
 
-// Subscribes to delivery; removing the subscription does not observe the exit.
+// Captured exits can defer observation until their consumer accepts delivery.
 void Function() listenFiber<T, E>(
   Fiber<T, E> fiber,
-  void Function(Exit<T, E> exit) listener,
-) => fiber._listen(listener);
+  void Function(Exit<T, E> exit) listener, {
+  bool observe = true,
+}) => fiber._listen(listener, observe: observe);
+
+// Delay reporting while an exit is being handed to a cancellable consumer.
+// Commit only when consumed; abandoning the last delivery releases the report.
+void Function(bool) reserveFiberObservation(Fiber<Object?, Object?> fiber) {
+  fiber._pendingObservations++;
+  var pending = true;
+  return (observed) {
+    if (!pending) return;
+    pending = false;
+    if (observed) fiber._observed = true;
+    fiber._pendingObservations--;
+    fiber._reportUnhandled();
+  };
+}
 
 Future<Exit<T, E>> fiberCompletion<T, E>(
   Fiber<T, E> fiber, {
