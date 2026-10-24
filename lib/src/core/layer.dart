@@ -142,25 +142,32 @@ extension TaskLayerOperations<T, E> on Task<T, E> {
   /// If construction fails, the task does not start; acquired resources are
   /// released when the caller's scope closes. Use `provide(layer).scoped()`
   /// when the service lifetime should end with this operation.
+  /// Cancellation stops construction and waits for its cleanup before returning.
   Task<T, E> provide(Layer<E> layer) => accessTaskEnvironment(
     (scope, _) => buildLayer(layer, scope).flatMap(provideContext),
   );
 }
 
-// Runtime and local provision share this construction boundary.
+// Construction owns its workers, while services retain the receiving scope.
 Task<Context, E> buildLayer<E>(Layer<E> layer, Scope scope) =>
-    Task.defer(() => _BuildSession(scope).build(layer));
+    accessTaskEnvironment(
+      (owner, _) => inTaskScope(
+        Task.defer(() => _BuildSession(owner, scope).build(layer)),
+        scope,
+      ),
+    ).scoped();
 
 final class _BuildSession {
-  _BuildSession(this.scope);
+  _BuildSession(this.owner, this.scope);
 
+  final Scope owner;
   final Scope scope;
   final _entries = Map<Layer<Object?>, _BuildEntry>.identity();
 
   Task<Context, E> build<E>(Layer<E> layer) =>
       Task.uninterruptibleMask((restore) {
         if (layer._fresh) {
-          return restore(layer._create(_BuildSession(scope)));
+          return restore(layer._create(_BuildSession(owner, scope)));
         }
         final existing = _entries[layer];
         if (existing != null) return restore(existing.wait<E>());
@@ -170,7 +177,8 @@ final class _BuildSession {
         // publication atomic with respect to cancellation of the first waiter.
         return forkTaskIn(
           Task.defer(() => layer._create(this)),
-          scope,
+          owner,
+          resourceScope: scope,
         ).exit().withError<E>().flatMap((started) {
           if (started case ExitSuccess(:final value)) {
             // The build session owns the result even if every waiter left.
