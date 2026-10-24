@@ -5,6 +5,258 @@ import 'package:test/test.dart';
 
 void main() {
   group('Task.uninterruptibleMask', () {
+    for (final concurrency in [1, 2]) {
+      test('all preserves the mask with concurrency $concurrency', () async {
+        final controller = CancellationController();
+        final events = <String>[];
+        final task = Task.uninterruptibleMask<void, Never>((_) {
+          return Task.all([
+            Task.sync(() {
+              events.add('first');
+              controller.requestCancel(reason: 'owner');
+              return 1;
+            }).map((value) {
+              events.add('first continuation');
+              return value;
+            }),
+            Task.sync(() {
+              events.add('second');
+              return 2;
+            }),
+          ], concurrency: concurrency).map((values) {
+            expect(values, [1, 2]);
+            events.add('collected');
+          });
+        });
+
+        expect(
+          _cancelReason(await _run(task, signal: controller.signal)),
+          'owner',
+        );
+        expect(events, ['first', 'first continuation', 'second', 'collected']);
+      });
+
+      test(
+        'all preserves worker restore with concurrency $concurrency',
+        () async {
+          final controller = CancellationController();
+          var protected = false;
+          final task = Task.uninterruptibleMask<List<int>, Never>((restore) {
+            controller.requestCancel(reason: 'restored worker');
+            return Task.all([
+              Task.sync(() {
+                protected = true;
+                return 1;
+              }),
+              restore(
+                Task.sync<int>(() => fail('Restored work must not start')),
+              ),
+            ], concurrency: concurrency);
+          });
+
+          final cause = _cause(await _run(task, signal: controller.signal));
+          final causes = switch (cause) {
+            CauseGroup(:final causes) => causes,
+            _ => [cause],
+          };
+          expect(causes, isNotEmpty);
+          expect(
+            causes,
+            everyElement(
+              isA<CauseCancelled>().having(
+                (cause) => cause.reason,
+                'reason',
+                'restored worker',
+              ),
+            ),
+          );
+          expect(protected, isTrue);
+        },
+      );
+    }
+
+    test('nested all and nested restore retain the inherited mask', () async {
+      final controller = CancellationController();
+      var collected = false;
+      final task = Task.uninterruptibleMask<void, Never>((_) {
+        return Task.all([
+          Task.uninterruptibleMask<List<int>, Never>((restore) {
+            controller.requestCancel(reason: 'nested all');
+            return restore(
+              Task.all([Task.succeed(1), Task.succeed(2)], concurrency: 2),
+            );
+          }),
+        ]).map((values) {
+          expect(values, [
+            [1, 2],
+          ]);
+          collected = true;
+        });
+      });
+
+      expect(
+        _cancelReason(await _run(task, signal: controller.signal)),
+        'nested all',
+      );
+      expect(collected, isTrue);
+    });
+
+    test('all collects after cancellation during worker cleanup', () async {
+      final controller = CancellationController();
+      final cleaning = Completer<void>();
+      final release = Completer<void>();
+      final events = <String>[];
+      final worker = Task.addFinalizer((_) {
+        return Task.fromFuture<void, Never>(() async {
+          events.add('cleanup started');
+          cleaning.complete();
+          await release.future;
+          events.add('cleanup finished');
+        }, onError: Error.throwWithStackTrace);
+      }).flatMap((_) => Task.succeed(1));
+      final task = Task.uninterruptibleMask<void, Never>((_) {
+        return Task.all([worker, Task.succeed(2)], concurrency: 2).map((
+          values,
+        ) {
+          expect(values, [1, 2]);
+          events.add('collected');
+        });
+      }).map((_) => fail('Cancellation must be restored outside the mask'));
+
+      final running = _run(task, signal: controller.signal);
+      await cleaning.future;
+      controller.requestCancel(reason: 'during cleanup');
+      release.complete();
+
+      expect(_cancelReason(await running), 'during cleanup');
+      expect(events, ['cleanup started', 'cleanup finished', 'collected']);
+    });
+
+    test('all recovers a worker Future error after cancellation', () async {
+      final controller = CancellationController();
+      final started = Completer<void>();
+      final pending = Completer<int>();
+      final events = <String>[];
+      final error = StateError('worker');
+      final stack = StackTrace.fromString('worker Future stack');
+      final worker =
+          Task.fromFuture<int, String>(
+            () {
+              started.complete();
+              return pending.future;
+            },
+            onError: (caught, caughtStack) {
+              expect(caught, same(error));
+              expect(caughtStack, same(stack));
+              events.add('onError');
+              return 'failed';
+            },
+          ).recover((failure) {
+            expect(failure, 'failed');
+            events.add('recovered');
+            return Task.succeed(1);
+          });
+      final task = Task.uninterruptibleMask<void, String>((_) {
+        return Task.all([
+          worker,
+          Task.succeed(2).withError<String>(),
+        ], concurrency: 2).map((values) {
+          expect(values, [1, 2]);
+          events.add('collected');
+        });
+      }).map((_) => fail('Cancellation must be restored outside the mask'));
+
+      final running = _run(task, signal: controller.signal);
+      await started.future;
+      controller.requestCancel(reason: 'pending Future');
+      pending.completeError(error, stack);
+
+      expect(_cancelReason(await running), 'pending Future');
+      expect(events, ['onError', 'recovered', 'collected']);
+    });
+
+    for (final operation in ['allSettled', 'zip', 'forEach']) {
+      test('$operation inherits the enclosing mask', () async {
+        final controller = CancellationController();
+        final events = <String>[];
+        final workers = [
+          Task.sync(() {
+            events.add('first');
+            controller.requestCancel(reason: operation);
+            return 1;
+          }),
+          Task.checkCancelled().map((_) {
+            events.add('second');
+            return 2;
+          }),
+        ];
+        final task = Task.uninterruptibleMask<void, Never>((_) {
+          final Task<List<int>, Never> collected = switch (operation) {
+            'allSettled' => Task.allSettled(
+              workers,
+              concurrency: 2,
+            ).map((exits) => exits.map(_value).toList()),
+            'zip' => Task.zip(
+              workers[0],
+              workers[1],
+              concurrency: 2,
+            ).map((pair) => [pair.$1, pair.$2]),
+            _ => Task.forEach(workers, (worker) => worker, concurrency: 2),
+          };
+          return collected.map((values) {
+            expect(values, [1, 2]);
+            events.add('collected');
+          });
+        });
+
+        expect(
+          _cancelReason(await _run(task, signal: controller.signal)),
+          operation,
+        );
+        expect(events, ['first', 'second', 'collected']);
+      });
+    }
+
+    for (final operation in ['race', 'firstSuccess', 'timeout']) {
+      test('$operation cancels pending work inside a mask', () async {
+        final started = Completer<void>();
+        void Function(Exit<int, String>)? finish;
+        var cancellations = 0;
+        final pending = Task.fromCallback<int, String>((complete) {
+          finish = complete;
+          started.complete();
+          return () {
+            cancellations++;
+          };
+        });
+        final winner = Task.fromFuture<void, Never>(
+          () => started.future,
+          onError: Error.throwWithStackTrace,
+        ).map((_) => 1).withError<String>();
+        final task = Task.uninterruptibleMask<int, String>((_) {
+          return switch (operation) {
+            'race' => Task.race([pending, winner]),
+            'firstSuccess' => Task.firstSuccess([pending, winner]),
+            _ => pending.timeout(Duration.zero, onTimeout: () => 'deadline'),
+          };
+        });
+
+        final running = _run(task);
+        try {
+          final exit = await running.timeout(const Duration(seconds: 2));
+          if (operation == 'timeout') {
+            expect((_cause(exit) as CauseFailure<String>).error, 'deadline');
+          } else {
+            expect(_value(exit), 1);
+          }
+          expect(cancellations, 1);
+        } finally {
+          finish?.call(Exit.success(-1));
+          await running;
+        }
+      });
+    }
+
     test('constructs its body lazily on every execution', () async {
       var bodies = 0;
       var restoredRuns = 0;
