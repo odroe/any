@@ -38,6 +38,98 @@ void main() {
     expect(_value(await runtime.run(second.acquire('a'))), 2);
   });
 
+  test('use releases its lease and capacity before continuing', () async {
+    final released = <String>[];
+    final map = await _own(
+      runtime,
+      SharedResourceMap.create<String, String, String>(
+        capacity: 1,
+        acquire: (key) => Task.acquireRelease(
+          Task.succeed(key),
+          release: (value, _) => Task.sync(() => released.add(value)),
+        ),
+        onCapacityExceeded: (key) => 'full:$key',
+      ),
+    );
+
+    final result = await runtime.run(
+      map.use('a', (value) => Task.succeed('$value!')).flatMap((first) {
+        expect(first, 'a!');
+        expect(released, ['a']);
+        return map.use('b', Task.succeed);
+      }),
+    );
+
+    expect(_value(result), 'b');
+    expect(released, ['a', 'b']);
+  });
+
+  test('widened use returns its lease before business recovery', () async {
+    final released = <String>[];
+    final original = await _own(
+      runtime,
+      SharedResourceMap.create<String, String, Never>(
+        capacity: 1,
+        acquire: (key) => Task.acquireRelease(
+          Task.succeed(key),
+          release: (value, _) => Task.sync(() => released.add(value)),
+        ),
+        onCapacityExceeded: (_) => throw StateError('unexpected capacity'),
+      ),
+    );
+    final SharedResourceMap<String, String, String> map = original;
+
+    final result = await runtime.run(
+      map.use<String>('a', (_) => Task.fail('operation failed')).recover((
+        error,
+      ) {
+        expect(error, 'operation failed');
+        expect(released, ['a']);
+        return map.use('b', Task.succeed);
+      }),
+    );
+
+    expect(_value(result), 'b');
+    expect(released, ['a', 'b']);
+  });
+
+  test(
+    'overlapping uses share one resource and preserve idle retention',
+    () async {
+      var starts = 0;
+      final released = <int>[];
+      final hold = _Gate<int, String>();
+      final map = await _own(
+        runtime,
+        SharedResourceMap.create<String, int, String>(
+          capacity: 1,
+          acquire: (_) => Task.acquireRelease(
+            Task.sync(() => ++starts),
+            release: (value, _) => Task.sync(() => released.add(value)),
+          ),
+          onCapacityExceeded: (key) => 'full:$key',
+          idleTimeout: ttl,
+        ),
+      );
+      final first = runtime.run(map.use('a', (_) => hold.task));
+      await hold.started.future;
+
+      expect(_value(await runtime.run(map.use('a', Task.succeed))), 1);
+      expect(clock.pendingCount, 0);
+      expect(released, isEmpty);
+      hold.succeed(1);
+      expect(_value(await first), 1);
+      expect(clock.pendingCount, 1);
+      expect(_value(await runtime.run(map.use('a', Task.succeed))), 1);
+      expect(starts, 1);
+      expect(released, isEmpty);
+
+      await runtime.run(map.invalidate('a'));
+      expect(released, [1]);
+      expect(clock.pendingCount, 0);
+    },
+  );
+
   test('invalid capacity and timeout become execution defects', () async {
     for (final capacity in [0, -1]) {
       final create = SharedResourceMap.create<String, int, String>(

@@ -14,7 +14,7 @@ import 'task.dart';
 /// runtime must release their own leases.
 ///
 /// Keep the map inside its owner's lifetime. For one operation, use
-/// `resources.acquire(key).flatMap(use).scoped()` to release the lease promptly.
+/// `resources.use(key, use)` to release the lease promptly.
 /// Returning the map from a finished `Runtime.run` does not keep it open.
 final class SharedResourceMap<K, T, E> {
   SharedResourceMap._(this._state);
@@ -61,7 +61,21 @@ extension SharedResourceMapOperations<K, T, E> on SharedResourceMap<K, T, E> {
   ///
   /// A closed map fails with a [StateError] defect. Waiting for the owner to close
   /// while holding a lease also fails if closing would wait for the caller.
+  /// Use [use] to release the lease after one operation.
   Task<T, E> acquire(K key) => Task.defer(() => _state.acquire(key));
+
+  /// Borrows the resource for [key] and releases its lease before completing.
+  ///
+  /// Runs [use] in a child scope and returns the callback's value on success.
+  /// Success, failure, and cancellation wait for the scope to close and release
+  /// the lease. If the last lease closes the resource, cleanup finishes first.
+  /// Other leases and the configured idle timeout can keep the resource open
+  /// and occupying capacity.
+  ///
+  /// Callback and cleanup failures are both preserved; thrown callback exceptions
+  /// become defects. Return values must remain usable after the lease ends.
+  Task<U, E> use<U>(K key, Task<U, E> Function(T value) use) =>
+      acquire(key).flatMap(use).scoped();
 
   /// Makes future callers of [key] acquire a replacement resource.
   ///
