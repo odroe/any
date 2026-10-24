@@ -161,14 +161,17 @@ void main() {
       final defect = StateError('release');
       final source = Flow.fromTask(
         Task.acquireRelease(
-          Task.succeed(1),
-          release: (_, _) => Task.sync(() => throw defect),
-        ).withError<String>().flatMap(
-          (_) => Task.fromCallback<int, String>((_) {
-            entered.complete();
-            return () {};
-          }),
-        ),
+              Task.succeed(1),
+              release: (_, _) => Task.sync(() => throw defect),
+            )
+            .withError<String>()
+            .flatMap(
+              (_) => Task.fromCallback<int, String>((_) {
+                entered.complete();
+                return () {};
+              }),
+            )
+            .scoped(),
       );
       final running = runtime.run(
         source

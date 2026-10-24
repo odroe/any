@@ -12,8 +12,8 @@ import 'task_local.dart';
 /// A handle to one running [Task] and its eventual [Exit].
 ///
 /// Create a fiber with `Runtime.start`, [TaskOperations.fork], or
-/// [TaskOperations.forkIn]. Its owning [Scope] keeps resources alive until the
-/// fiber stops and finishes cleanup.
+/// [TaskOperations.forkIn]. A child can borrow a resource [Scope] that outlives
+/// its execution. Finishing the child does not close that borrowed scope.
 ///
 /// Ownership and cancellation are registered before work starts. Deeply nested
 /// starts may be deferred to keep execution stack safe; cancellation before startup
@@ -76,9 +76,10 @@ final class Fiber<T, E> {
 
   /// Returns a task that cancels this fiber and waits for its [Exit].
   ///
-  /// Completion includes resource cleanup. An in-flight, non-cancellable [Future]
-  /// can therefore delay the result. A self-wait or ancestor wait fails with a
-  /// [StateError] defect before requesting cancellation.
+  /// Completion includes the fiber's own cleanup, without closing borrowed
+  /// resources. An in-flight, non-cancellable [Future] can delay the result.
+  /// A self-wait or ancestor wait fails with a [StateError] defect before
+  /// requesting cancellation.
   Task<Exit<T, E>, Never> cancel({Object? reason}) =>
       awaitFiberTask(this, cancel: true, reason: reason);
 
@@ -159,9 +160,22 @@ Fiber<T, E> startFiber<T, E>(
   bool interruptible = true,
   CancellationSignal? signal,
   Scope? runScope,
+  Scope? resourceScope,
 }) {
-  final fiber = Fiber<T, E>._(createScope(), report);
+  final fiber = Fiber<T, E>._(
+    createScope(runtimeId: scopeRuntimeId(owner)),
+    report,
+  );
   attachScopeFiber(owner, fiber);
+  final void Function()? releaseBorrow;
+  try {
+    releaseBorrow = resourceScope == null || identical(resourceScope, owner)
+        ? null
+        : borrowScopeFiber(resourceScope, fiber);
+  } catch (_) {
+    detachScopeFiber(owner, fiber);
+    rethrow;
+  }
   final unsubscribe = signal?.onCancel(
     (reason) => fiber.requestCancel(reason: reason),
   );
@@ -183,6 +197,7 @@ Fiber<T, E> startFiber<T, E>(
                 interruptible: interruptible,
                 signal: fiber._controller.signal,
                 scope: fiber._scope,
+                resourceScope: resourceScope,
                 runScope: runScope,
                 fiber: fiber,
                 context: context,
@@ -197,6 +212,7 @@ Fiber<T, E> startFiber<T, E>(
             // Detach before publishing the exit: a joining parent must not collect
             // the same failure again when it subsequently closes its own scope.
             detachScopeFiber(owner, fiber);
+            releaseBorrow?.call();
             fiber._finish(result);
           },
           zoneValues: {

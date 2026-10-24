@@ -288,10 +288,10 @@ void main() {
     expect(open, isFalse);
   });
 
-  test('cleanup cancellation remains complete and is not repeated', () async {
+  test('owner cleanup preserves repeated cancellation occurrences', () async {
     const cancellation = Cause<Never>.cancelled('cleanup');
     final defect = StateError('cleanup');
-    final shared = await _own(
+    final owner = _Owner(
       runtime,
       Flow.fromTask(
         Task.acquireRelease(
@@ -306,19 +306,22 @@ void main() {
         ),
       ).share(capacity: 1),
     );
-    final causes = _causes(await runtime.run(shared.toList()));
+    final shared = await owner.ready.future;
+    expect(_value(await runtime.run(shared.toList())), [1]);
+    expect(_value(await runtime.run(shared.toList())), isEmpty);
+    owner.release();
+    final causes = _causes(await owner.done);
     expect(causes, hasLength(3));
     expect(causes[0], same(cancellation));
     expect((causes[1] as CauseDefect).error, same(defect));
     expect(causes[2], same(cancellation));
-    expect(_causes(await runtime.run(shared.toList())), hasLength(3));
   });
 
   test('downstream buffering keeps earlier inner producers alive', () async {
     final gate = Completer<void>();
     final open = <int>{};
     final released = <int>[];
-    final shared = await _own(
+    final owner = _Owner(
       runtime,
       Flow.fromIterable([1, 2, 3])
           .flatMap(
@@ -337,6 +340,7 @@ void main() {
           )
           .share(capacity: 2),
     );
+    final shared = await owner.ready.future;
     final running = runtime.run(
       shared.buffer(3).forEach((value) {
         expect(open, contains(value));
@@ -349,7 +353,10 @@ void main() {
     expect(released, isEmpty);
     gate.complete();
     expect(await running, isA<ExitSuccess>());
-    expect(released, [1, 2, 3]);
+    expect(released, isEmpty);
+    owner.release();
+    expect(await owner.done, isA<ExitSuccess>());
+    expect(released, [3, 2, 1]);
     expect(open, isEmpty);
   });
 
@@ -451,15 +458,17 @@ void main() {
         runtime,
         Flow.fromTask(
           Task.acquireRelease(
-            Task.sync(() {
-              started.complete();
-              return 1;
-            }),
-            release: (_, _) =>
-                Task.sync(() => cleaning.complete())
-                    .flatMap((_) => _future(release.future))
-                    .flatMap((_) => Task.failCause(cleanup)),
-          ).flatMap((_) => Task.fromCallback<int, Never>((_) => () {})),
+                Task.sync(() {
+                  started.complete();
+                  return 1;
+                }),
+                release: (_, _) =>
+                    Task.sync(() => cleaning.complete())
+                        .flatMap((_) => _future(release.future))
+                        .flatMap((_) => Task.failCause(cleanup)),
+              )
+              .flatMap((_) => Task.fromCallback<int, Never>((_) => () {}))
+              .scoped(),
         ).share(capacity: 1),
       );
       var done = false;
@@ -627,9 +636,10 @@ void main() {
             causes.single,
             cancelled ? isA<CauseCancelled>() : isA<CauseFailure<String>>(),
           );
-          expect(released, acquired);
+          expect(released, isEmpty);
           owner.release();
           expect(await owner.done, isA<ExitSuccess>());
+          expect(released, acquired);
         },
       );
     }
@@ -801,11 +811,13 @@ void main() {
         runtime,
         Flow.fromTask(
           Task.acquireRelease(
-            Task.sync(() => started.complete()),
-            release: (_, _) =>
-                Task.sync(() => cleaning.complete())
-                    .flatMap((_) => _future(release.future)),
-          ).flatMap((_) => Task.fromCallback<int, Never>((_) => () {})),
+                Task.sync(() => started.complete()),
+                release: (_, _) =>
+                    Task.sync(() => cleaning.complete())
+                        .flatMap((_) => _future(release.future)),
+              )
+              .flatMap((_) => Task.fromCallback<int, Never>((_) => () {}))
+              .scoped(),
         ).share(capacity: 1),
       );
       final first = runtime.run(shared.toList(), signal: firstCancel.signal);
@@ -837,7 +849,7 @@ void main() {
                 Task.sync(() => cleaning.complete())
                     .flatMap((_) => _future(release.future))
                     .flatMap((_) => Task.failCause(cleanup)),
-          ),
+          ).scoped(),
         ).share(capacity: 1),
       );
       final running = runtime.run(shared.toList(), signal: controller.signal);

@@ -8,10 +8,20 @@ import '../scope.dart';
 import '../task.dart';
 
 // A pull acknowledges the preceding delivery; its transport slot can be reused.
-// Operators retaining values must retain this resource snapshot before pulling
-// again. Finishing production retires scopes without waiting on downstream leases.
+// Operators retaining values retain their transport producers before pulling
+// again. Retirement waits on downstream leases, independently of user resources.
 final class FlowCursor<T, E> {
-  FlowCursor(this._pull, this.scopeForValue, this.finish, this.producers);
+  FlowCursor(
+    this._pull,
+    this.scopeForValue,
+    this.finish,
+    this.producers, {
+    required this.resourceScope,
+  });
+
+  // User tasks borrow the consumer's resources. Producer scopes below only own
+  // transport work and cleanup, and may retire before the consumer continues.
+  final Scope resourceScope;
 
   final Task<Option<T>, E> _pull;
   final Scope Function() scopeForValue;
@@ -91,6 +101,7 @@ TaskEvaluation<void, Never> mergeFlowEvaluations(
 ) {
   final causes = <Cause<Never>>[];
   final events = <FailureEvent>[];
+  final cleanupCancellations = <CauseCancelled>[];
   final seen = <Object>{};
   for (final result in results) {
     if (result.exit case ExitFailure(:final cause)) {
@@ -98,6 +109,7 @@ TaskEvaluation<void, Never> mergeFlowEvaluations(
       for (final event in result.events) {
         (sources[event.cause] ??= Queue()).addLast(event);
       }
+      final cancellations = [...result.cleanupCancellations];
       for (final reason in _causes(cause)) {
         if (reason is CauseDefect) {
           final event = sources[reason]!.removeFirst();
@@ -105,6 +117,9 @@ TaskEvaluation<void, Never> mergeFlowEvaluations(
           events.add(event);
         }
         causes.add(reason);
+        if (reason is CauseCancelled && cancellations.remove(reason)) {
+          cleanupCancellations.add(reason);
+        }
       }
     }
   }
@@ -113,6 +128,7 @@ TaskEvaluation<void, Never> mergeFlowEvaluations(
         ? const Exit.success(null)
         : Exit.failure(Cause.combine(causes)),
     List.unmodifiable(events),
+    cleanupCancellations: List.unmodifiable(cleanupCancellations),
   );
 }
 

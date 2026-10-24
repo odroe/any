@@ -39,11 +39,16 @@ extension FlowSharingOperations<T, E> on Flow<T, E> {
   /// pending reads. Later consumers receive only retained replay and the terminal
   /// result. Accepted values precede source failure.
   ///
-  /// Replay and values still in use keep their resources alive. Delayed cleanup
-  /// failures reach the final release or owning scope and later consumers. Closing
-  /// the owner rejects new consumption and waits for all outstanding uses. A
+  /// Resources acquired by the source belong to the creating scope. They remain
+  /// available until that scope closes, even without replay or active consumers.
+  /// Collected values can therefore be used after consumption while the owner is
+  /// open. Downstream callbacks acquire resources in their consumer's scope.
+  ///
+  /// Replay and active deliveries also retain their producer cleanup. Closing the
+  /// owner rejects new consumption and waits for outstanding deliveries. A
   /// consumer in another runtime may finish its current value, then fails with a
-  /// [StateError] defect. Keep all uses within the creating scope's lifetime.
+  /// [StateError] defect. Retaining a collected value does not extend the owner's
+  /// lifetime; keep all uses within the creating scope's lifetime.
   Task<Flow<T, E>, Never> share({required int capacity, int replay = 0}) =>
       Task.defer(() {
         if (capacity < 1) {
@@ -59,7 +64,7 @@ extension FlowSharingOperations<T, E> on Flow<T, E> {
                 () => _SharedFlow(this, owner, environment, capacity, replay),
               ),
               release: (shared, exit) => shared.close(exit),
-            ).map((shared) => flowFromCursor(shared.open())),
+            ).map((shared) => flowFromCursor(shared.open)),
           ),
         );
       });
@@ -72,7 +77,8 @@ final class _SharedFlow<T, E> {
     this.environment,
     this.capacity,
     this.replay,
-  ) {
+  ) : _resources = createScope(runtimeId: scopeRuntimeId(owner)),
+      _work = createScope(runtimeId: scopeRuntimeId(owner)) {
     _removeResources = addScopeCloseDependency(owner, _resources);
     _removeWork = addScopeCloseDependency(owner, _work);
     _lifetime = FlowProducer(
@@ -90,8 +96,8 @@ final class _SharedFlow<T, E> {
   final TaskEnvironment environment;
   final int capacity;
   final int replay;
-  final _resources = createScope();
-  final _work = createScope();
+  final Scope _resources;
+  final Scope _work;
   final _resourcesClosed = Completer<void>();
   final _stopped = Completer<void>();
   final _stopReason = Object();
@@ -109,40 +115,41 @@ final class _SharedFlow<T, E> {
   var _first = 0;
   var _next = 0;
   var _started = false;
-  var _retired = false;
   var _resourcesFinished = false;
   var _stopping = false;
   var _ended = false;
   var _closed = false;
 
-  Task<FlowCursor<T, E>, E> open() => Task.uninterruptibleMask((restore) {
-    Task<FlowCursor<T, E>, E> subscribe() => Task.defer(() {
-      _checkOpen();
-      if (_stopping && !_ended) {
-        return restore(wait(() => _closed || _ended))
-            .withError<E>()
-            .flatMap((_) => subscribe());
-      }
-      return Scope.open().withError<E>().flatMap((scope) {
-        final subscription = _SharedSubscription<T, E>(
-          this,
-          scope,
-          _replayStart,
-        );
-        _subscriptions.add(subscription);
-        return inTaskScope(
-          Task.addFinalizer(subscription.detach),
-          scope,
-        ).withError<E>().map((_) {
-          if (!_started) _start();
-          _notify();
-          return subscription.cursor;
+  Task<FlowCursor<T, E>, E> open(Scope resources) =>
+      Task.uninterruptibleMask((restore) {
+        Task<FlowCursor<T, E>, E> subscribe() => Task.defer(() {
+          _checkOpen();
+          if (_stopping && !_ended) {
+            return restore(wait(() => _closed || _ended))
+                .withError<E>()
+                .flatMap((_) => subscribe());
+          }
+          return Scope.open().withError<E>().flatMap((scope) {
+            final subscription = _SharedSubscription<T, E>(
+              this,
+              scope,
+              _replayStart,
+              resources,
+            );
+            _subscriptions.add(subscription);
+            return inTaskScope(
+              Task.addFinalizer(subscription.detach),
+              scope,
+            ).withError<E>().map((_) {
+              if (!_started) _start();
+              _notify();
+              return subscription.cursor;
+            });
+          });
         });
-      });
-    });
 
-    return subscribe();
-  });
+        return subscribe();
+      });
 
   void _checkOpen() {
     if (_closed || scopeIsClosing(owner)) {
@@ -172,21 +179,19 @@ final class _SharedFlow<T, E> {
     _started = true;
     final task =
         inTaskScope(
-          openFlowCursor(source).flatMap((cursor) {
+          openFlowCursor(source, resourceScope: _resources).flatMap((cursor) {
             _source = cursor;
             return _produce();
           }),
           _resources,
         ).onExit((exit) {
-          _retired = true;
           final cleanupExit = _stopping ? _stopExit ?? exit : exit;
-          return (_source?.finish(cleanupExit) ?? Task.succeed(null)).ensuring(
-            _lifetime.finish(cleanupExit),
-          );
+          return _source?.finish(cleanupExit) ?? Task.succeed(null);
         });
     _driver = startFiber(
       task,
       owner: _work,
+      resourceScope: _work,
       context: environment.context,
       locals: environment.locals,
       report: environment.report,
@@ -197,15 +202,14 @@ final class _SharedFlow<T, E> {
   }
 
   Future<void> _driverEnded(Exit<void, E> exit) async {
-    _record(TaskEvaluation(exit, fiberFailureEvents(_driver!)), stop: true);
-    if (!_retired) {
-      // Cancellation before the deferred driver starts also skips its onExit
-      // registration. No source work ran, but its empty resource root is owned.
-      await closeScope(_resources, exit);
-      _resourcesFinished = true;
-      _record(scopeCleanupFor(_resources));
-      _removeResources();
-    }
+    _record(
+      TaskEvaluation(
+        exit,
+        fiberFailureEvents(_driver!),
+        cleanupCancellations: fiberCleanupCancellations(_driver!),
+      ),
+      stop: true,
+    );
     await closeScope(_work, exit);
     _removeWork();
     _ended = true;
@@ -284,6 +288,7 @@ final class _SharedFlow<T, E> {
     if (result.exit case ExitFailure(:final cause)) {
       final events = result.events.iterator;
       final added = <_SharedFailure<E>>[];
+      final cancellations = [...result.cleanupCancellations];
       var removedStop = false;
       for (final cause in _causes(cause)) {
         FailureEvent? event;
@@ -299,7 +304,11 @@ final class _SharedFlow<T, E> {
           removedStop = true;
           continue;
         }
-        final failure = _SharedFailure<E>(cause, event);
+        final failure = _SharedFailure<E>(
+          cause,
+          event,
+          cancellations.remove(cause),
+        );
         _failures.add(failure);
         added.add(failure);
       }
@@ -361,15 +370,13 @@ final class _SharedFlow<T, E> {
           _notify();
           final stop = _started
               ? _await(_stopped.future)
-              : _lifetime
-                    .finish(exit)
-                    .ensuring(Task.sync(_completeResources))
-                    .ensuring(
-                      _await(
-                        closeScope(_work, exit).then((_) => _removeWork()),
-                      ),
-                    );
+              : _await(closeScope(_work, exit).then((_) => _removeWork()));
           return stop
+              .ensuring(
+                _lifetime.finish(exit).exit().map((_) {
+                  if (_resourcesFinished) _record(scopeCleanupFor(_resources));
+                }),
+              )
               .ensuring(trim())
               .ensuring(_await(_resourcesClosed.future))
               .flatMap((_) => taskFromEvaluation(_cleanup(observed)));
@@ -382,6 +389,7 @@ final class _SharedFlow<T, E> {
   ]) {
     final causes = <Cause<Never>>[];
     final events = <FailureEvent>[];
+    final cleanupCancellations = <CauseCancelled>[];
     for (final failure in failures ?? _failures) {
       if (observed.contains(failure)) continue;
       switch (failure.cause) {
@@ -395,6 +403,9 @@ final class _SharedFlow<T, E> {
         case CauseGroup():
           throw StateError('Cause groups must be flat.');
       }
+      if (failure.cause case final CauseCancelled cause when failure.cleanup) {
+        cleanupCancellations.add(cause);
+      }
       failure.claimed = true;
       observed.add(failure);
     }
@@ -403,15 +414,17 @@ final class _SharedFlow<T, E> {
           ? const Exit.success(null)
           : Exit.failure(Cause.combine(causes)),
       List.unmodifiable(events),
+      cleanupCancellations: List.unmodifiable(cleanupCancellations),
     );
   }
 }
 
 final class _SharedSubscription<T, E> {
-  _SharedSubscription(this.shared, this.scope, this.position);
+  _SharedSubscription(this.shared, this.scope, this.position, this.resources);
 
   final _SharedFlow<T, E> shared;
   final Scope scope;
+  final Scope resources;
   final observed = <_SharedFailure<E>>{};
   late final _lifetime = FlowProducer(scope);
   FlowProducer? _current;
@@ -423,6 +436,7 @@ final class _SharedSubscription<T, E> {
     () => _current?.scope ?? scope,
     finish,
     () => [?_current],
+    resourceScope: resources,
   );
 
   Task<Option<T>, E> _pull() => Task.uninterruptibleMask((restore) {
@@ -477,10 +491,14 @@ final class _SharedSubscription<T, E> {
   Task<Option<T>, E> _terminal() => Task.defer(() {
     final causes = <Cause<E>>[];
     final events = <FailureEvent>[];
+    final cleanupCancellations = <CauseCancelled>[];
     for (final failure in shared._failures) {
       if (!observed.add(failure)) continue;
       failure.claimed = true;
       causes.add(failure.cause);
+      if (failure.cause case final CauseCancelled cause when failure.cleanup) {
+        cleanupCancellations.add(cause);
+      }
       if (failure.event case final event?) events.add(event);
     }
     final result = TaskEvaluation<Option<T>, E>(
@@ -488,6 +506,7 @@ final class _SharedSubscription<T, E> {
           ? const Exit.success(Option.none())
           : Exit.failure(Cause.combine(causes)),
       List.unmodifiable(events),
+      cleanupCancellations: List.unmodifiable(cleanupCancellations),
     );
     return finish(result.exit)
         .withError<E>()
@@ -535,10 +554,11 @@ final class _SharedValue<T, E> {
 }
 
 final class _SharedFailure<E> {
-  _SharedFailure(this.cause, this.event);
+  _SharedFailure(this.cause, this.event, this.cleanup);
 
   final Cause<E> cause;
   final FailureEvent? event;
+  final bool cleanup;
   var claimed = false;
 }
 

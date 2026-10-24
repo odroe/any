@@ -76,7 +76,7 @@ final class SpanRecord {
   /// The UTC wall time at the beginning of this span.
   final DateTime startedAt;
 
-  /// The UTC wall time after work and cleanup finish.
+  /// The UTC wall time when this span ends.
   final DateTime endedAt;
 
   /// Elapsed monotonic time, independent of wall-clock adjustments.
@@ -101,12 +101,13 @@ final class SpanRecord {
 /// A tracer that exports completed task spans to an application-supplied backend.
 ///
 /// Bind a tracer through [key], then use [TaskTracingOperations.withSpan] around
-/// operations to record their duration and outcome, including resource cleanup.
-/// Nested spans form a trace; logs can carry the active trace and span IDs.
+/// operations to record their duration and outcome. Use `task.scoped().withSpan`
+/// to include resource cleanup. Nested spans form a trace; logs can carry the
+/// active trace and span IDs.
 ///
 /// Backend errors go to the configured error handler without changing task
 /// results. The application owns the backend and must flush and close it after
-/// traced work and its cleanup have finished.
+/// the application's tasks and resource cleanup have finished.
 ///
 /// ```dart
 /// final records = <SpanRecord>[];
@@ -359,18 +360,18 @@ final class Span {
 
 /// Trace spans around task executions.
 extension TaskTracingOperations<T, E> on Task<T, E> {
-  /// Records this task and its resource cleanup as one span.
+  /// Records this task expression as one span.
   ///
   /// Each execution creates a new span. [attributes] are shallow-copied now.
   /// [parent] overrides the inherited span's identity, for example when joining
   /// an incoming distributed trace. Without either, a new trace is created.
   /// Nested tasks and finalizers see this span through [Span.current].
   ///
-  /// Resources acquired by this task are released before the span ends. The
-  /// recorded exit includes cancellation and cleanup defects. Completion waits
-  /// for cleanup and the backend, which is called at most once; reporting errors
-  /// do not change the task's outcome. A no-op tracer still creates the resource
-  /// boundary but records no span.
+  /// Resources acquired by this task belong to the caller's scope. To include
+  /// their cleanup in the span and its recorded exit, use
+  /// `task.scoped().withSpan(name)`. Completion waits for the backend, which is
+  /// called at most once; reporting errors do not change the task's outcome.
+  /// A no-op tracer leaves execution unchanged and records no span.
   Task<T, E> withSpan(
     String name, {
     Map<String, Object?> attributes = const {},
@@ -378,34 +379,26 @@ extension TaskTracingOperations<T, E> on Task<T, E> {
   }) {
     final copied = Map<String, Object?>.unmodifiable(attributes);
     return Task.service(Tracer.key).withError<E>().flatMap((tracer) {
-      if (tracer._output == null) return scoped();
+      if (tracer._output == null) return this;
       return Task.uninterruptibleMask<T, E>((restore) {
         return _current.get().withError<E>().flatMap(
           (inherited) => Task.service(Clock.key).withError<E>().flatMap(
-            (clock) =>
-                Task.service(RandomSource.key).withError<E>().flatMap((random) {
-                  final span = tracer._start(
-                    name,
-                    parent ?? inherited?.context,
-                    copied,
-                    clock,
-                    random,
-                  );
-                  if (span == null) return restore(this);
-                  return accessTaskEnvironment(
-                    (scope, _) => forkTaskIn(
-                      _current.locally(span, restore(this)),
-                      scope,
-                      inheritHost: true,
-                    ),
-                  ).withError<E>().flatMap(
-                    (fiber) => restore(fiber.join())
-                        .onExit((_) => fiber.awaitExit().flatMap(span._end)),
-                  );
-                }),
+            (clock) => Task.service(RandomSource.key).withError<E>().flatMap((
+              random,
+            ) {
+              final span = tracer._start(
+                name,
+                parent ?? inherited?.context,
+                copied,
+                clock,
+                random,
+              );
+              if (span == null) return restore(this);
+              return _current.locally(span, restore(this).onExit(span._end));
+            }),
           ),
         );
-      }).scoped();
+      });
     });
   }
 }

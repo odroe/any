@@ -42,6 +42,124 @@ void main() {
     expect(log, hasLength(9));
   });
 
+  for (final mode in [
+    'all',
+    'forEach',
+    'allSettled',
+    'zip',
+    'race',
+    'firstSuccess',
+  ]) {
+    test('$mode leaves worker resources in the caller scope', () async {
+      final acquired = <int>[];
+      final released = <int>[];
+      Task<int, Never> acquire(int value) => Task.acquireRelease(
+        Task.sync(() {
+          acquired.add(value);
+          return value;
+        }),
+        release: (value, _) => Task.sync(() => released.add(value)),
+      );
+      final tasks = [acquire(1), acquire(2)];
+      final Task<List<int>, Never> combined = switch (mode) {
+        'all' => Task.all(tasks, concurrency: 2),
+        'forEach' => Task.forEach([1, 2], acquire, concurrency: 2),
+        'allSettled' => Task.allSettled(
+          tasks,
+          concurrency: 2,
+        ).map((exits) => [for (final exit in exits) _value(exit)]),
+        'zip' => Task.zip(
+          tasks.first,
+          tasks.last,
+          concurrency: 2,
+        ).map((values) => [values.$1, values.$2]),
+        'race' => Task.race(tasks).map((value) => [value]),
+        _ => Task.firstSuccess(tasks).map((value) => [value]),
+      };
+
+      final values = await runtime.runOrThrow(
+        combined.map((values) {
+          expect(released, isEmpty);
+          return values;
+        }),
+      );
+
+      expect(values, isNotEmpty);
+      expect(released, unorderedEquals(acquired));
+      expect(reports, isEmpty);
+    });
+  }
+
+  test(
+    'explicitly scoped workers close their resources before delivery',
+    () async {
+      final released = <int>[];
+      final task = Task.forEach(
+        [1, 2],
+        (value) => Task.acquireRelease(
+          Task.succeed(value),
+          release: (value, _) => Task.sync(() => released.add(value)),
+        ).scoped(),
+        concurrency: 2,
+      );
+
+      expect(
+        await runtime.runOrThrow(
+          task.map((values) {
+            expect(released, unorderedEquals([1, 2]));
+            return values;
+          }),
+        ),
+        [1, 2],
+      );
+    },
+  );
+
+  test('failed workers retain resources while the caller recovers', () async {
+    var released = false;
+    final worker = Task.acquireRelease(
+      Task.succeed(1).withError<String>(),
+      release: (_, _) => Task.sync(() => released = true),
+    ).flatMap<int>((_) => Task.fail('failed'));
+
+    final result = await runtime.runOrThrow(
+      Task.all([worker]).recover((error) {
+        expect(error, 'failed');
+        expect(released, isFalse);
+        return Task.succeed(<int>[]);
+      }),
+    );
+
+    expect(result, isEmpty);
+    expect(released, isTrue);
+  });
+
+  test(
+    'race stops its loser without closing the loser resource scope',
+    () async {
+      var released = false;
+      final loser = _Gate<int, Never>();
+      final winner = _Gate<int, Never>();
+      final acquired = Task.acquireRelease(
+        Task.succeed(1),
+        release: (_, _) => Task.sync(() => released = true),
+      ).flatMap((_) => loser.task);
+      final running = runtime.runOrThrow(
+        Task.race([acquired, winner.task]).map((value) {
+          expect(loser.cancelled, isTrue);
+          expect(released, isFalse);
+          return value;
+        }),
+      );
+
+      await loser.ready.future;
+      await winner.ready.future;
+      winner.complete(const Exit.success(2));
+      expect(await running, 2);
+      expect(released, isTrue);
+    },
+  );
+
   test(
     'forEach admits only available slots and preserves input order',
     () async {
@@ -661,6 +779,7 @@ final class _Gate<T, E> {
   _Gate({this.onCancel});
 
   final FutureOr<void> Function()? onCancel;
+  final ready = Completer<void>();
   late void Function(Exit<T, E>) complete;
   var started = false;
   var cancelled = false;
@@ -668,6 +787,7 @@ final class _Gate<T, E> {
   Task<T, E> get task => Task.fromCallback((complete) {
     started = true;
     this.complete = complete;
+    if (!ready.isCompleted) ready.complete();
     return () {
       cancelled = true;
       return onCancel?.call();

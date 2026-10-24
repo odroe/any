@@ -553,7 +553,7 @@ void main() {
                 },
                 onError: _defect,
               ).flatMap((_) => Task.failCause(const Cause.cancelled())),
-            ),
+            ).scoped(),
           ).filter((_) => false),
         )
         .groupedWithin(3, window)

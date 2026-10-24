@@ -141,6 +141,8 @@ final class _Run<A, T, E> {
 
     final index = exits.length;
     exits.add(null);
+    // Workers are owned executions, but their acquisitions use the caller's
+    // resource scope. Stopping a worker must not close resources it returned.
     return forkTask(
       Task.defer(
         () => stopping
@@ -208,7 +210,7 @@ final class _Run<A, T, E> {
     if (active.isNotEmpty) return wait().flatMap((_) => cleanup(exit));
     if (exit is ExitSuccess) return Task.succeed(null);
     // Owner cancellation follows Task's cancellation rules. Business errors
-    // cannot escape through this Never-typed finalizer, but defects must.
+    // cannot escape through this Never-typed cleanup, but defects must.
     return taskFromEvaluation(
       result<void, Never>(() {}, include: (_) => false, defectsOnly: true),
     );
@@ -259,6 +261,11 @@ final class _Run<A, T, E> {
           ? Exit.success(success())
           : Exit.failure(Cause.combine(reasons)),
       List.unmodifiable(events),
+      pendingFailures: reasons.isEmpty && mode == _Mode.settled && !defectsOnly
+          ? List.unmodifiable([
+              for (final completion in completed) ...completion.result.events,
+            ])
+          : const [],
     );
   }
 }

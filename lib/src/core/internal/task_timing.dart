@@ -12,7 +12,7 @@ Task<T, E> retryTask<T, E>(
   Schedule schedule, {
   bool Function(E error)? when,
 }) => _withPolicy<T, E>((nextDelay, wait) {
-  Task<T, E> attempt() => task.scoped().recover(
+  Task<T, E> attempt() => task.recover(
     (error) => Task.defer(() {
       if (when != null && !when(error)) return Task.fail(error);
       final delay = nextDelay();
@@ -30,7 +30,7 @@ Task<T, E> repeatTask<T, E>(
   Schedule schedule, {
   bool Function(T value)? until,
 }) => _withPolicy<T, E>((nextDelay, wait) {
-  Task<T, E> attempt() => task.scoped().flatMap(
+  Task<T, E> attempt() => task.flatMap(
     (value) => Task.defer(() {
       if (until != null && until(value)) return Task.succeed(value);
       final delay = nextDelay();

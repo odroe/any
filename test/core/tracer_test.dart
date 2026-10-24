@@ -66,6 +66,41 @@ void main() {
     expect(await runtime.runOrThrow(Span.current()), isA<OptionNone<Span>>());
   });
 
+  test('a span ends without closing resources acquired by its body', () async {
+    final records = <SpanRecord>[];
+    final runtime = setup(Tracer(records.add));
+    var released = false;
+    final resource = Object();
+    final result = await runtime.runOrThrow(
+      Task.acquireRelease(
+        Task.succeed(resource),
+        release: (_, _) => Task.sync(() => released = true),
+      ).withSpan('acquire').map((value) {
+        expect(released, isFalse);
+        expect(records.single.exit, isA<ExitSuccess<void, Object?>>());
+        return value;
+      }),
+    );
+
+    expect(result, same(resource));
+    expect(released, isTrue);
+  });
+
+  test(
+    'cleanup outside the expression does not change the recorded exit',
+    () async {
+      final records = <SpanRecord>[];
+      final runtime = setup(Tracer(records.add));
+      final error = StateError('outer cleanup');
+      final exit = await runtime.run(
+        Task.addFinalizer((_) => Task.sync(() => throw error)).withSpan('body'),
+      );
+
+      expect(_causes(exit).whereType<CauseDefect>().single.error, same(error));
+      expect(records.single.exit, isA<ExitSuccess<void, Object?>>());
+    },
+  );
+
   test(
     'an explicit remote parent overrides the locally active parent',
     () async {
@@ -180,6 +215,7 @@ void main() {
             )
             .withError<String>()
             .flatMap((_) => Task.fail('business'))
+            .scoped()
             .withSpan('fails'),
       );
       expect(exit, isA<ExitFailure<Never, String>>());
@@ -221,6 +257,7 @@ void main() {
               return () {};
             }),
           )
+          .scoped()
           .withSpan('cancel'),
       signal: controller.signal,
     );
@@ -328,7 +365,7 @@ void main() {
   );
 
   test(
-    'a no-op tracer preserves the resource boundary without reading clocks',
+    'a no-op tracer preserves the caller scope without reading clocks',
     () async {
       final clock = _FaultClock();
       final runtime = setup(
@@ -340,8 +377,9 @@ void main() {
       await runtime.runOrThrow(
         Task.addFinalizer((_) => Task.sync(() => released = true).map((_) {}))
             .withSpan('noop')
-            .flatMap((_) => Task.sync(() => expect(released, isTrue))),
+            .flatMap((_) => Task.sync(() => expect(released, isFalse))),
       );
+      expect(released, isTrue);
       expect(clock.calls, 0);
       expect(await runtime.runOrThrow(Span.current()), isA<OptionNone<Span>>());
     },

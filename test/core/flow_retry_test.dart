@@ -72,7 +72,7 @@ void main() {
     expect(calls, 2);
   });
 
-  test('predicate is checked after cleanup and can reject the retry', () async {
+  test('predicate rejects retry without closing ambient resources', () async {
     final log = <String>[];
     final flow =
         Flow.fromTask(
@@ -91,34 +91,31 @@ void main() {
           },
         );
     expect(await runtime.run(flow.toList()), isA<ExitFailure>());
-    expect(log, ['acquire', 'release', 'stop']);
+    expect(log, ['acquire', 'stop', 'release']);
   });
 
-  test(
-    'cleanup failure is combined with the business failure before retry',
-    () async {
-      final defect = StateError('release');
-      var predicates = 0;
-      final flow =
-          Flow.fromTask(
-            Task.acquireRelease(
-              Task.succeed(1),
-              release: (_, _) => Task.sync(() => throw defect),
-            ).withError<String>().flatMap((_) => Task.fail('body')),
-          ).retry(
-            Schedule.recurs(1),
-            when: (_) {
-              predicates++;
-              return true;
-            },
-          );
-      final causes = _causes(_cause(await runtime.run(flow.toList())));
-      expect(causes, hasLength(2));
-      expect((causes.first as CauseFailure<String>).error, 'body');
-      expect((causes.last as CauseDefect).error, same(defect));
-      expect(predicates, 0);
-    },
-  );
+  test('explicit local cleanup failure prevents retry', () async {
+    final defect = StateError('release');
+    var predicates = 0;
+    final flow =
+        Flow.fromTask(
+          Task.acquireRelease(
+            Task.succeed(1),
+            release: (_, _) => Task.sync(() => throw defect),
+          ).withError<String>().flatMap((_) => Task.fail('body')).scoped(),
+        ).retry(
+          Schedule.recurs(1),
+          when: (_) {
+            predicates++;
+            return true;
+          },
+        );
+    final causes = _causes(_cause(await runtime.run(flow.toList())));
+    expect(causes, hasLength(2));
+    expect((causes.first as CauseFailure<String>).error, 'body');
+    expect((causes.last as CauseDefect).error, same(defect));
+    expect(predicates, 0);
+  });
 
   test(
     'grouped failure, defect, and explicit cancellation bypass retry',

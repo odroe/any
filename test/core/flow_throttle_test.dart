@@ -375,7 +375,7 @@ void main() {
           .throttle(interval);
       final running = runtime.run(flow.toList(), signal: controller.signal);
       await _until(() => clock.pendingCount == 1);
-      expect(released, [1]);
+      expect(released, isEmpty);
       controller.requestCancel(reason: 'consumer');
       expect(
         _causes(_cause(await running))
@@ -383,7 +383,7 @@ void main() {
             .map((cause) => cause.reason),
         unorderedEquals(['consumer', null, null]),
       );
-      expect(released, [1, 2]);
+      expect(released, [2, 1]);
     },
   );
 

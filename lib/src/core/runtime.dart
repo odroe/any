@@ -106,14 +106,14 @@ final class Runtime {
       context: context,
       onUnhandledError: onUnhandledError,
     );
-    final building = runtime.run(
+    final building = runtime.start(
       buildLayer(services, runtime._scope),
       signal: signal,
     );
     final unsubscribe = signal?.onCancel((reason) {
       unawaited(runtime._beginClose(Exit.failure(Cause.cancelled(reason))));
     });
-    final built = await building;
+    final built = await fiberCompletion(building);
     unsubscribe?.call();
     Cause<E>? failure;
     switch (built) {
@@ -127,7 +127,13 @@ final class Runtime {
       case ExitFailure(:final cause):
         failure = cause;
     }
-    final closed = await runtime._beginClose(Exit.failure(failure));
+    await runtime._beginClose(Exit.failure(failure));
+    // Stopping startup can deliver the same defect through its fiber and the
+    // application scope. Keep each occurrence once, including equal defects
+    // produced independently by service cleanup.
+    final closed = scopeCleanupFor(runtime._scope, {
+      for (final event in fiberFailureEvents(building)) event.source,
+    }).exit;
     return Exit.failure(switch (closed) {
       ExitSuccess() => failure,
       ExitFailure(:final cause) => Cause.combine([failure, cause]),

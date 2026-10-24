@@ -112,11 +112,9 @@ final class SharedResourceState<K, T, E> {
   void _start(_Generation<K, T, E> generation) {
     try {
       final fiber = startFiber(
-        inTaskScope(
-          Task.defer(() => _acquire(generation.key)),
-          generation.scope,
-        ),
+        Task.defer(() => _acquire(generation.key)),
         owner: generation.scope,
+        resourceScope: generation.scope,
         context: _environment.context,
         locals: _environment.locals,
         report: _environment.report,
@@ -373,12 +371,13 @@ final class SharedResourceState<K, T, E> {
 }
 
 final class _Generation<K, T, E> {
-  _Generation(Scope owner, this.key) {
+  _Generation(Scope owner, this.key)
+    : scope = createScope(runtimeId: scopeRuntimeId(owner)) {
     removeOwnerDependency = addScopeCloseDependency(owner, scope);
   }
 
   final K key;
-  final scope = createScope();
+  final Scope scope;
   late final void Function() removeOwnerDependency;
   final stopReason = Object();
   final leases = <_Lease<K, T, E>>{};

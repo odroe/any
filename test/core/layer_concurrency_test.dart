@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:any/any.dart';
+import 'package:any/testing.dart';
 import 'package:test/test.dart';
 
 void main() {
@@ -9,6 +10,178 @@ void main() {
   tearDown(() async {
     await _turn();
     expect(reports, isEmpty);
+  });
+
+  test(
+    'provision timeout waits for construction cleanup before fallback',
+    () async {
+      final clock = TestClock();
+      final runtime = Runtime(
+        context: Context.from([Clock.key.bind(clock)]),
+        onUnhandledError: reports.add,
+      );
+      final started = Completer<void>();
+      final cleanup = Completer<void>();
+      var stopped = false;
+      var cleaned = false;
+      var fallbackRan = false;
+      var releases = 0;
+      addTearDown(() async {
+        if (!cleanup.isCompleted) cleanup.complete();
+        await runtime.close();
+      });
+      final key = ServiceKey<int>('pending');
+      final layer = key.layer(
+        Task.acquireRelease(
+          Task.succeed(1),
+          release: (_, _) => Task.sync(() => releases++),
+        ).flatMap(
+          (_) => Task.fromCallback<int, Never>((_) {
+            started.complete();
+            return () async {
+              stopped = true;
+              await cleanup.future;
+              cleaned = true;
+            };
+          }),
+        ),
+      );
+      const deadline = Duration(seconds: 1);
+      final running = runtime.run(
+        Task.service(key)
+            .provide(layer)
+            .timeoutOrElse(
+              deadline,
+              () => Task.sync(() {
+                fallbackRan = true;
+                expect(stopped, isTrue);
+                expect(cleaned, isTrue);
+                expect(releases, 0);
+                return 2;
+              }),
+            ),
+      );
+      await started.future;
+      clock.advance(deadline);
+      await _until(() => stopped || fallbackRan);
+      expect(stopped, isTrue);
+      expect(fallbackRan, isFalse);
+      expect(releases, 0);
+      cleanup.complete();
+      expect(_value(await running), 2);
+      expect(releases, 1);
+    },
+  );
+
+  test(
+    'a losing provision stops its build while ambient resources remain',
+    () async {
+      final runtime = Runtime(onUnhandledError: reports.add);
+      addTearDown(runtime.close);
+      final started = Completer<void>();
+      var stopped = false;
+      var releases = 0;
+      final key = ServiceKey<int>('pending');
+      final layer = key.layer(
+        Task.acquireRelease(
+          Task.succeed(1),
+          release: (_, _) => Task.sync(() => releases++),
+        ).flatMap(
+          (_) => Task.fromCallback<int, Never>((_) {
+            started.complete();
+            return () {
+              stopped = true;
+            };
+          }),
+        ),
+      );
+      final result = await runtime.run(
+        Task.race([
+          Task.service(key).provide(layer),
+          Task.fromFuture<void, Never>(
+            () => started.future,
+            onError: Error.throwWithStackTrace,
+          ).map((_) => 2),
+        ]).map((value) {
+          expect(stopped, isTrue);
+          expect(releases, 0);
+          return value;
+        }),
+      );
+      expect(_value(result), 2);
+      expect(releases, 1);
+    },
+  );
+
+  test('failed local construction waits for sibling cleanup and retains its defect', () async {
+    final runtime = Runtime(onUnhandledError: reports.add);
+    addTearDown(runtime.close);
+    final pending = ServiceKey<int>('pending');
+    final failed = ServiceKey<int>('failed');
+    final started = Completer<void>();
+    final defect = StateError('cancel construction');
+    var stopped = false;
+    final layer = pending
+        .layer(
+          Task.fromCallback<int, String>((_) {
+            started.complete();
+            return () {
+              stopped = true;
+              throw defect;
+            };
+          }),
+        )
+        .merge(
+          failed.layer(
+            Task.fromFuture<void, String>(
+              () => started.future,
+              onError: Error.throwWithStackTrace,
+            ).flatMap((_) => Task.fail('build failed')),
+          ),
+          concurrency: 2,
+        );
+    final result = await runtime.run(
+      Task.service(pending)
+          .withError<String>()
+          .provide(layer)
+          .exit()
+          .map((exit) {
+            expect(stopped, isTrue);
+            final reasons = _reasons(_cause(exit));
+            expect(
+              reasons.whereType<CauseFailure<String>>().single.error,
+              'build failed',
+            );
+            expect(
+              reasons.whereType<CauseDefect>().map((cause) => cause.error),
+              [same(defect)],
+            );
+          }),
+    );
+    expect(result, isA<ExitSuccess>());
+  });
+
+  test('local construction shares its caller request domain', () async {
+    final runtime = Runtime(onUnhandledError: reports.add);
+    addTearDown(runtime.close);
+    var loads = 0;
+    final resolver = RequestResolver<int, int, Never>((keys) {
+      loads++;
+      return Task.succeed([for (final key in keys) Result.success(key)]);
+    });
+    final service = ServiceKey<int>('service');
+    final result = await runtime.runOrThrow(
+      resolver
+          .request(1)
+          .flatMap(
+            (_) =>
+                Task.service(service)
+                    .provide(service.layer(resolver.request(1)))
+                    .flatMap((_) => resolver.request(1)),
+          ),
+    );
+    expect(result, 1);
+    expect(loads, 1);
   });
 
   test(
@@ -272,6 +445,69 @@ void main() {
       expect(events, ['stop', 'release']);
     },
   );
+
+  test(
+    'startup preserves separate cleanup occurrences with the same cause',
+    () async {
+      final controller = CancellationController();
+      final started = Completer<void>();
+      final defect = Cause<Never>.defect(Object(), StackTrace.current);
+      final key = ServiceKey<int>('service');
+      final opening = Runtime.create(
+        key.layer(
+          Task.acquireRelease(
+            Task.succeed(1),
+            release: (_, _) => Task.failCause(defect),
+          ).flatMap(
+            (_) => Task.fromCallback<int, Never>((_) {
+              started.complete();
+              return () {};
+            }).ensuring(Task.failCause(defect)),
+          ),
+        ),
+        signal: controller.signal,
+        onUnhandledError: reports.add,
+      );
+      await started.future;
+      controller.requestCancel(reason: 'cancel startup');
+      final reasons = _reasons(_cause(await opening));
+      expect(reasons.whereType<CauseDefect>(), [same(defect), same(defect)]);
+      expect(
+        reasons.whereType<CauseCancelled>().first.reason,
+        'cancel startup',
+      );
+    },
+  );
+
+  test('startup cancellation drains nested local construction', () async {
+    final controller = CancellationController();
+    final started = Completer<void>();
+    final inner = ServiceKey<int>('inner');
+    final outer = ServiceKey<int>('outer');
+    var stopped = false;
+    final layer = outer.layer(
+      Task.service(inner).provide(
+        inner.layer(
+          Task.fromCallback<int, Never>((_) {
+            started.complete();
+            return () {
+              stopped = true;
+            };
+          }),
+        ),
+      ),
+    );
+    final opening = Runtime.create(
+      layer,
+      signal: controller.signal,
+      onUnhandledError: reports.add,
+    );
+    await started.future;
+    controller.requestCancel(reason: 'nested startup');
+    final exit = await opening.timeout(const Duration(seconds: 2));
+    expect((_cause(exit) as CauseCancelled).reason, 'nested startup');
+    expect(stopped, isTrue);
+  });
 
   test('parallel duplicate detection follows declaration order after out-of-order builds', () async {
     final first = ServiceKey<int>('first duplicate');

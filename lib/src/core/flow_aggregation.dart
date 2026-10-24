@@ -22,8 +22,8 @@ extension FlowAggregationOperations<T, E> on Flow<T, E> {
   /// A pending read survives the deadline and supplies the next batch.
   ///
   /// At most [size] values and one pending read are held, beyond groups still in
-  /// use downstream. No new reads start while downstream consumes a group. Input
-  /// resources remain alive until their group is consumed. Cancellation stops
+  /// use downstream. No new reads start while downstream consumes a group. User
+  /// resources remain in the consuming task's scope. Cancellation stops
   /// pending work and waits for cleanup; late defects and cleanup failures still
   /// propagate, but business failures or cancellation from unfinished reads do not.
   Flow<List<T>, E> groupedWithin(int size, Duration duration) =>
@@ -47,9 +47,10 @@ extension FlowAggregationOperations<T, E> on Flow<T, E> {
   /// finish. Its arrival time still counts toward the interval. This holds at
   /// most one candidate and one pending read, beyond outputs retained downstream.
   ///
-  /// Replacing a candidate releases its resources; delivered values and callback
-  /// resources remain alive until consumed. Cancellation follows [groupedWithin]'s
-  /// cleanup rules. Use [throttle] when every value must be delivered.
+  /// Replacing a candidate releases its buffer slot, without closing resources
+  /// acquired by user tasks. Use an explicit task scope for per-element cleanup.
+  /// Cancellation follows [groupedWithin]'s cleanup rules. Use [throttle] when
+  /// every value must be delivered.
   Flow<T, E> debounce(Duration duration) =>
       _aggregate(this, null, duration).map((values) => values.single);
 
@@ -60,11 +61,11 @@ extension FlowAggregationOperations<T, E> on Flow<T, E> {
   /// [debounce], this does not discard values. Zero preserves the source; a
   /// negative duration causes a [RangeError] defect before source work starts.
   ///
-  /// Reads happen only on downstream demand. A value waiting for its deadline
-  /// keeps its resources alive, and cancellation stops the wait. Timing uses the
-  /// current [Clock]'s monotonic time.
+  /// Reads happen only on downstream demand, and cancellation stops the wait.
+  /// Waiting does not change the resource scope used by user tasks. Timing uses
+  /// the current [Clock]'s monotonic time.
   Flow<T, E> throttle(Duration duration) => flowFromCursor(
-    Task.defer(() {
+    (resources) => Task.defer(() {
       if (duration.isNegative) {
         throw RangeError.value(
           duration.inMicroseconds,
@@ -72,9 +73,11 @@ extension FlowAggregationOperations<T, E> on Flow<T, E> {
           'Must not be negative.',
         );
       }
-      if (duration == Duration.zero) return openFlowCursor(this);
+      if (duration == Duration.zero) {
+        return openFlowCursor(this, resourceScope: resources);
+      }
       return Task.service(Clock.key).withError<E>().flatMap(
-        (clock) => openFlowCursor(this).map((source) {
+        (clock) => openFlowCursor(this, resourceScope: resources).map((source) {
           Duration? deliveredAt;
           Task<Option<T>, E> deliver(Option<T> item) => Task.defer(() {
             final now = clock.elapsed;
@@ -100,6 +103,7 @@ extension FlowAggregationOperations<T, E> on Flow<T, E> {
             source.scopeForValue,
             source.finish,
             source.producers,
+            resourceScope: resources,
           );
         }),
       );
@@ -112,7 +116,7 @@ Flow<List<T>, E> _aggregate<T, E>(
   int? groupSize,
   Duration duration,
 ) => flowFromCursor(
-  Task.defer(() {
+  (resources) => Task.defer(() {
     if (groupSize != null && groupSize < 1) {
       throw RangeError.range(groupSize, 1, null, 'size');
     }
@@ -126,21 +130,25 @@ Flow<List<T>, E> _aggregate<T, E>(
     }
     return Task.service(Clock.key).withError<E>().flatMap(
       (clock) => Scope.open().withError<E>().flatMap(
-        (owner) => inTaskScope(openFlowCursor(flow), owner).flatMap((source) {
-          final aggregation = groupSize == null
-              ? _TimedAggregation.debounced(source, owner, clock, duration)
-              : _TimedAggregation.grouped(
-                  source,
-                  owner,
-                  clock,
-                  groupSize,
-                  duration,
-                );
-          return inTaskScope(
-            Task.addFinalizer(aggregation.cleanup),
-            owner,
-          ).withError<E>().map((_) => aggregation.cursor);
-        }),
+        (owner) =>
+            inTaskScope(
+              openFlowCursor(flow, resourceScope: resources),
+              owner,
+            ).flatMap((source) {
+              final aggregation = groupSize == null
+                  ? _TimedAggregation.debounced(source, owner, clock, duration)
+                  : _TimedAggregation.grouped(
+                      source,
+                      owner,
+                      clock,
+                      groupSize,
+                      duration,
+                    );
+              return inTaskScope(
+                Task.addFinalizer(aggregation.cleanup),
+                owner,
+              ).withError<E>().map((_) => aggregation.cursor);
+            }),
       ),
     );
   }),
@@ -199,6 +207,7 @@ final class _TimedAggregation<T, E> {
     () => _current?.scope ?? owner,
     _finish,
     () => [?_current],
+    resourceScope: source.resourceScope,
   );
 
   Task<Option<List<T>>, E> _pull() => Task.defer(() {
@@ -224,6 +233,7 @@ final class _TimedAggregation<T, E> {
             TaskEvaluation<Option<List<T>>, E>(
               Exit.failure(cause),
               result.events,
+              cleanupCancellations: result.cleanupCancellations,
             ),
           ).mapCause((cause) {
             _failureDelivered = true;
@@ -298,12 +308,17 @@ final class _TimedAggregation<T, E> {
           return cause;
         }),
         owner,
+        resourceScope: source.resourceScope,
         inheritHost: true,
       ).map((fiber) {
         _active = fiber;
         listenFiber(fiber, (exit) {
           _active = null;
-          final result = TaskEvaluation(exit, fiberFailureEvents(fiber));
+          final result = TaskEvaluation(
+            exit,
+            fiberFailureEvents(fiber),
+            cleanupCancellations: fiberCleanupCancellations(fiber),
+          );
           _result = result;
           if (exit case ExitFailure(:final cause)) {
             _failure = result;
@@ -314,6 +329,10 @@ final class _TimedAggregation<T, E> {
                   .toList();
             }
           }
+          _explicitCancellation = [
+            ..._explicitCancellation,
+            ...fiberCleanupCancellations(fiber),
+          ];
           _wake?.call();
         });
       });
@@ -423,12 +442,14 @@ final class _TimedAggregation<T, E> {
       _pendingValue = null;
       _result = null;
       final causes = <Cause<Never>>[];
+      final cancellations = [..._explicitCancellation];
+      final cleanups = [...?_failure?.cleanupCancellations];
       if (_failure?.exit case ExitFailure(:final cause)) {
         for (final reason in _causes(cause)) {
           if (reason is CauseDefect ||
               (reason is CauseCancelled &&
                   !_failureDelivered &&
-                  _explicitCancellation.contains(reason))) {
+                  cancellations.remove(reason))) {
             causes.add(reason as Cause<Never>);
           }
         }
@@ -439,6 +460,10 @@ final class _TimedAggregation<T, E> {
               ? const Exit.success(null)
               : Exit.failure(Cause.combine(causes)),
           _failure?.events ?? const [],
+          cleanupCancellations: [
+            for (final cause in causes)
+              if (cause is CauseCancelled && cleanups.remove(cause)) cause,
+          ],
         ),
       );
     }),

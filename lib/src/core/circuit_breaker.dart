@@ -205,8 +205,8 @@ extension CircuitBreakerOperations on CircuitBreaker {
   /// [onOpen] runs only when the breaker is open or all probe slots are in use.
   /// Its exception becomes a defect; rejected tasks do not affect the state.
   ///
-  /// Admitted work inherits the caller's context and cancellation state. Its
-  /// resources are released before the outcome is counted:
+  /// Admitted work inherits the caller's context, resource scope, and
+  /// cancellation state. Its outcome is counted when the expression completes:
   ///
   /// * Success clears consecutive failures and closes a half-open breaker.
   /// * Business errors count unless [isFailure] returns false; defects always
@@ -218,6 +218,9 @@ extension CircuitBreakerOperations on CircuitBreaker {
   /// a failure and the defect is appended to the original cause. Results from
   /// earlier open/closed periods neither invoke the policy nor update state.
   /// Cancelling a probe releases its slot without reporting success.
+  ///
+  /// Use `protect(task.scoped(), ...)` to include resource cleanup in the
+  /// protected outcome. Otherwise those resources outlive this operation.
   Task<T, E> protect<T, E>(
     Task<T, E> task, {
     required E Function() onOpen,
@@ -225,19 +228,11 @@ extension CircuitBreakerOperations on CircuitBreaker {
   }) => Task.uninterruptibleMask<T, E>((restore) {
     final admission = _admit();
     if (admission == null) return Task.fail(onOpen());
-    // The local scope owns cancellation. A direct signal subscription would
-    // cancel the child even while the caller's enclosing mask remains active.
-    return accessTaskEnvironment(
-      (scope, _) => forkTaskIn(restore(task), scope, inheritHost: true),
-    ).withError<E>().flatMap(
-      (fiber) => restore(fiber.join()).onExit(
-        (_) => fiber.awaitExit().flatMap((exit) {
-          final failure = _record(admission, exit, isFailure);
-          return failure == null ? Task.succeed(null) : Task.failCause(failure);
-        }),
-      ),
-    );
-  }).scoped();
+    return restore(task).onExit((exit) {
+      final failure = _record(admission, exit, isFailure);
+      return failure == null ? Task.succeed(null) : Task.failCause(failure);
+    });
+  });
 }
 
 bool _counts<E>(Cause<E> cause, bool Function(E)? isFailure) {

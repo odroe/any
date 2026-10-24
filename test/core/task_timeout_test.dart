@@ -24,6 +24,52 @@ void main() {
   const deadline = Duration(seconds: 1);
 
   test(
+    'timeout preserves acquired resources after cancelling its timer',
+    () async {
+      var released = false;
+      final resource = Object();
+      final result = await runtime.runOrThrow(
+        Task.acquireRelease(
+          Task.succeed(resource).withError<String>(),
+          release: (_, _) => Task.sync(() => released = true),
+        ).timeout(deadline, onTimeout: () => 'timeout').map((value) {
+          expect(released, isFalse);
+          expect(clock.pendingCount, 0);
+          return value;
+        }),
+      );
+
+      expect(result, same(resource));
+      expect(released, isTrue);
+    },
+  );
+
+  test('a timeout fallback runs before ambient resource cleanup', () async {
+    var released = false;
+    final gate = _Gate<int, String>();
+    final running = runtime.runOrThrow(
+      Task.acquireRelease(
+            Task.succeed(1).withError<String>(),
+            release: (_, _) => Task.sync(() => released = true),
+          )
+          .flatMap((_) => gate.task)
+          .timeoutOrElse(
+            deadline,
+            () => Task.sync(() {
+              expect(released, isFalse);
+              expect(gate.cancelled, isTrue);
+              return 2;
+            }),
+          ),
+    );
+
+    await gate.ready.future;
+    clock.advance(deadline);
+    expect(await running, 2);
+    expect(released, isTrue);
+  });
+
+  test(
     'timeout is lazy and cancels its timer when the operation succeeds',
     () async {
       var calls = 0;
@@ -622,11 +668,13 @@ void main() {
 final class _Gate<T, E> {
   _Gate({this.onCancel});
   final FutureOr<void> Function()? onCancel;
+  final ready = Completer<void>();
   late void Function(Exit<T, E>) complete;
   var cancelled = false;
 
   Task<T, E> get task => Task.fromCallback((complete) {
     this.complete = complete;
+    if (!ready.isCompleted) ready.complete();
     return () {
       cancelled = true;
       return onCancel?.call();

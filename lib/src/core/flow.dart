@@ -39,18 +39,21 @@ import 'task.dart';
 /// ```
 ///
 /// Consumption requests values as needed unless an operator buffers or processes
-/// concurrently. An element's resources remain alive while downstream uses it;
-/// stopping consumption waits for owned work and cleanup. A collected value does
-/// not extend its resources' lifetime beyond consumption.
+/// concurrently. User tasks acquire resources in the consuming task's scope;
+/// ending consumption stops internal work without closing that borrowed scope.
+/// Use [TaskOperations.scoped] for per-element resource use, returning data that
+/// remains valid after cleanup.
 ///
 /// Exceptions in callbacks become defects. External sources retain their own
 /// sharing rules: for example, consumers of [fromQueue] compete for values.
 final class Flow<T, E> {
   Flow._(this._open);
 
-  Flow._source(Task<Task<Option<T>, E>, E> open) : _open = _openCursor(open);
+  Flow._source(Task<Task<Option<T>, E>, E> open, {bool ownsResources = false})
+    : _open = ((resources) =>
+          _openCursor(open, resources, ownsResources: ownsResources));
 
-  final Task<FlowCursor<T, E>, E> _open;
+  final Task<FlowCursor<T, E>, E> Function(Scope resources) _open;
 
   /// Emits [values] in iteration order.
   ///
@@ -70,8 +73,8 @@ final class Flow<T, E> {
 
   /// Emits the successful result of [task] once per consumption.
   ///
-  /// A failed task emits nothing. Resources acquired by the task stay alive through
-  /// consumption of the result and close when the flow ends or is stopped.
+  /// A failed task emits nothing. Resources acquired by the task belong to the
+  /// consuming task's scope and remain available after consumption ends.
   static Flow<T, E> fromTask<T, E>(Task<T, E> task) => Flow._source(
     Task.sync(() {
       var emitted = false;
@@ -127,6 +130,7 @@ final class Flow<T, E> {
         return source.pull(onError);
       }),
     ),
+    ownsResources: true,
   );
 
   /// Builds a sequence by applying [step] to a state, starting with [initial].
@@ -171,11 +175,10 @@ extension FlowOperations<T, E> on Flow<T, E> {
   /// is false, which emits results in completion order. A nonpositive limit causes
   /// a [RangeError] defect before source work starts.
   ///
-  /// Each result owns resources acquired by its mapping task and downstream
-  /// callbacks. They close after consumption of that result, before releasing its
-  /// input resources. Later buffering may keep results alive beyond this method's
-  /// concurrency limit. Use [TaskOperations.scoped] inside [transform] to release
-  /// resources as soon as mapping finishes.
+  /// Mapping tasks and downstream callbacks use the consuming task's resource
+  /// scope. Concurrency and buffering do not limit the resources accumulated in
+  /// that scope. Use [TaskOperations.scoped] inside [transform] to finish each
+  /// resource's use and cleanup before emitting its result.
   ///
   /// Failure stops the source and cancels unfinished mappings. Stopping early
   /// waits for their cleanup and preserves observed defects and cleanup failures.
@@ -184,12 +187,12 @@ extension FlowOperations<T, E> on Flow<T, E> {
     int concurrency = 1,
     bool preserveOrder = true,
   }) => Flow._(
-    Task.defer(() {
+    (resources) => Task.defer(() {
       if (concurrency < 1) {
         throw RangeError.range(concurrency, 1, null, 'concurrency');
       }
       return Scope.open().withError<E>().flatMap(
-        (owner) => inTaskScope(_open, owner).flatMap((source) {
+        (owner) => inTaskScope(_open(resources), owner).flatMap((source) {
           final mapping = _ConcurrentMap(
             source,
             owner,
@@ -212,9 +215,9 @@ extension FlowOperations<T, E> on Flow<T, E> {
 
   /// Keeps elements whose sequential [test] task returns true.
   ///
-  /// The test's resources belong to the input element's scope, including for
-  /// rejected values. Use [TaskOperations.scoped] on the test task if its resources
-  /// should close after each test. A failed test stops consumption.
+  /// The test's resources belong to the consuming task's scope, including for
+  /// rejected values. Use [TaskOperations.scoped] on the test task to close its
+  /// resources after each test. A failed test stops consumption.
   Flow<T, E> filterTask(Task<bool, E> Function(T value) test) =>
       _transform(_open, (source) {
         Task<Option<T>, E> next() => Task.defer(
@@ -222,7 +225,7 @@ extension FlowOperations<T, E> on Flow<T, E> {
             (item) => switch (item) {
               OptionSome(:final value) => inTaskScope(
                 test(value),
-                source.scope,
+                source.resourceScope,
               ).flatMap((keep) => keep ? Task.succeed(item) : next()),
               OptionNone() => Task.succeed(item),
             },
@@ -234,11 +237,11 @@ extension FlowOperations<T, E> on Flow<T, E> {
   /// Emits each flow returned by [transform] in sequence.
   ///
   /// Each inner flow finishes producing before the next outer value is requested.
-  /// The outer value's resources stay available to its inner flow. Values retained
-  /// downstream can keep an earlier inner flow's resources alive; otherwise its
-  /// cleanup finishes before the next inner flow opens. Failure stops the sequence.
+  /// User tasks in both flows share the consuming task's resource scope. Each
+  /// inner flow stops its internal production before the next opens; this does
+  /// not release resources acquired by user tasks. Failure stops the sequence.
   Flow<U, E> flatMap<U>(Flow<U, E> Function(T value) transform) => Flow._(
-    _open.map((source) {
+    (resources) => _open(resources).map((source) {
       FlowCursor<U, E>? inner;
       Task<Option<U>, E> next() => Task.defer(() {
         final current = inner;
@@ -252,9 +255,10 @@ extension FlowOperations<T, E> on Flow<T, E> {
         return source.pull().flatMap(
           (item) => switch (item) {
             OptionSome(:final value) =>
-              inTaskScope(transform(value)._open, source.scope).flatMap((
-                opened,
-              ) {
+              inTaskScope(
+                transform(value)._open(resources),
+                source.scope,
+              ).flatMap((opened) {
                 inner = opened;
                 return next();
               }),
@@ -267,6 +271,7 @@ extension FlowOperations<T, E> on Flow<T, E> {
         () => inner?.scope ?? source.scope,
         source.finish,
         () => [...source.producers(), ...?inner?.producers()],
+        resourceScope: resources,
       );
     }),
   );
@@ -296,8 +301,8 @@ extension FlowOperations<T, E> on Flow<T, E> {
 
   /// Collects consecutive elements into immutable lists of at most [size].
   ///
-  /// Normal completion emits a final partial group; failure discards it. Each
-  /// group keeps its inputs' resources alive until the group is consumed.
+  /// Normal completion emits a final partial group; failure discards it. User
+  /// resources remain in the consuming task's scope after a group is consumed.
   /// [size] must be positive; otherwise consumption fails with a [RangeError]
   /// defect before opening the source.
   ///
@@ -309,11 +314,11 @@ extension FlowOperations<T, E> on Flow<T, E> {
   /// At most [size] inputs are held for the next group, in addition to any groups
   /// still in use downstream.
   Flow<List<T>, E> grouped(int size) => Flow._(
-    Task.defer(() {
+    (resources) => Task.defer(() {
       if (size < 1) throw RangeError.range(size, 1, null, 'size');
       return Scope.open().withError<E>().flatMap(
         (owner) => inTaskScope(
-          _open,
+          _open(resources),
           owner,
         ).map((source) => _Grouped(source, owner, size).cursor),
       );
@@ -323,8 +328,8 @@ extension FlowOperations<T, E> on Flow<T, E> {
   /// Prefetches up to [capacity] elements while downstream processes a value.
   ///
   /// Use this between a producer and a slow consumer to let their work overlap.
-  /// Values retain their input order and resources; downstream callbacks still
-  /// run in the consuming task.
+  /// Values retain their input order. Source tasks and downstream callbacks
+  /// acquire resources in the consuming task's scope.
   ///
   /// ```dart
   /// final work = Flow.fromIterable([1, 2, 3])
@@ -344,10 +349,10 @@ extension FlowOperations<T, E> on Flow<T, E> {
   /// new business failures or cancellation from unfinished source work are ignored;
   /// defects and resource cleanup failures still propagate.
   Flow<T, E> buffer(int capacity) => Flow._(
-    Task.defer(() {
+    (resources) => Task.defer(() {
       if (capacity < 1) throw RangeError.range(capacity, 1, null, 'capacity');
       return Scope.open().withError<E>().flatMap(
-        (owner) => inTaskScope(_open, owner).flatMap((source) {
+        (owner) => inTaskScope(_open(resources), owner).flatMap((source) {
           final buffering = _Buffered(source, owner, capacity);
           return inTaskScope(
             Task.addFinalizer(buffering.cleanup),
@@ -361,13 +366,13 @@ extension FlowOperations<T, E> on Flow<T, E> {
   /// Emits at most [count] elements and then stops the source.
   ///
   /// Zero leaves the source unopened. A negative count becomes a [RangeError]
-  /// defect on consumption. The final element's resources remain available until
-  /// its downstream consumption finishes.
+  /// defect on consumption. Stopping production leaves user resources in the
+  /// consuming task's scope available to subsequent tasks.
   Flow<T, E> take(int count) => Flow._(
-    Task.defer(() {
+    (resources) => Task.defer(() {
       _checkCount(count);
-      if (count == 0) return Flow.fromIterable(<T>[])._open;
-      return _open.map((source) {
+      if (count == 0) return Flow.fromIterable(<T>[])._open(resources);
+      return _open(resources).map((source) {
         var remaining = count;
         final pull = Task.defer(() {
           if (remaining == 0) {
@@ -384,6 +389,7 @@ extension FlowOperations<T, E> on Flow<T, E> {
           source.scopeForValue,
           source.finish,
           source.producers,
+          resourceScope: source.resourceScope,
         );
       });
     }),
@@ -393,9 +399,9 @@ extension FlowOperations<T, E> on Flow<T, E> {
   ///
   /// Negative counts become [RangeError] defects when consumed.
   Flow<T, E> drop(int count) => Flow._(
-    Task.defer(() {
+    (resources) => Task.defer(() {
       _checkCount(count);
-      return _open.map((source) {
+      return _open(resources).map((source) {
         var remaining = count;
         Task<Option<T>, E> next() => Task.defer(
           () => source.pull().flatMap((item) {
@@ -411,6 +417,7 @@ extension FlowOperations<T, E> on Flow<T, E> {
           source.scopeForValue,
           source.finish,
           source.producers,
+          resourceScope: source.resourceScope,
         );
       });
     }),
@@ -452,19 +459,19 @@ extension FlowOperations<T, E> on Flow<T, E> {
 
   /// Emits this flow followed by [next].
   ///
-  /// [next] starts only after normal completion. Cleanup finishes first unless
-  /// values still in use downstream keep earlier resources alive. A failure,
-  /// including delayed cleanup failure, stops the combined flow.
+  /// [next] starts only after normal completion and internal source cleanup,
+  /// except for transport resources still retained downstream. User resources
+  /// remain in the consuming task's scope. A failure stops the combined flow.
   Flow<T, E> concat(Flow<T, E> next) => Flow._(
-    accessTaskEnvironment(
-      (owner, _) => _open.map((source) {
+    (resources) => accessTaskEnvironment(
+      (owner, _) => _open(resources).map((source) {
         var current = source;
         var switched = false;
         final pull = Task.defer(
           () => current.pull().flatMap((item) {
             if (item is OptionSome<T> || switched) return Task.succeed(item);
             switched = true;
-            return inTaskScope(next._open, owner).flatMap((opened) {
+            return inTaskScope(next._open(resources), owner).flatMap((opened) {
               current = opened;
               return current.pull();
             });
@@ -475,6 +482,7 @@ extension FlowOperations<T, E> on Flow<T, E> {
           () => current.scope,
           (exit) => Task.defer(() => current.finish(exit)),
           () => current.producers(),
+          resourceScope: resources,
         );
       }),
     ),
@@ -486,7 +494,7 @@ extension FlowOperations<T, E> on Flow<T, E> {
   /// [TaskOperations.mapError]. Defects, cancellation, and cleanup failures are
   /// not transformed.
   Flow<T, F> mapError<F>(F Function(E error) transform) => Flow._(
-    _open
+    (resources) => _open(resources)
         .mapError(transform)
         .map(
           (source) => FlowCursor(
@@ -494,6 +502,7 @@ extension FlowOperations<T, E> on Flow<T, E> {
             source.scopeForValue,
             source.finish,
             source.producers,
+            resourceScope: source.resourceScope,
           ),
         ),
   );
@@ -504,13 +513,13 @@ extension FlowOperations<T, E> on Flow<T, E> {
   /// grouped causes, and failures from the replacement flow propagate unchanged.
   /// Values already delivered are not repeated or undone.
   ///
-  /// The failed source's cleanup finishes before recovery, except for resources
-  /// still used downstream. Immediate cleanup failure prevents recovery. Cleanup
-  /// of retained values may fail later; those failures propagate to the consumer
-  /// and cannot be recovered here.
+  /// Internal producer cleanup finishes before recovery, except for transport
+  /// resources still retained downstream. User resources remain in the consuming
+  /// task's scope. Immediate cleanup failure prevents recovery; deferred cleanup
+  /// failures propagate to the consumer and cannot be recovered here.
   Flow<T, E> recover(Flow<T, E> Function(E error) recover) => Flow._(
-    accessTaskEnvironment(
-      (owner, _) => _open.map((opened) {
+    (resources) => accessTaskEnvironment(
+      (owner, _) => _open(resources).map((opened) {
         var replaced = false;
         var current = opened;
         final pull = Task.defer(
@@ -528,9 +537,10 @@ extension FlowOperations<T, E> on Flow<T, E> {
                 .flatMap<Option<T>>((_) => Task.fail(error))
                 .recover((error) {
                   replaced = true;
-                  return inTaskScope(recover(error)._open, owner).flatMap((
-                    replacement,
-                  ) {
+                  return inTaskScope(
+                    recover(error)._open(resources),
+                    owner,
+                  ).flatMap((replacement) {
                     current = replacement;
                     return current.pull();
                   });
@@ -542,6 +552,7 @@ extension FlowOperations<T, E> on Flow<T, E> {
           () => current.scope,
           (exit) => Task.defer(() => current.finish(exit)),
           () => current.producers(),
+          resourceScope: resources,
         );
       }),
     ),
@@ -549,8 +560,10 @@ extension FlowOperations<T, E> on Flow<T, E> {
 
   /// Collects all elements into an immutable list.
   ///
-  /// Returns after source cleanup. Use a finite flow or [take] to bound memory;
-  /// resources associated with the values do not remain open in the returned list.
+  /// Returns after internal source cleanup. Resources acquired by user tasks
+  /// remain available to subsequent tasks in the same scope. Returning handles
+  /// beyond that scope does not keep them open. Use a finite flow or [take] to
+  /// bound collection size.
   Task<List<T>, E> toList() => Task.defer(() {
     final values = <T>[];
     return forEach((value) => Task.sync(() => values.add(value)))
@@ -574,24 +587,26 @@ extension FlowOperations<T, E> on Flow<T, E> {
   /// Runs [action] for each element, waiting before requesting the next.
   ///
   /// Failure or cancellation stops consumption and waits for cleanup. Resources
-  /// acquired by [action] belong to the input element's scope and may outlive that
-  /// call. Use [TaskOperations.scoped] on the returned task to close them after
-  /// each call.
+  /// acquired by [action] belong to the consuming task's scope and may outlive
+  /// consumption. Use [TaskOperations.scoped] on the returned task to close them
+  /// after each call.
   Task<void, E> forEach(Task<void, E> Function(T value) action) =>
-      _open.flatMap((source) {
-        Task<void, E> next() => Task.defer(
-          () => source.pull().flatMap(
-            (item) => switch (item) {
-              OptionSome(:final value) => inTaskScope(
-                action(value),
-                source.scope,
-              ).flatMap((_) => next()),
-              OptionNone() => Task.succeed(null),
-            },
-          ),
-        );
-        return next();
-      }).scoped();
+      accessTaskEnvironment(
+        (resources, _) => _open(resources).flatMap((source) {
+          Task<void, E> next() => Task.defer(
+            () => source.pull().flatMap(
+              (item) => switch (item) {
+                OptionSome(:final value) => inTaskScope(
+                  action(value),
+                  resources,
+                ).flatMap((_) => next()),
+                OptionNone() => Task.succeed(null),
+              },
+            ),
+          );
+          return next();
+        }).scoped(),
+      );
 
   /// Consumes all elements for their effects and waits for producer cleanup.
   Task<void, E> drain() => forEach((_) => Task.succeed(null));
@@ -653,49 +668,59 @@ void _checkCount(int count) {
 }
 
 Flow<U, E> _transform<T, U, E>(
-  Task<FlowCursor<T, E>, E> open,
+  Task<FlowCursor<T, E>, E> Function(Scope resources) open,
   Task<Option<U>, E> Function(FlowCursor<T, E> source) transform,
 ) => Flow._(
-  open.map(
+  (resources) => open(resources).map(
     (source) => FlowCursor(
       transform(source),
       source.scopeForValue,
       source.finish,
       source.producers,
+      resourceScope: source.resourceScope,
     ),
   ),
 );
 
-Task<FlowCursor<T, E>, E> _openCursor<T, E>(Task<Task<Option<T>, E>, E> open) =>
-    Scope.open().map((scope) {
-      final producer = FlowProducer(scope);
-      Task<Option<T>, E>? next;
-      var closed = false;
-      Task<void, Never> finish(Exit<Object?, Object?> exit) => Task.defer(() {
-        closed = true;
-        return producer.finish(exit);
+Task<FlowCursor<T, E>, E> _openCursor<T, E>(
+  Task<Task<Option<T>, E>, E> open,
+  Scope resources, {
+  required bool ownsResources,
+}) => Scope.open().map((scope) {
+  final producer = FlowProducer(scope);
+  Task<Option<T>, E>? next;
+  var closed = false;
+  Task<void, Never> finish(Exit<Object?, Object?> exit) => Task.defer(() {
+    closed = true;
+    return producer.finish(exit);
+  });
+  final pull = Task.defer(() {
+    if (closed) return Task.succeed(const Option<Never>.none());
+    final read = Task.defer(() {
+      final initialized = next;
+      if (initialized != null) return initialized;
+      return open.flatMap((initialized) {
+        next = initialized;
+        return initialized;
       });
-      final pull = Task.defer(() {
-        if (closed) return Task.succeed(const Option<Never>.none());
-        final read = Task.defer(() {
-          final initialized = next;
-          if (initialized != null) return initialized;
-          return open.flatMap((initialized) {
-            next = initialized;
-            return initialized;
-          });
-        });
-        return inTaskScope(read, scope).flatMap((item) {
-          if (item is OptionSome<T>) return Task.succeed(item);
-          closed = true;
-          return producer
-              .finish(const Exit.success(null))
-              .withError<E>()
-              .map((_) => item);
-        });
-      });
-      return FlowCursor(pull, () => scope, finish, () => [producer]);
     });
+    return inTaskScope(read, ownsResources ? scope : resources).flatMap((item) {
+      if (item is OptionSome<T>) return Task.succeed(item);
+      closed = true;
+      return producer
+          .finish(const Exit.success(null))
+          .withError<E>()
+          .map((_) => item);
+    });
+  });
+  return FlowCursor(
+    pull,
+    () => scope,
+    finish,
+    () => [producer],
+    resourceScope: resources,
+  );
+});
 
 final class _StreamSource<T> {
   _StreamSource(this.capacity, this.overflow);
@@ -995,6 +1020,7 @@ final class _Buffered<T, E> {
     () => _current?.scope ?? owner,
     _finish,
     () => [_lifetime, ...?_current?.producers],
+    resourceScope: source.resourceScope,
   );
 
   Task<Option<T>, E> _pull() => Task.defer(() {
@@ -1018,17 +1044,26 @@ final class _Buffered<T, E> {
           return cause;
         }),
         owner,
+        resourceScope: source.resourceScope,
         inheritHost: true,
       ).withError<E>().flatMap((fiber) {
         _driver = fiber;
         listenFiber(fiber, (exit) {
-          _terminal = TaskEvaluation(exit, fiberFailureEvents(fiber));
+          _terminal = TaskEvaluation(
+            exit,
+            fiberFailureEvents(fiber),
+            cleanupCancellations: fiberCleanupCancellations(fiber),
+          );
           if (exit case ExitFailure(:final cause) when _stoppedByUs) {
             _explicitCancellation = _causes(cause)
                 .whereType<CauseCancelled>()
                 .where((cause) => !identical(cause.reason, _stopReason))
                 .toList();
           }
+          _explicitCancellation = [
+            ..._explicitCancellation,
+            ...fiberCleanupCancellations(fiber),
+          ];
           _consumerWake?.call();
         });
         return _pull();
@@ -1047,6 +1082,7 @@ final class _Buffered<T, E> {
           TaskEvaluation(
             terminal.exit.map((_) => const Option<Never>.none()),
             terminal.events,
+            cleanupCancellations: terminal.cleanupCancellations,
           ),
         ).mapCause((cause) {
           _terminalDelivered = true;
@@ -1147,13 +1183,15 @@ final class _Buffered<T, E> {
     _current = null;
     _values.clear();
     final events = _terminal?.events ?? const <FailureEvent>[];
+    final cancellations = [..._explicitCancellation];
+    final cleanups = [...?_terminal?.cleanupCancellations];
     final causes = <Cause<Never>>[];
     if (_terminal?.exit case ExitFailure(:final cause)) {
       for (final reason in _causes(cause)) {
         if (reason is CauseDefect ||
             (reason is CauseCancelled &&
                 !_terminalDelivered &&
-                _explicitCancellation.contains(reason))) {
+                cancellations.remove(reason))) {
           causes.add(reason as Cause<Never>);
         }
       }
@@ -1164,6 +1202,10 @@ final class _Buffered<T, E> {
             ? const Exit.success(null)
             : Exit.failure(Cause.combine(causes)),
         events,
+        cleanupCancellations: [
+          for (final cause in causes)
+            if (cause is CauseCancelled && cleanups.remove(cause)) cause,
+        ],
       ),
     );
   });
@@ -1220,6 +1262,7 @@ final class _ConcurrentMap<T, U, E> {
     () => _current?.producer.scope ?? owner,
     _finish,
     () => [if (_current case final current?) current.producer],
+    resourceScope: source.resourceScope,
   );
 
   Task<Option<U>, E> _pull() => Task.defer(() {
@@ -1244,6 +1287,7 @@ final class _ConcurrentMap<T, U, E> {
           return cause;
         }),
         owner,
+        resourceScope: source.resourceScope,
         inheritHost: true,
       ).withError<E>().flatMap((fiber) {
         _driver = fiber;
@@ -1344,7 +1388,7 @@ final class _ConcurrentMap<T, U, E> {
             forkTaskIn(
               inTaskScope(
                 Task.defer(() => transform(value)),
-                entry.producer.scope,
+                source.resourceScope,
               ).mapCause((cause) {
                 cancellations.addAll(
                   _causes(cause).whereType<CauseCancelled>(),
@@ -1352,13 +1396,18 @@ final class _ConcurrentMap<T, U, E> {
                 return cause;
               }),
               owner,
+              resourceScope: source.resourceScope,
               inheritHost: true,
             ).withError<E>().flatMap((fiber) {
               _active.add(fiber);
               if (_stopping) fiber.requestCancel(reason: _stopReason);
               listenFiber(fiber, (exit) {
                 _active.remove(fiber);
-                final result = TaskEvaluation(exit, fiberFailureEvents(fiber));
+                final result = TaskEvaluation(
+                  exit,
+                  fiberFailureEvents(fiber),
+                  cleanupCancellations: fiberCleanupCancellations(fiber),
+                );
                 entry.result = result;
                 if (exit is ExitFailure<U, E>) {
                   _recordFailure(fiber, exit, cancellations);
@@ -1416,10 +1465,14 @@ final class _ConcurrentMap<T, U, E> {
     // Cleanup provenance survives a pending owner cancellation even when the
     // cleanup's scope has already closed and detached from the worker.
     _failures.add(
-      _MapFailure(TaskEvaluation(exit, fiberFailureEvents(fiber)), [
-        ...cancellations,
-        ...fiberCleanupCancellations(fiber),
-      ]),
+      _MapFailure(
+        TaskEvaluation(
+          exit,
+          fiberFailureEvents(fiber),
+          cleanupCancellations: fiberCleanupCancellations(fiber),
+        ),
+        [...cancellations, ...fiberCleanupCancellations(fiber)],
+      ),
     );
     _stop();
   }
@@ -1460,10 +1513,12 @@ final class _ConcurrentMap<T, U, E> {
   }) {
     final causes = <Cause<F>>[];
     final events = <FailureEvent>[];
+    final cleanupCancellations = <CauseCancelled>[];
     final seen = <Object>{};
     for (final failure in _failures) {
       final result = failure.result;
       final cancellations = [...failure.cancellations];
+      final cleanups = [...result.cleanupCancellations];
       if (result.exit case ExitFailure(:final cause)) {
         final sources = Map<CauseDefect, Queue<FailureEvent>>.identity();
         for (final event in result.events) {
@@ -1484,6 +1539,9 @@ final class _ConcurrentMap<T, U, E> {
                       (!_failureDelivered && cancellations.remove(reason))) &&
                   !identical(reason.reason, _stopReason)) {
                 causes.add(reason);
+                if (cleanups.remove(reason)) {
+                  cleanupCancellations.add(reason);
+                }
               }
             case CauseGroup():
               throw StateError('Cause groups must be flat.');
@@ -1496,6 +1554,7 @@ final class _ConcurrentMap<T, U, E> {
           ? Exit.success(success())
           : Exit.failure(Cause.combine(causes)),
       List.unmodifiable(events),
+      cleanupCancellations: List.unmodifiable(cleanupCancellations),
     );
   }
 }
@@ -1522,6 +1581,7 @@ final class _Grouped<T, E> {
     () => _current?.scope ?? owner,
     _finish,
     () => [?_current],
+    resourceScope: source.resourceScope,
   );
 
   Task<Option<List<T>>, E> _pull() => Task.defer(() {
@@ -1604,6 +1664,13 @@ final class _Grouped<T, E> {
 }
 
 // Internal bridges for flow operators in other libraries; not exported.
-Task<FlowCursor<T, E>, E> openFlowCursor<T, E>(Flow<T, E> flow) => flow._open;
+Task<FlowCursor<T, E>, E> openFlowCursor<T, E>(
+  Flow<T, E> flow, {
+  Scope? resourceScope,
+}) => resourceScope == null
+    ? accessTaskEnvironment((scope, _) => flow._open(scope))
+    : flow._open(resourceScope);
 
-Flow<T, E> flowFromCursor<T, E>(Task<FlowCursor<T, E>, E> open) => Flow._(open);
+Flow<T, E> flowFromCursor<T, E>(
+  Task<FlowCursor<T, E>, E> Function(Scope resources) open,
+) => Flow._(open);

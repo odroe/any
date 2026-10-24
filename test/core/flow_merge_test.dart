@@ -86,7 +86,7 @@ void main() {
     () async {
       final opening = _Gate<FlowCursor<int, String>, String>();
       final rightStarted = Completer<void>();
-      final left = flowFromCursor(opening.task);
+      final left = flowFromCursor((_) => opening.task);
       final right = Flow.fromTask(
         Task.defer<int, String>(() {
           rightStarted.complete();
@@ -110,8 +110,9 @@ void main() {
     () async {
       var released = false;
       final left = flowFromCursor(
-        Task.addFinalizer((_) => Task.sync(() => released = true))
-            .flatMap((_) => openFlowCursor(Flow.fromIterable([1, 2]))),
+        (_) =>
+            Task.addFinalizer((_) => Task.sync(() => released = true))
+                .flatMap((_) => openFlowCursor(Flow.fromIterable([1, 2]))),
       );
       final received = <int>[];
       final exit = await runtime.run(
@@ -140,7 +141,7 @@ void main() {
         if (!finish.isCompleted) finish.complete();
       });
       final left = flowFromCursor(
-        Task.fromFuture<void, String>(
+        (_) => Task.fromFuture<void, String>(
           () {
             opening.complete();
             return finish.future;
@@ -411,7 +412,7 @@ void main() {
   });
 
   test(
-    'cleanup cancellation observed during another delivery survives take',
+    'explicit source cleanup cancellation survives merging and take',
     () async {
       final cleaned = Completer<void>();
       final left = Flow.fromTask(
@@ -420,7 +421,7 @@ void main() {
           release: (_, _) => Task.sync(() => cleaned.complete()).flatMap(
             (_) => Task.failCause(const Cause<Never>.cancelled('cleanup')),
           ),
-        ),
+        ).scoped(),
       );
       final right = Flow.fromIterable([2, 3]);
       final exit = await runtime.run(

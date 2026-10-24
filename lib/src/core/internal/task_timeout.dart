@@ -34,8 +34,8 @@ Task<T, Object?> _race<T, E>(
   Duration duration,
   Object expired,
 ) => computeRace([
-  // Register the deadline before starting the computation. Both fibers
-  // belong to the race's scope and publish only after their cleanup ends.
+  // Register the deadline before starting the computation. The race stops and
+  // waits for both fibers; user resources retain the caller's scope.
   Task.sleep(duration).withError<Object?>().flatMap((_) => Task.fail(expired)),
   task,
 ]);

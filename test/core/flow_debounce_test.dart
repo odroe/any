@@ -189,7 +189,7 @@ void main() {
   );
 
   test(
-    'replaced input resources close before the next source pull starts',
+    'replacing candidates preserves user resources until scope closure',
     () async {
       final source = _Source<int, Never>();
       final live = <int>{};
@@ -215,21 +215,21 @@ void main() {
       expect(live, {1});
       source.emit(1, 2);
       await _until(() => source.requested == 3);
-      expect(released, [1]);
-      expect(live, {2});
+      expect(released, isEmpty);
+      expect(live, {1, 2});
       source.emit(2, 3);
       await _until(() => source.requested == 4);
-      expect(released, [1, 2]);
-      expect(live, {3});
+      expect(released, isEmpty);
+      expect(live, {1, 2, 3});
       source.end(3);
       expect(_value(await running), [3]);
-      expect(released, [1, 2, 3]);
+      expect(released, [3, 2, 1]);
       expect(live, isEmpty);
     },
   );
 
   test(
-    'replacement waits for old cleanup while retaining the new candidate',
+    'candidate replacement progresses before asynchronous ambient cleanup',
     () async {
       final source = _Source<int, Never>();
       final releasing = Completer<void>();
@@ -256,14 +256,14 @@ void main() {
       source.emit(0, 1);
       await _until(() => source.requested == 2);
       source.emit(1, 2);
-      await releasing.future;
+      await _until(() => source.requested == 3);
       expect(live, {1, 2});
-      expect(source.requested, 2);
+      expect(releasing.isCompleted, isFalse);
+      source.end(2);
+      await releasing.future;
+      expect(live, {1});
       expect(clock.pendingCount, 0);
       release.complete();
-      await _until(() => source.requested == 3);
-      expect(live, {2});
-      source.end(2);
       expect(_value(await running), [2]);
       expect(live, isEmpty);
     },
@@ -299,7 +299,7 @@ void main() {
   );
 
   test(
-    'explicit cancellation during replacement cleanup is retained',
+    'explicit cancellation from deferred user cleanup is retained',
     () async {
       final released = <int>[];
       final flow = Flow.fromIterable([1, 2])
@@ -321,7 +321,7 @@ void main() {
             .map((cause) => cause.reason),
         [null],
       );
-      expect(released, [1, 2]);
+      expect(released, [2, 1]);
     },
   );
 
@@ -381,7 +381,7 @@ void main() {
       ),
       isA<ExitSuccess>(),
     );
-    expect(events, ['input 1', 'consumer 2', 'input 2']);
+    expect(events, ['consumer 2', 'input 2', 'input 1']);
   });
 
   test(

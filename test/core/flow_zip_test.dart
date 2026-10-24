@@ -136,7 +136,7 @@ void main() {
     () async {
       final opening = _Gate<FlowCursor<int, Never>, Never>();
       final running = runtime.run(
-        flowFromCursor(opening.task)
+        flowFromCursor((_) => opening.task)
             .zip(Flow.fromIterable(<String>[]))
             .toList(),
       );
@@ -371,7 +371,12 @@ void main() {
       );
       final exit = _value(
         await runtime.run(
-          left.zip(Flow.fromIterable(['a', 'b'])).take(1).toList().exit(),
+          left
+              .zip(Flow.fromIterable(['a', 'b']))
+              .take(1)
+              .toList()
+              .scoped()
+              .exit(),
         ),
       );
       expect(

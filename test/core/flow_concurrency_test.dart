@@ -40,7 +40,7 @@ void main() {
   });
 
   test(
-    'default mapping closes each output before pulling the next input',
+    'default mapping shares callback resources until the consumer scope closes',
     () async {
       final events = <String>[];
       Iterable<int> values() sync* {
@@ -73,13 +73,13 @@ void main() {
         'pull 1',
         'map 1',
         'consume 1',
-        'release consume 1',
-        'release map 1',
         'pull 2',
         'map 2',
         'consume 2',
         'release consume 2',
         'release map 2',
+        'release consume 1',
+        'release map 1',
       ]);
     },
   );
@@ -471,7 +471,7 @@ void main() {
       expect(events, ['recover']);
       mapperGate.complete(1);
       expect(await running, isA<ExitSuccess>());
-      expect(events, ['recover', 'consume 1', 'release', 'consume 2']);
+      expect(events, ['recover', 'consume 1', 'consume 2', 'release']);
     },
   );
 
