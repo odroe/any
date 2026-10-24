@@ -60,6 +60,10 @@ final class Fiber<T, E> {
   /// or the waiting execution returns it. Waiting on oneself, or on work that
   /// must wait for the caller, fails with a [StateError] defect instead of
   /// deadlocking.
+  ///
+  /// The target's owner retains its work and resource leases after a waiter
+  /// cancels. An undelivered failure remains eligible for the owner's unhandled-
+  /// failure reporting. Use [cancel] to stop the target itself.
   Task<Exit<T, E>, Never> awaitExit() => awaitFiberTask(this);
 
   /// Returns a task that waits for this fiber and adopts its value or failure.

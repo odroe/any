@@ -150,6 +150,41 @@ final class Runtime {
   /// completes after its child work and resource cleanup. Observe its result with
   /// [Fiber.join], [Fiber.awaitExit], or [Fiber.poll] to handle failures directly.
   ///
+  /// To let a page stop waiting without cancelling native work, pass the page's
+  /// signal to a separate [run] of [Fiber.join]. Acquire leases inside the owned
+  /// operation; they remain held until the operation actually finishes.
+  ///
+  /// For an application-owned `SharedResource<HttpClient, HttpException>` named
+  /// `clients`, this keeps the client lease through the entire HTTP response:
+  ///
+  /// ```dart
+  /// // Imports dart:convert, dart:io, and package:any/any.dart.
+  /// Future<Exit<String, HttpException>> downloadForPage(
+  ///   Runtime app,
+  ///   SharedResource<HttpClient, HttpException> clients,
+  ///   Uri uri,
+  ///   CancellationSignal pageSignal,
+  /// ) {
+  ///   final download = clients.use(
+  ///     (client) => Task.fromFuture(() async {
+  ///       final request = await client.getUrl(uri);
+  ///       final response = await request.close();
+  ///       final body = await response.transform(utf8.decoder).join();
+  ///       if (response.statusCode >= 400) {
+  ///         throw HttpException('HTTP ${response.statusCode}', uri: uri);
+  ///       }
+  ///       return body;
+  ///     }, onError: (error, _) => HttpException('$error', uri: uri)),
+  ///   );
+  ///   final operation = app.start(download);
+  ///   return app.run(operation.join(), signal: pageSignal);
+  /// }
+  /// ```
+  ///
+  /// The application must eventually [close] this runtime. Shutdown requests
+  /// cancellation and waits for pending native work before releasing resources.
+  /// A page cancellation does not abort the HTTP request in this example.
+  ///
   /// A closing or closed runtime returns a completed fiber with a [RuntimeClosed]
   /// defect; the task does not start.
   Fiber<T, E> start<T, E>(Task<T, E> task, {CancellationSignal? signal}) =>
@@ -186,6 +221,11 @@ final class Runtime {
   /// [signal] cancels only this execution. An already cancelled signal prevents
   /// the task from starting. Cancellation waits for any in-flight,
   /// non-cancellable [Future] to settle before returning.
+  ///
+  /// Applying [Future.timeout] to the returned Future does not cancel this task.
+  /// This entry still observes its eventual exit, even if the host abandons that
+  /// Future. Use [start] and a separately cancellable [Fiber.join] when work must
+  /// remain supervised after its caller stops waiting.
   Future<Exit<T, E>> run<T, E>(Task<T, E> task, {CancellationSignal? signal}) =>
       fiberCompletion(start(task, signal: signal));
 
