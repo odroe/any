@@ -22,6 +22,106 @@ void main() {
     await runtime.close();
   });
 
+  test('use waits for lease cleanup before continuing', () async {
+    final entered = Completer<void>();
+    final release = Completer<void>();
+    final events = <String>[];
+    addTearDown(() {
+      if (!release.isCompleted) release.complete();
+    });
+    final resource = await _own(
+      runtime,
+      SharedResource.create(
+        Task.acquireRelease(
+          Task.succeed(1),
+          release: (_, _) => Task.sync(() {
+            events.add('resource cleanup');
+            entered.complete();
+          }).flatMap((_) => _future(release.future)),
+        ),
+      ),
+    );
+    final running = runtime.run(
+      resource
+          .use((value) {
+            return Task.addFinalizer(
+              (_) => Task.sync(() => events.add('callback cleanup')),
+            ).map((_) => value + 1);
+          })
+          .map((value) {
+            events.add('continued');
+            return value;
+          }),
+    );
+    await entered.future;
+    expect(events, ['callback cleanup', 'resource cleanup']);
+    release.complete();
+    expect(_value(await running), 2);
+    expect(events.last, 'continued');
+  });
+
+  test('cancelling use preserves another lease and the idle timeout', () async {
+    var acquisitions = 0;
+    var releases = 0;
+    final cleaned = Completer<void>();
+    final resource = await _own(
+      runtime,
+      SharedResource.create(
+        Task.acquireRelease(
+          Task.sync(() => ++acquisitions),
+          release: (_, _) => Task.sync(() {
+            releases++;
+            cleaned.complete();
+          }),
+        ),
+        idleTimeout: ttl,
+      ),
+    );
+    final controller = CancellationController();
+    final firstGate = _Gate<void, Never>();
+    final secondGate = _Gate<void, Never>();
+    final first = runtime.run(
+      resource.use((value) => firstGate.task.map((_) => value)),
+      signal: controller.signal,
+    );
+    final second = runtime.run(
+      resource.use((value) => secondGate.task.map((_) => value)),
+    );
+    await Future.wait([firstGate.started.future, secondGate.started.future]);
+    controller.requestCancel(reason: 'first');
+    expect(
+      _causes(await first).whereType<CauseCancelled>().single.reason,
+      'first',
+    );
+    expect(firstGate.cancelled, isTrue);
+    expect(secondGate.cancelled, isFalse);
+    expect((acquisitions, releases, clock.pendingCount), (1, 0, 0));
+    secondGate.succeed(null);
+    expect(_value(await second), 1);
+    expect((releases, clock.pendingCount), (0, 1));
+    clock.advance(ttl);
+    await cleaned.future;
+    expect(releases, 1);
+  });
+
+  test('a widened use preserves callback and cleanup failures', () async {
+    final defect = StateError('release');
+    final SharedResource<int, Never> infallible = await _own(
+      runtime,
+      SharedResource.create(
+        Task.acquireRelease(
+          Task.succeed(1),
+          release: (_, _) => Task.sync(() => throw defect),
+        ),
+      ),
+    );
+    final SharedResource<int, String> resource = infallible;
+    final exit = await runtime.run(resource.use<int>((_) => Task.fail('use')));
+    expect(_causes(exit).whereType<CauseFailure<String>>().single.error, 'use');
+    expect(_defects(exit), [same(defect)]);
+    expect(reports, isEmpty);
+  });
+
   test(
     'creation is lazy, independent, and does not start acquisition',
     () async {

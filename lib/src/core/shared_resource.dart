@@ -14,7 +14,7 @@ import 'task.dart';
 /// borrowers in another runtime must finish their own scopes.
 ///
 /// This example keeps one HTTP client available throughout the requests. Each
-/// request releases its lease when its scoped task ends.
+/// request uses [SharedResourceOperations.use] to release its lease promptly.
 ///
 /// ```dart
 /// import 'dart:io';
@@ -34,16 +34,13 @@ import 'task.dart';
 ///       ).withError<String>().flatMap(
 ///         (shared) => Task.forEach(
 ///           urls,
-///           (url) => shared
-///               .acquire()
-///               .flatMap(
-///                 (client) => Task.fromFuture(() async {
-///                   final response = await (await client.getUrl(url)).close();
-///                   await response.drain<void>();
-///                   return response.statusCode;
-///                 }, onError: (error, _) => error.toString()),
-///               )
-///               .scoped(),
+///           (url) => shared.use(
+///             (client) => Task.fromFuture(() async {
+///               final response = await (await client.getUrl(url)).close();
+///               await response.drain<void>();
+///               return response.statusCode;
+///             }, onError: (error, _) => error.toString()),
+///           ),
 ///           concurrency: 4,
 ///         ),
 ///       );
@@ -92,11 +89,23 @@ final class SharedResource<T, E> {
 extension SharedResourceOperations<T, E> on SharedResource<T, E> {
   /// Borrows the resource until the calling scope closes.
   ///
-  /// Use `acquire().flatMap(use).scoped()` to release the lease after one operation.
+  /// Use [use] to release the lease after one operation.
   /// Concurrent callers share an unfinished acquisition. Cancelling one waiter
   /// does not stop the others; the last waiter cancels acquisition and waits for
   /// its cleanup. A closed owner fails with a [StateError] defect.
   Task<T, E> acquire() => Task.defer(() => _state.acquire(null));
+
+  /// Borrows the resource for [use] and releases its lease before completing.
+  ///
+  /// Runs [use] in a child scope and returns the callback's value on success.
+  /// Success, failure, and cancellation wait for the scope to close and release
+  /// the lease. If the last lease closes the resource, cleanup finishes first.
+  /// Other leases and the configured idle timeout can keep the resource open.
+  ///
+  /// Callback and cleanup failures are both preserved; thrown callback exceptions
+  /// become defects. Return values must remain usable after the lease ends.
+  Task<U, E> use<U>(Task<U, E> Function(T value) use) =>
+      acquire().flatMap(use).scoped();
 
   /// Makes future callers acquire a replacement resource.
   ///
