@@ -1176,6 +1176,13 @@ final class _MapEntry<T, E> {
   TaskEvaluation<T, E>? result;
 }
 
+final class _MapFailure<E> {
+  _MapFailure(this.result, this.cancellations);
+
+  final TaskEvaluation<Object?, E> result;
+  final List<CauseCancelled> cancellations;
+}
+
 final class _ConcurrentMap<T, U, E> {
   _ConcurrentMap(
     this.source,
@@ -1196,7 +1203,7 @@ final class _ConcurrentMap<T, U, E> {
   late final _lifetime = FlowProducer(owner);
   final _ordered = Queue<_MapEntry<U, E>>();
   final _ready = Queue<_MapEntry<U, E>>();
-  final _failures = <TaskEvaluation<Object?, E>>[];
+  final _failures = <_MapFailure<E>>[];
   final _active = <Fiber<U, E>>{};
   Fiber<void, E>? _driver;
   _MapEntry<U, E>? _current;
@@ -1206,6 +1213,7 @@ final class _ConcurrentMap<T, U, E> {
   var _driverDone = false;
   var _ended = false;
   var _stopping = false;
+  var _failureDelivered = false;
 
   late final cursor = FlowCursor<U, E>(
     _pull(),
@@ -1229,8 +1237,12 @@ final class _ConcurrentMap<T, U, E> {
     }
     if (!_started) {
       _started = true;
+      final cancellations = <CauseCancelled>[];
       return forkTaskIn(
-        _produce(),
+        _produce().mapCause((cause) {
+          cancellations.addAll(_causes(cause).whereType<CauseCancelled>());
+          return cause;
+        }),
         owner,
         inheritHost: true,
       ).withError<E>().flatMap((fiber) {
@@ -1238,8 +1250,7 @@ final class _ConcurrentMap<T, U, E> {
         listenFiber(fiber, (exit) {
           _driverDone = true;
           if (exit is ExitFailure<void, E>) {
-            _failures.add(TaskEvaluation(exit, fiberFailureEvents(fiber)));
-            _stop();
+            _recordFailure(fiber, exit, cancellations);
           }
           _notify();
         });
@@ -1252,7 +1263,10 @@ final class _ConcurrentMap<T, U, E> {
       }
       return taskFromEvaluation(
         _failure<Option<U>, E>(() => const Option.none()),
-      );
+      ).mapCause((cause) {
+        _failureDelivered = true;
+        return cause;
+      });
     }
     final ready = preserveOrder ? _ordered : _ready;
     if (ready.isNotEmpty && ready.first.result != null) {
@@ -1299,6 +1313,7 @@ final class _ConcurrentMap<T, U, E> {
         return Task.succeed(null);
       }
       final value = (item as OptionSome<T>).value;
+      final cancellations = <CauseCancelled>[];
       return Task.sync(() {
         final inputs = source.producers().toSet().toList();
         final scope = createScope(parent: source.scope);
@@ -1330,7 +1345,12 @@ final class _ConcurrentMap<T, U, E> {
               inTaskScope(
                 Task.defer(() => transform(value)),
                 entry.producer.scope,
-              ),
+              ).mapCause((cause) {
+                cancellations.addAll(
+                  _causes(cause).whereType<CauseCancelled>(),
+                );
+                return cause;
+              }),
               owner,
               inheritHost: true,
             ).withError<E>().flatMap((fiber) {
@@ -1341,8 +1361,7 @@ final class _ConcurrentMap<T, U, E> {
                 final result = TaskEvaluation(exit, fiberFailureEvents(fiber));
                 entry.result = result;
                 if (exit is ExitFailure<U, E>) {
-                  _failures.add(result);
-                  _stop();
+                  _recordFailure(fiber, exit, cancellations);
                 } else {
                   _ready.addLast(entry);
                 }
@@ -1389,6 +1408,22 @@ final class _ConcurrentMap<T, U, E> {
     _notify();
   }
 
+  void _recordFailure<A>(
+    Fiber<A, E> fiber,
+    ExitFailure<A, E> exit,
+    List<CauseCancelled> cancellations,
+  ) {
+    // Cleanup provenance survives a pending owner cancellation even when the
+    // cleanup's scope has already closed and detached from the worker.
+    _failures.add(
+      _MapFailure(TaskEvaluation(exit, fiberFailureEvents(fiber)), [
+        ...cancellations,
+        ...fiberCleanupCancellations(fiber),
+      ]),
+    );
+    _stop();
+  }
+
   Task<void, Never> _finish(Exit<Object?, Object?> exit) => Task.defer(() {
     _stop();
     if (_started && (!_driverDone || _active.isNotEmpty)) {
@@ -1426,7 +1461,9 @@ final class _ConcurrentMap<T, U, E> {
     final causes = <Cause<F>>[];
     final events = <FailureEvent>[];
     final seen = <Object>{};
-    for (final result in _failures) {
+    for (final failure in _failures) {
+      final result = failure.result;
+      final cancellations = [...failure.cancellations];
       if (result.exit case ExitFailure(:final cause)) {
         final sources = Map<CauseDefect, Queue<FailureEvent>>.identity();
         for (final event in result.events) {
@@ -1442,9 +1479,11 @@ final class _ConcurrentMap<T, U, E> {
               }
             case CauseFailure(:final error):
               if (!defectsOnly) causes.add(Cause.failure(error as F));
-            case CauseCancelled(:final reason):
-              if (!defectsOnly && !identical(reason, _stopReason)) {
-                causes.add(Cause.cancelled(reason));
+            case CauseCancelled():
+              if ((!defectsOnly ||
+                      (!_failureDelivered && cancellations.remove(reason))) &&
+                  !identical(reason.reason, _stopReason)) {
+                causes.add(reason);
               }
             case CauseGroup():
               throw StateError('Cause groups must be flat.');
