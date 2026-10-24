@@ -687,6 +687,147 @@ void main() {
     expect(_value(await runtime.run(flow.toList())), [2000]);
   });
 
+  for (final fromMapper in [true, false]) {
+    for (final preserveOrder in [true, false]) {
+      test('early take retains ${fromMapper ? 'mapper' : 'source'} cleanup '
+          'cancellation (preserveOrder: $preserveOrder)', () async {
+        final first = Completer<int>();
+        final started = Completer<void>();
+        final cleaning = Completer<void>();
+        final release = Completer<void>();
+        final defect = StateError('cleanup');
+        final stack = StackTrace.fromString('cleanup stack');
+        const cancellation = Cause<Never>.cancelled('cleanup');
+        final pending =
+            Task.fromCallback<int, Never>((complete) {
+              started.complete();
+              return () {};
+            }).ensuring(
+              Task.fromFuture(() {
+                cleaning.complete();
+                return release.future;
+              }, onError: _defect).flatMap(
+                (_) => Task.failCause(
+                  Cause.combine([
+                    cancellation,
+                    cancellation,
+                    Cause.defect(defect, stack),
+                  ]),
+                ),
+              ),
+            );
+        final source = fromMapper
+            ? Flow.fromIterable([1, 2])
+            : Flow.fromIterable([1]).concat(Flow.fromTask(pending));
+        var completed = false;
+        final running = runtime
+            .run(
+              source
+                  .mapTask(
+                    (value) => value == 1
+                        ? Task.fromFuture(() => first.future, onError: _defect)
+                        : pending,
+                    concurrency: 2,
+                    preserveOrder: preserveOrder,
+                  )
+                  .take(1)
+                  .toList(),
+            )
+            .then((exit) {
+              completed = true;
+              return exit;
+            });
+        await started.future;
+        first.complete(1);
+        await cleaning.future;
+        expect(completed, isFalse);
+        release.complete();
+
+        final causes = _causes(_cause(await running));
+        expect(causes, [
+          same(cancellation),
+          same(cancellation),
+          isA<CauseDefect>()
+              .having((cause) => cause.error, 'error', same(defect))
+              .having((cause) => cause.stackTrace, 'stack', same(stack)),
+        ]);
+      });
+    }
+  }
+
+  test(
+    'delivered mapper cancellation is not repeated during cleanup',
+    () async {
+      const cancellation = Cause<Never>.cancelled('mapper');
+      final flow = Flow.fromIterable([1]).mapTask(
+        (_) =>
+            Task.failCause<Never>(Cause.combine([cancellation, cancellation])),
+        concurrency: 2,
+      );
+      expect(_causes(_cause(await runtime.run(flow.toList()))), [
+        same(cancellation),
+        same(cancellation),
+      ]);
+    },
+  );
+
+  test('owner cancellation retains mapper cleanup cancellation once', () async {
+    final controller = CancellationController();
+    final started = Completer<void>();
+    const cleanup = Cause<Never>.cancelled('cleanup');
+    final flow = Flow.fromIterable([1]).mapTask(
+      (_) => Task.fromCallback<int, Never>((complete) {
+        started.complete();
+        return () {};
+      }).ensuring(Task.failCause(Cause.combine([cleanup, cleanup]))),
+      concurrency: 2,
+    );
+    final running = runtime.run(flow.toList(), signal: controller.signal);
+    await started.future;
+    controller.requestCancel(reason: 'owner');
+    expect(_causes(_cause(await running)), [
+      isA<CauseCancelled>().having((cause) => cause.reason, 'reason', 'owner'),
+      same(cleanup),
+      same(cleanup),
+    ]);
+  });
+
+  for (final reuseInCleanup in [false, true]) {
+    test('owner cancellation discards late masked mapper cancellation '
+        '(reused in cleanup: $reuseInCleanup)', () async {
+      final controller = CancellationController();
+      final started = Completer<void>();
+      final release = Completer<void>();
+      const cancellation = Cause<Never>.cancelled('late mapper');
+      final flow = Flow.fromIterable([1]).mapTask(
+        (_) =>
+            Task.uninterruptibleMask<int, Never>(
+              (_) => Task.fromFuture(() {
+                started.complete();
+                return release.future;
+              }, onError: _defect).flatMap((_) => Task.failCause(cancellation)),
+            ).ensuring(
+              reuseInCleanup
+                  ? Task.failCause(cancellation)
+                  : Task.succeed(null),
+            ),
+        concurrency: 2,
+      );
+      final running = runtime.run(flow.toList(), signal: controller.signal);
+      await started.future;
+      controller.requestCancel(reason: 'owner');
+      release.complete();
+      expect(_causes(_cause(await running)), [
+        isA<CauseCancelled>().having(
+          (cause) => cause.reason,
+          'reason',
+          'owner',
+        ),
+        if (reuseInCleanup) same(cancellation),
+      ]);
+    });
+  }
+
   test('explicit cancellation from output cleanup is retained', () async {
     final flow = Flow.fromIterable([1]).mapTask(
       (value) => Task.acquireRelease(
