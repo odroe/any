@@ -141,11 +141,14 @@ final class _Run<A, T, E> {
 
     final index = exits.length;
     exits.add(null);
-    return Task.defer(
-      () => stopping
-          ? Task.failCause<E>(Cause.cancelled(stopReason))
-          : action(value),
-    ).fork().flatMap((fiber) {
+    return forkTask(
+      Task.defer(
+        () => stopping
+            ? Task.failCause<E>(Cause.cancelled(stopReason))
+            : action(value),
+      ),
+      inheritCancellation: mode == _Mode.all || mode == _Mode.settled,
+    ).flatMap((fiber) {
       active[index] = fiber;
       if (stopping) fiber.requestCancel(reason: stopReason);
       listenFiber(fiber, (exit) {
