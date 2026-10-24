@@ -792,6 +792,118 @@ void main() {
     ]);
   });
 
+  for (final fromMapper in [true, false]) {
+    test('${fromMapper ? 'mapper' : 'source'} cleanup can request owner '
+        'cancellation without losing its own failure', () async {
+      final controller = CancellationController();
+      const cancellation = Cause<Never>.cancelled('cleanup');
+      final defect = StateError('cleanup defect');
+      final stack = StackTrace.fromString('cleanup stack');
+      final task = Task.succeed(1).ensuring(
+        Task.defer(() {
+          controller.requestCancel(reason: 'owner');
+          return Task.failCause(
+            Cause.combine([
+              cancellation,
+              cancellation,
+              Cause.defect(defect, stack),
+            ]),
+          );
+        }),
+      );
+      final source = fromMapper ? Flow.fromIterable([1]) : Flow.fromTask(task);
+      final flow = source.mapTask(
+        (value) => fromMapper ? task : Task.succeed(value),
+        concurrency: 2,
+      );
+
+      expect(
+        _causes(
+          _cause(await runtime.run(flow.toList(), signal: controller.signal)),
+        ),
+        [
+          isA<CauseCancelled>().having(
+            (cause) => cause.reason,
+            'reason',
+            'owner',
+          ),
+          isA<CauseDefect>()
+              .having((cause) => cause.error, 'error', same(defect))
+              .having((cause) => cause.stackTrace, 'stack', same(stack)),
+          same(cancellation),
+          same(cancellation),
+        ],
+      );
+    });
+  }
+
+  for (final capture in [true, false]) {
+    test('${capture ? 'captured' : 'recovered'} cleanup cancellation is not '
+        'retained when a later body reuses its cause', () async {
+      final controller = CancellationController();
+      const cancellation = Cause<Never>.cancelled('reused');
+      final flow = Flow.fromIterable([1]).mapTask(
+        (value) => Task.uninterruptibleMask<int, Never>((_) {
+          final failed = Task.succeed(value)
+              .ensuring(Task.failCause(cancellation));
+          final handled = capture
+              ? failed.exit().map((_) => value)
+              : failed.recoverCause<Never>((_) => Task.succeed(value));
+          return handled.flatMap((_) {
+            controller.requestCancel(reason: 'owner');
+            return Task.yieldNow().flatMap((_) => Task.failCause(cancellation));
+          });
+        }),
+        concurrency: 2,
+      );
+
+      expect(
+        _causes(
+          _cause(await runtime.run(flow.toList(), signal: controller.signal)),
+        ),
+        [
+          isA<CauseCancelled>().having(
+            (cause) => cause.reason,
+            'reason',
+            'owner',
+          ),
+        ],
+      );
+    });
+  }
+
+  test('cause mapping preserves cleanup before owner cancellation', () async {
+    final controller = CancellationController();
+    const cancellation = Cause<Never>.cancelled('cleanup');
+    final flow = Flow.fromIterable([1]).mapTask(
+      (value) =>
+          Task.succeed(value)
+              .ensuring(Task.failCause(cancellation))
+              .mapCause<Never>((cause) => cause)
+              .ensuring(
+                Task.defer(() {
+                  controller.requestCancel(reason: 'owner');
+                  return Task.yieldNow();
+                }),
+              ),
+      concurrency: 2,
+    );
+
+    expect(
+      _causes(
+        _cause(await runtime.run(flow.toList(), signal: controller.signal)),
+      ),
+      [
+        isA<CauseCancelled>().having(
+          (cause) => cause.reason,
+          'reason',
+          'owner',
+        ),
+        same(cancellation),
+      ],
+    );
+  });
+
   for (final reuseInCleanup in [false, true]) {
     test('owner cancellation discards late masked mapper cancellation '
         '(reused in cleanup: $reuseInCleanup)', () async {

@@ -29,6 +29,7 @@ final class Fiber<T, E> {
   final _listeners = <Object, void Function(Exit<T, E>)>{};
   final _zone = Zone.current;
   late final List<FailureEvent> _finalEvents;
+  late final List<CauseCancelled> _cleanupCancellations;
   Exit<T, E>? _exit;
   var _active = true;
   var _observed = false;
@@ -88,6 +89,7 @@ final class Fiber<T, E> {
   void _finish(TaskEvaluation<T, E> result) {
     final exit = result.exit;
     _finalEvents = result.events;
+    _cleanupCancellations = result.cleanupCancellations;
     _active = false;
     _exit = exit;
     _completion.complete(exit);
@@ -202,6 +204,9 @@ bool fiberIsActive(Fiber<Object?, Object?> fiber) => fiber._active;
 
 List<FailureEvent> fiberFailureEvents(Fiber<Object?, Object?> fiber) =>
     fiber._finalEvents;
+
+List<CauseCancelled> fiberCleanupCancellations(Fiber<Object?, Object?> fiber) =>
+    fiber._cleanupCancellations;
 
 List<Fiber<Object?, Object?>> currentFibers() =>
     Zone.current[_currentFibers] as List<Fiber<Object?, Object?>>? ?? const [];

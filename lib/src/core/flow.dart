@@ -1213,7 +1213,6 @@ final class _ConcurrentMap<T, U, E> {
   var _driverDone = false;
   var _ended = false;
   var _stopping = false;
-  var _stoppedByUs = false;
   var _failureDelivered = false;
 
   late final cursor = FlowCursor<U, E>(
@@ -1402,7 +1401,6 @@ final class _ConcurrentMap<T, U, E> {
   void _stop() {
     if (_stopping) return;
     _stopping = true;
-    _stoppedByUs = !scopeIsClosing(owner);
     _driver?.requestCancel(reason: _stopReason);
     for (final fiber in _active.toList()) {
       fiber.requestCancel(reason: _stopReason);
@@ -1415,18 +1413,12 @@ final class _ConcurrentMap<T, U, E> {
     ExitFailure<A, E> exit,
     List<CauseCancelled> cancellations,
   ) {
-    // Owner cancellation skips mapCause. The worker's own cleanup tree still
-    // records cleanup cancellation separately from its interrupted body.
-    final cleanup = scopeCleanupFor(fiberScope(fiber));
+    // Cleanup provenance survives a pending owner cancellation even when the
+    // cleanup's scope has already closed and detached from the worker.
     _failures.add(
       _MapFailure(TaskEvaluation(exit, fiberFailureEvents(fiber)), [
-        if (_stoppedByUs)
-          ..._causes(exit.cause).whereType<CauseCancelled>()
-        else ...[
-          ...cancellations,
-          if (cleanup.exit case ExitFailure(:final cause))
-            ..._causes(cause).whereType<CauseCancelled>(),
-        ],
+        ...cancellations,
+        ...fiberCleanupCancellations(fiber),
       ]),
     );
     _stop();

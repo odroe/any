@@ -566,9 +566,10 @@ extension TaskOperations<T, E> on Task<T, E> {
     _Continue(
       _node,
       _Frame(
-        failure: (cause, events, signal) => _preserveFailure(
+        failure: (cause, events, cleanups, signal) => _preserveFailure(
           _mapErrors(cause, (error) => transform(error as E), signal),
           events,
+          cleanups,
         ),
       ),
     ),
@@ -582,9 +583,9 @@ extension TaskOperations<T, E> on Task<T, E> {
     _Continue(
       _node,
       _Frame(
-        failure: (cause, events, _) => switch (cause) {
+        failure: (cause, events, cleanups, _) => switch (cause) {
           CauseFailure(:final error) => recover(error as E)._node,
-          _ => _Failure(cause, events),
+          _ => _Failure(cause, events, cleanups),
         },
       ),
     ),
@@ -600,7 +601,7 @@ extension TaskOperations<T, E> on Task<T, E> {
         _Continue(
           _node,
           _Frame(
-            failure: (cause, _, _) => recover(_typedCause<E>(cause))._node,
+            failure: (cause, _, _, _) => recover(_typedCause<E>(cause))._node,
           ),
         ),
       );
@@ -613,8 +614,11 @@ extension TaskOperations<T, E> on Task<T, E> {
     _Continue(
       _node,
       _Frame(
-        failure: (cause, events, _) =>
-            _preserveFailure(transform(_typedCause<E>(cause)), events),
+        failure: (cause, events, cleanups, _) => _preserveFailure(
+          transform(_typedCause<E>(cause)),
+          events,
+          cleanups,
+        ),
       ),
     ),
   );
@@ -629,7 +633,7 @@ extension TaskOperations<T, E> on Task<T, E> {
       _node,
       _Frame(
         success: (value) => _Success(Exit<T, E>.success(value as T)),
-        failure: (cause, _, _) =>
+        failure: (cause, _, _, _) =>
             _Success(Exit<T, E>.failure(_typedCause<E>(cause))),
       ),
     ),
@@ -645,8 +649,11 @@ extension TaskOperations<T, E> on Task<T, E> {
     _Continue(
       _node,
       _Frame(
-        failure: (cause, events, _) =>
-            _preserveFailure(_defects(cause, StackTrace.current), events),
+        failure: (cause, events, cleanups, _) => _preserveFailure(
+          _defects(cause, StackTrace.current),
+          events,
+          cleanups,
+        ),
       ),
     ),
   );
@@ -664,7 +671,11 @@ extension InfallibleTaskOperations<T> on Task<T, Never> {
 // Internal execution results retain provenance only for the current failure.
 // Capturing or recovering a failure returns success without these events.
 final class TaskEvaluation<T, E> {
-  const TaskEvaluation(this.exit, this.events);
+  const TaskEvaluation(
+    this.exit,
+    this.events, {
+    this.cleanupCancellations = const [],
+  });
 
   factory TaskEvaluation.fresh(Exit<T, E> exit) =>
       TaskEvaluation(exit, switch (exit) {
@@ -674,6 +685,9 @@ final class TaskEvaluation<T, E> {
 
   final Exit<T, E> exit;
   final List<FailureEvent> events;
+  // Only occurrences still present on this failure path, not earlier cleanup
+  // failures that have already been captured or recovered.
+  final List<CauseCancelled> cleanupCancellations;
 }
 
 // Runtime's execution boundary. This declaration is not exported by any.dart.
@@ -704,6 +718,7 @@ Future<TaskEvaluation<T, E>> evaluateTask<T, E>(
     result = TaskEvaluation(
       _appendCleanup(result.exit, Cause.cancelled(signal!.reason)),
       result.events,
+      cleanupCancellations: result.cleanupCancellations,
     );
     cancellationObserved = true;
   }
@@ -719,6 +734,7 @@ Future<TaskEvaluation<T, E>> evaluateTask<T, E>(
     result = TaskEvaluation(
       _appendCleanup(result.exit, Cause.cancelled(signal!.reason)),
       result.events,
+      cleanupCancellations: result.cleanupCancellations,
     );
   }
   return result;
@@ -807,7 +823,11 @@ Task<TaskEnvironment, Never> captureTaskEnvironment() => Task._(
 Task<T, E> taskFromEvaluation<T, E>(TaskEvaluation<T, E> result) =>
     Task._(switch (result.exit) {
       ExitSuccess(:final value) => _Success(value),
-      ExitFailure(:final cause) => _Failure(cause, result.events),
+      ExitFailure(:final cause) => _Failure(
+        cause,
+        result.events,
+        result.cleanupCancellations,
+      ),
     });
 
 Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
@@ -833,6 +853,7 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
   Object? value;
   Cause<Object?>? failure;
   var events = const <FailureEvent>[];
+  var cleanupCancellations = const <CauseCancelled>[];
   var remaining = 2048;
 
   while (true) {
@@ -842,6 +863,7 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
         TaskEvaluation(
           Exit<T, E>.failure(_cancelled(failure, effectiveSignal!.reason)),
           events,
+          cleanupCancellations: cleanupCancellations,
         ),
         true,
         observed,
@@ -860,6 +882,7 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
             value = runScope;
             failure = null;
             events = const [];
+            cleanupCancellations = const [];
             evaluating = false;
           case _Environment(:final use):
             current = use(currentScope, currentContext, currentLocals, fiber);
@@ -871,6 +894,7 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
             value = read(currentLocals);
             failure = null;
             events = const [];
+            cleanupCancellations = const [];
             evaluating = false;
           case _ProvideLocal(
             :final source,
@@ -887,6 +911,7 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
             value = read(currentContext);
             failure = null;
             events = const [];
+            cleanupCancellations = const [];
             evaluating = false;
           case _ProvideContext(:final source, :final context):
             frames.add(_Frame(context: currentContext));
@@ -906,6 +931,7 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
             );
             failure = null;
             events = const [];
+            cleanupCancellations = const [];
             evaluating = false;
           case _AwaitFiber(
             :final target,
@@ -924,9 +950,11 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
             }
             if (cancel) target.requestCancel(reason: reason);
             var delivered = const <FailureEvent>[];
+            var deliveredCleanups = const <CauseCancelled>[];
             final pending = _runCallback(
               (complete) => listenFiber(target, (exit) {
                 delivered = fiberFailureEvents(target);
+                deliveredCleanups = fiberCleanupCancellations(target);
                 observed.addAll(delivered.map((event) => event.source));
                 complete(join ? exit : Exit.success(exit));
               }),
@@ -940,19 +968,27 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
                 value = result;
                 failure = null;
                 events = const [];
+                cleanupCancellations = const [];
               case ExitFailure(:final cause):
                 failure = cause;
                 events = _failureEvents(cause, delivered);
+                cleanupCancellations = join ? deliveredCleanups : const [];
             }
             evaluating = false;
           case _Success(value: final result):
             value = result;
             failure = null;
             events = const [];
+            cleanupCancellations = const [];
             evaluating = false;
-          case _Failure(:final cause, events: final sources):
+          case _Failure(
+            :final cause,
+            events: final sources,
+            cleanupCancellations: final cleanups,
+          ):
             failure = cause;
             events = sources ?? _failureEvents(cause);
+            cleanupCancellations = cleanups;
             evaluating = false;
           case _Sync(:final body, :final onError):
             try {
@@ -963,6 +999,7 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
                   ? Cause.defect(error, stackTrace)
                   : Cause.failure(onError(error, stackTrace));
               events = _failureEvents(failure);
+              cleanupCancellations = const [];
               evaluating = false;
             }
           case _Suspend(:final create):
@@ -981,11 +1018,13 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
               value = await create();
               failure = null;
               events = const [];
+              cleanupCancellations = const [];
             } catch (error, stackTrace) {
               failure = effectiveSignal?.isCancelled ?? false
                   ? Cause.defect(error, stackTrace)
                   : Cause.failure(onError(error, stackTrace));
               events = _failureEvents(failure);
+              cleanupCancellations = const [];
             }
             evaluating = false;
           case _FromCallback(:final register):
@@ -998,9 +1037,11 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
                 value = result;
                 failure = null;
                 events = const [];
+                cleanupCancellations = const [];
               case ExitFailure(:final cause):
                 failure = cause;
                 events = _failureEvents(cause);
+                cleanupCancellations = const [];
             }
             evaluating = false;
           case _Yield():
@@ -1008,6 +1049,7 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
             value = null;
             failure = null;
             events = const [];
+            cleanupCancellations = const [];
             evaluating = false;
           case _Continue(:final source, :final frame):
             frames.add(frame);
@@ -1016,6 +1058,7 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
             value = createScope(parent: currentScope);
             failure = null;
             events = const [];
+            cleanupCancellations = const [];
             evaluating = false;
           case _AddFinalizer(:final finalizer):
             final zone = Zone.current;
@@ -1049,6 +1092,10 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
               _ => null,
             };
             events = result?.events ?? const [];
+            cleanupCancellations = switch (result?.exit) {
+              ExitFailure(:final cause) => _cancellations(cause),
+              _ => const [],
+            };
             value = null;
             evaluating = false;
           case _Scoped(:final source):
@@ -1066,9 +1113,14 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
                   currentScope = parent;
                   return _FinishScope(child, Exit.success(value), const []);
                 },
-                failure: (cause, events, _) {
+                failure: (cause, events, cleanups, _) {
                   currentScope = parent;
-                  return _FinishScope(child, Exit.failure(cause), events);
+                  return _FinishScope(
+                    child,
+                    Exit.failure(cause),
+                    events,
+                    cleanups,
+                  );
                 },
               ),
             );
@@ -1077,10 +1129,15 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
             :final scope,
             :final exit,
             events: final bodyEvents,
+            cleanupCancellations: final bodyCleanups,
           ):
             await closeScope(scope, exit);
             final completed = _appendEvaluation(
-              TaskEvaluation(exit, bodyEvents),
+              TaskEvaluation(
+                exit,
+                bodyEvents,
+                cleanupCancellations: bodyCleanups,
+              ),
               scopeCleanupFor(scope, {
                 ...observed,
                 for (final event in bodyEvents) event.source,
@@ -1094,6 +1151,7 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
                 failure = cause;
             }
             events = completed.events;
+            cleanupCancellations = completed.cleanupCancellations;
             evaluating = false;
           case _CloseScope(:final scope, :final exit):
             if (scopeCloseWouldDeadlock(scope, currentScope) ||
@@ -1115,6 +1173,7 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
               _ => null,
             };
             events = completed.events;
+            cleanupCancellations = completed.cleanupCancellations;
             observed.addAll(events.map((event) => event.source));
             value = null;
             evaluating = false;
@@ -1126,7 +1185,15 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
         final Exit<T, E> exit = failure == null
             ? Exit.success(value as T)
             : Exit.failure(_typedCause<E>(failure));
-        return (TaskEvaluation(exit, events), false, observed);
+        return (
+          TaskEvaluation(
+            exit,
+            events,
+            cleanupCancellations: cleanupCancellations,
+          ),
+          false,
+          observed,
+        );
       }
 
       final frame = frames.removeLast();
@@ -1149,7 +1216,7 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
       if (failure case final cause?) {
         final resume = frame.failure;
         if (resume == null) continue;
-        current = resume(cause, events, effectiveSignal);
+        current = resume(cause, events, cleanupCancellations, effectiveSignal);
       } else {
         final resume = frame.success;
         if (resume == null) continue;
@@ -1157,27 +1224,36 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
       }
       // A continuation has already produced this failure. Record it before the
       // next cancellation check so defects cannot disappear between frames.
-      if (current case _Failure(:final cause, events: final sources)) {
+      if (current case _Failure(
+        :final cause,
+        events: final sources,
+        cleanupCancellations: final cleanups,
+      )) {
         failure = cause;
         events = sources ?? _failureEvents(cause);
+        cleanupCancellations = cleanups;
         evaluating = false;
       } else if (current case _FinishScope(
         exit: ExitFailure(:final cause),
         events: final sources,
+        cleanupCancellations: final cleanups,
       )) {
         // Closing still has to execute, but cancellation before it starts must
         // retain the body failure that is already being handed to the scope.
         failure = cause;
         events = sources;
+        cleanupCancellations = cleanups;
         evaluating = true;
       } else {
         failure = null;
         events = const [];
+        cleanupCancellations = const [];
         evaluating = true;
       }
     } catch (error, stackTrace) {
       failure = Cause.defect(error, stackTrace);
       events = _failureEvents(failure);
+      cleanupCancellations = const [];
       evaluating = false;
     }
   }
@@ -1207,8 +1283,26 @@ List<FailureEvent> _failureEvents(
   ]);
 }
 
-_Failure _preserveFailure(Cause<Object?> cause, List<FailureEvent> events) =>
-    _Failure(cause, _failureEvents(cause, events));
+List<CauseCancelled> _cancellations(Cause<Object?> cause) => switch (cause) {
+  CauseCancelled() => [cause],
+  CauseGroup(:final causes) => causes.whereType<CauseCancelled>().toList(),
+  _ => const [],
+};
+
+_Failure _preserveFailure(
+  Cause<Object?> cause,
+  List<FailureEvent> events,
+  List<CauseCancelled> cleanupCancellations,
+) {
+  if (cleanupCancellations.isEmpty) {
+    return _Failure(cause, _failureEvents(cause, events));
+  }
+  final available = [...cleanupCancellations];
+  return _Failure(cause, _failureEvents(cause, events), [
+    for (final cancellation in _cancellations(cause))
+      if (available.remove(cancellation)) cancellation,
+  ]);
+}
 
 TaskEvaluation<T, E> _appendEvaluation<T, E>(
   TaskEvaluation<T, E> result,
@@ -1219,10 +1313,14 @@ TaskEvaluation<T, E> _appendEvaluation<T, E>(
     _ => null,
   };
   if (cause == null) return result;
-  return TaskEvaluation(_appendCleanup(result.exit, cause), [
-    ...result.events,
-    ...cleanup.events,
-  ]);
+  return TaskEvaluation(
+    _appendCleanup(result.exit, cause),
+    [...result.events, ...cleanup.events],
+    cleanupCancellations: [
+      ...result.cleanupCancellations,
+      ..._cancellations(cause),
+    ],
+  );
 }
 
 FutureOr<Exit<Object?, Object?>> _runCallback(
@@ -1443,9 +1541,14 @@ final class _Success extends _Node {
 }
 
 final class _Failure extends _Node {
-  const _Failure(this.cause, [this.events]);
+  const _Failure(
+    this.cause, [
+    this.events,
+    this.cleanupCancellations = const [],
+  ]);
   final Cause<Object?> cause;
   final List<FailureEvent>? events;
+  final List<CauseCancelled> cleanupCancellations;
 }
 
 final class _Sync extends _Node {
@@ -1506,10 +1609,16 @@ final class _Scoped extends _Node {
 }
 
 final class _FinishScope extends _Node {
-  const _FinishScope(this.scope, this.exit, this.events);
+  const _FinishScope(
+    this.scope,
+    this.exit,
+    this.events, [
+    this.cleanupCancellations = const [],
+  ]);
   final Scope scope;
   final Exit<Object?, Object?> exit;
   final List<FailureEvent> events;
+  final List<CauseCancelled> cleanupCancellations;
 }
 
 final class _CloseScope extends _Node {
@@ -1528,7 +1637,12 @@ final class _Frame {
     this.scope,
   });
   final _Node Function(Object?)? success;
-  final _Node Function(Cause<Object?>, List<FailureEvent>, CancellationSignal?)?
+  final _Node Function(
+    Cause<Object?>,
+    List<FailureEvent>,
+    List<CauseCancelled>,
+    CancellationSignal?,
+  )?
   failure;
   final bool? interruptible;
   final Context? context;

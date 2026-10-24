@@ -125,6 +125,10 @@ TaskEvaluation<void, Never> scopeCleanupFor(
         if (event.cause case final CauseDefect cause)
           FailureEvent(cause, event.source),
     ]),
+    cleanupCancellations: List.unmodifiable([
+      for (final event in events)
+        if (event.cause case final CauseCancelled cause) cause,
+    ]),
   );
 }
 
