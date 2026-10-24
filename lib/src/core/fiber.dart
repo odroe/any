@@ -4,6 +4,7 @@ import 'cancellation.dart';
 import 'cause.dart';
 import 'context.dart';
 import 'exit.dart';
+import 'internal/execution_mode.dart';
 import 'option.dart';
 import 'scope.dart';
 import 'task.dart';
@@ -161,6 +162,7 @@ Fiber<T, E> startFiber<T, E>(
   CancellationSignal? signal,
   Scope? runScope,
   Scope? resourceScope,
+  ExecutionMode? mode,
 }) {
   final fiber = Fiber<T, E>._(
     createScope(runtimeId: scopeRuntimeId(owner)),
@@ -184,43 +186,51 @@ Fiber<T, E> startFiber<T, E>(
     fiber,
   ];
 
+  void finish(TaskEvaluation<T, E> result) {
+    unsubscribe?.call();
+    // Detach before publishing the exit: a joining parent must not collect
+    // the same failure again when it subsequently closes its own scope.
+    detachScopeFiber(owner, fiber);
+    releaseBorrow?.call();
+    fiber._finish(result);
+  }
+
+  void failed(Object error, StackTrace stackTrace) => finish(
+    TaskEvaluation.fresh(Exit.failure(Cause.defect(error, stackTrace))),
+  );
+
   void start() {
     _startupDepth++;
     try {
-      unawaited(
-        runZoned(
-          () async {
-            TaskEvaluation<T, E> result;
-            try {
-              result = await evaluateTask(
-                task,
-                interruptible: interruptible,
-                signal: fiber._controller.signal,
-                scope: fiber._scope,
-                resourceScope: resourceScope,
-                runScope: runScope,
-                fiber: fiber,
-                context: context,
-                locals: locals,
-              );
-            } catch (error, stackTrace) {
-              result = TaskEvaluation.fresh(
-                Exit.failure(Cause.defect(error, stackTrace)),
-              );
-            }
-            unsubscribe?.call();
-            // Detach before publishing the exit: a joining parent must not collect
-            // the same failure again when it subsequently closes its own scope.
-            detachScopeFiber(owner, fiber);
-            releaseBorrow?.call();
-            fiber._finish(result);
-          },
-          zoneValues: {
-            _currentFibers: List<Fiber<Object?, Object?>>.unmodifiable(
-              ancestors,
-            ),
-          },
-        ),
+      runZoned(
+        () {
+          final FutureOr<TaskEvaluation<T, E>> result;
+          try {
+            result = evaluateTask(
+              task,
+              interruptible: interruptible,
+              signal: fiber._controller.signal,
+              scope: fiber._scope,
+              resourceScope: resourceScope,
+              runScope: runScope,
+              fiber: fiber,
+              context: context,
+              locals: locals,
+              mode: mode,
+            );
+          } catch (error, stackTrace) {
+            failed(error, stackTrace);
+            return;
+          }
+          if (result is Future<TaskEvaluation<T, E>>) {
+            unawaited(result.then(finish, onError: failed));
+          } else {
+            finish(result);
+          }
+        },
+        zoneValues: {
+          _currentFibers: List<Fiber<Object?, Object?>>.unmodifiable(ancestors),
+        },
       );
     } finally {
       _startupDepth--;
@@ -241,7 +251,8 @@ Fiber<T, E> completedFiber<T, E>(
   required void Function(Cause<Object?> cause) report,
 }) {
   final fiber = Fiber<T, E>._(createScope(), report);
-  unawaited(closeScope(fiber._scope, exit));
+  final closing = closeScope(fiber._scope, exit);
+  if (closing is Future<Cause<Never>?>) unawaited(closing);
   fiber._finish(TaskEvaluation.fresh(exit));
   return fiber;
 }
@@ -295,14 +306,14 @@ Future<Exit<T, E>> fiberCompletion<T, E>(
 }
 
 // Stops owned work and retains defects without converting business failures.
-Future<List<FailureEvent>> stopFiber(
+FutureOr<List<FailureEvent>> stopFiber(
   Fiber<Object?, Object?> fiber, {
   Object? reason,
-}) async {
+}) {
   fiber._defectsHandledByOwner = true;
   fiber.requestCancel(reason: reason);
-  await fiberCompletion(fiber, observe: false);
-  return fiber._finalEvents;
+  if (fiber._exit != null) return fiber._finalEvents;
+  return fiberCompletion(fiber, observe: false).then((_) => fiber._finalEvents);
 }
 
 // One defect occurrence retained across internal ownership boundaries.

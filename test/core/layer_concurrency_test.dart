@@ -324,22 +324,33 @@ void main() {
   });
 
   test(
-    'simultaneous business failures are retained in observation order',
+    'the first observed business failure cancels unfinished branches',
     () async {
       final first = ServiceKey<int>('first');
       final second = ServiceKey<int>('second');
-      final exit = await Runtime.create(
-        first
-            .layer(Task.fail('first'))
-            .merge(second.layer(Task.fail('second')), concurrency: 2),
+      final started = Completer<void>();
+      final completions = <void Function(Exit<int, String>)>[];
+      final cancelled = <int>[];
+      Task<int, String> acquire() => Task.fromCallback((complete) {
+        final index = completions.length;
+        completions.add(complete);
+        if (completions.length == 2) started.complete();
+        return () => cancelled.add(index);
+      });
+      final opening = Runtime.create(
+        first.layer(acquire()).merge(second.layer(acquire()), concurrency: 2),
         onUnhandledError: reports.add,
       );
+      await started.future;
+      completions[1](const Exit.failure(Cause.failure('second')));
+      final exit = await opening;
       expect(
         _reasons(_cause(exit))
             .whereType<CauseFailure<String>>()
             .map((cause) => cause.error),
-        ['first', 'second'],
+        ['second'],
       );
+      expect(cancelled, [0]);
       expect(_reasons(_cause(exit)).whereType<CauseCancelled>(), isEmpty);
     },
   );
@@ -369,12 +380,21 @@ void main() {
       final a = ServiceKey<int>('a');
       final b = ServiceKey<int>('b');
       final defect = Cause<Never>.defect(Object(), StackTrace.current);
-      final exit = await Runtime.create(
-        a
-            .layer(Task.failCause(defect))
-            .merge(b.layer(Task.failCause(defect)), concurrency: 2),
+      final started = Completer<void>();
+      final completions = <void Function(Exit<int, Never>)>[];
+      Task<int, Never> acquire() => Task.fromCallback((complete) {
+        completions.add(complete);
+        if (completions.length == 2) started.complete();
+        return () {};
+      });
+      final opening = Runtime.create(
+        a.layer(acquire()).merge(b.layer(acquire()), concurrency: 2),
         onUnhandledError: reports.add,
       );
+      await started.future;
+      completions[0](Exit.failure(defect));
+      completions[1](Exit.failure(defect));
+      final exit = await opening;
       expect(_reasons(_cause(exit)).whereType<CauseDefect>(), [
         same(defect),
         same(defect),

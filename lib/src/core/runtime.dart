@@ -6,9 +6,11 @@ import 'clock.dart';
 import 'context.dart';
 import 'exit.dart';
 import 'fiber.dart';
+import 'internal/execution_mode.dart';
 import 'layer.dart';
 import 'logger.dart';
 import 'metric.dart';
+import 'option.dart';
 import 'scope.dart';
 import 'random_source.dart';
 import 'task.dart';
@@ -19,6 +21,8 @@ import 'tracer.dart';
 /// Use [run] to obtain an [Exit], [runOrThrow] to integrate with exception-based
 /// code, or [start] to keep a [Fiber] handle. Each call starts an independent
 /// execution. [close] stops owned work and releases application resources.
+/// Use [runSync] or [runSyncOrThrow] at interfaces that require a synchronous
+/// result; asynchronous work is reported through [AsyncTaskException].
 ///
 /// ```dart
 /// final runtime = Runtime();
@@ -148,7 +152,14 @@ final class Runtime {
   ///
   /// A closing or closed runtime returns a completed fiber with a [RuntimeClosed]
   /// defect; the task does not start.
-  Fiber<T, E> start<T, E>(Task<T, E> task, {CancellationSignal? signal}) {
+  Fiber<T, E> start<T, E>(Task<T, E> task, {CancellationSignal? signal}) =>
+      _start(task, signal: signal);
+
+  Fiber<T, E> _start<T, E>(
+    Task<T, E> task, {
+    CancellationSignal? signal,
+    ExecutionMode? mode,
+  }) {
     if (_closing != null) {
       return completedFiber(
         Exit<T, E>.failure(
@@ -163,6 +174,7 @@ final class Runtime {
       report: _report,
       signal: signal,
       context: _context,
+      mode: mode,
     );
   }
 
@@ -189,6 +201,59 @@ final class Runtime {
     ExitSuccess(:final value) => value,
     ExitFailure(:final cause) => throw TaskException(cause),
   };
+
+  /// Runs [task] synchronously and returns its complete [Exit].
+  ///
+  /// Completion includes owned child work and cleanup. Business failures,
+  /// defects, and cancellation remain in the exit, as with [run]. An already
+  /// cancelled [signal] prevents the body from starting.
+  ///
+  /// Throws [AsyncTaskException] if execution must wait, including for a native
+  /// [Future], an explicit yield, unfinished child work, or asynchronous cleanup.
+  /// Even an already completed Future requires asynchronous continuation. A
+  /// callback that delivers its result during registration can finish synchronously.
+  ///
+  /// At an asynchronous boundary, cancellation is requested and this runtime
+  /// continues supervising the original execution. The exception's
+  /// [AsyncTaskException.completion] exposes its eventual exit. Effects already
+  /// performed are not repeated or rolled back; cancellation still respects
+  /// masks and waits for non-cancellable work and cleanup.
+  ///
+  /// Automatic scheduling yields are disabled during this call. Explicit yields
+  /// and stack-safety deferrals still require asynchronous execution. Timers
+  /// cannot interrupt synchronous Dart code; use [run] for long-running work.
+  Exit<T, E> runSync<T, E>(Task<T, E> task, {CancellationSignal? signal}) {
+    final mode = ExecutionMode(automaticYield: false);
+    final Fiber<T, E> fiber;
+    try {
+      fiber = _start(task, signal: signal, mode: mode);
+    } finally {
+      mode.automaticYield = true;
+    }
+    if (fiber.poll() case OptionSome(:final value)) return value;
+    fiber.requestCancel();
+    throw AsyncTaskException<T, E>._(fiber);
+  }
+
+  /// Runs [task] synchronously and returns its value.
+  ///
+  /// Throws [TaskException] on task failure, retaining the complete [Cause].
+  /// Throws [AsyncTaskException] when synchronous completion is impossible.
+  /// Execution, cancellation, and cleanup follow [runSync].
+  ///
+  /// ```dart
+  /// final runtime = Runtime();
+  /// final total = runtime.runSyncOrThrow(
+  ///   Task.sync(() => [3, 5, 8]).map((values) => values.reduce((a, b) => a + b)),
+  /// );
+  /// assert(total == 16);
+  /// await runtime.close();
+  /// ```
+  T runSyncOrThrow<T, E>(Task<T, E> task, {CancellationSignal? signal}) =>
+      switch (runSync(task, signal: signal)) {
+        ExitSuccess(:final value) => value,
+        ExitFailure(:final cause) => throw TaskException(cause),
+      };
 
   /// Stops this runtime and returns the outcome of shutting it down.
   ///
@@ -252,10 +317,34 @@ final class RuntimeClosed implements Exception {
   String toString() => 'RuntimeClosed: The runtime no longer accepts tasks.';
 }
 
+/// A synchronous run that requires asynchronous work to finish.
+///
+/// [Runtime.runSync] and [Runtime.runSyncOrThrow] request cancellation before
+/// throwing this exception. The original runtime retains ownership of the work
+/// and its cleanup. Use [completion] to wait for the final result; starting the
+/// task again would repeat effects that already ran.
+final class AsyncTaskException<T, E> implements Exception {
+  AsyncTaskException._(this._fiber);
+
+  final Fiber<T, E> _fiber;
+
+  /// The original execution's exit after owned work and cleanup finish.
+  ///
+  /// Reading this property observes the eventual result for unhandled-failure
+  /// reporting, as [Runtime.run] does. Ignoring the exception leaves reporting
+  /// with its runtime. A non-cancellable operation can delay completion.
+  Future<Exit<T, E>> get completion => fiberCompletion(_fiber);
+
+  @override
+  String toString() =>
+      'AsyncTaskException: The task could not finish synchronously.';
+}
+
 /// A task's complete failure represented as a Dart exception.
 ///
-/// [Runtime.runOrThrow] throws this exception when a task fails. Inspect [cause]
-/// for business errors, defects with their original stack traces, or cancellation.
+/// [Runtime.runOrThrow] and [Runtime.runSyncOrThrow] throw this exception when a
+/// task fails. Inspect [cause] for business errors, defects with their original
+/// stack traces, or cancellation.
 final class TaskException implements Exception {
   /// Creates an exception retaining the complete [cause].
   const TaskException(this.cause);

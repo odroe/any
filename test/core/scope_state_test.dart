@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:any/any.dart';
+import 'package:any/src/core/internal/execution_mode.dart';
 import 'package:any/src/core/scope.dart' as scopes;
 import 'package:any/src/core/task.dart' as tasks;
 import 'package:test/test.dart';
@@ -8,10 +9,11 @@ import 'package:test/test.dart';
 void main() {
   late Runtime runtime;
 
-  Future<tasks.TaskEvaluation<void, Never>> runFinalizer(
+  FutureOr<tasks.TaskEvaluation<void, Never>> runFinalizer(
     Task<void, Never> task,
     scopes.Scope scope,
-  ) => tasks.evaluateTask(task);
+    ExecutionMode mode,
+  ) => tasks.evaluateTask(task, mode: mode);
 
   FutureOr<Cause<Never>?> add(
     scopes.Scope scope,
@@ -23,17 +25,71 @@ void main() {
       runFinalizer: runFinalizer,
     );
     if (pending == null) return null;
-    return (pending as Future<tasks.TaskEvaluation<void, Never>?>).then(
-      (result) => switch (result?.exit) {
-        ExitFailure(:final cause) => cause,
-        _ => null,
-      },
-    );
+    Cause<Never>? causeOf(tasks.TaskEvaluation<void, Never>? result) =>
+        switch (result?.exit) {
+          ExitFailure(:final cause) => cause,
+          _ => null,
+        };
+    return pending is Future<tasks.TaskEvaluation<void, Never>?>
+        ? pending.then(causeOf)
+        : causeOf(pending);
   }
 
   setUp(() => runtime = Runtime());
   tearDown(() async {
     expect(await runtime.close(), isA<ExitSuccess<void, Never>>());
+  });
+
+  test('synchronous finalizers finish before close returns', () {
+    final scope = scopes.createScope();
+    final events = <int>[];
+    final defect = Cause<Never>.defect(Object(), StackTrace.current);
+    add(scope, (_) => Task.sync(() => events.add(1)));
+    add(scope, (_) => Task.failCause(defect));
+    add(scope, (_) => Task.sync(() => events.add(2)));
+
+    final result = scopes.closeScope(scope, const Exit.success(null));
+
+    expect(result, same(defect));
+    expect(events, [2, 1]);
+    expect(scopes.closeScope(scope, const Exit.success(null)), same(result));
+  });
+
+  test('finalizers use the closing mode rather than the registration mode', () {
+    final scope = scopes.createScope();
+    final registration = ExecutionMode();
+    final closing = ExecutionMode(automaticYield: false);
+    final late = ExecutionMode();
+    final modes = <ExecutionMode>[];
+
+    tasks.TaskEvaluation<void, Never> run(
+      Task<void, Never> task,
+      Scope scope,
+      ExecutionMode mode,
+    ) {
+      modes.add(mode);
+      return const tasks.TaskEvaluation(Exit.success(null), []);
+    }
+
+    scopes.addScopeFinalizer(
+      scope,
+      (_) => Task.succeed(null),
+      runFinalizer: run,
+      mode: registration,
+    );
+    expect(
+      scopes.closeScope(scope, const Exit.success(null), mode: closing),
+      isNull,
+    );
+    expect(modes, [same(closing)]);
+    final result = scopes.addScopeFinalizer(
+      scope,
+      (_) => Task.succeed(null),
+      runFinalizer: run,
+      mode: late,
+    );
+    expect(result, isA<tasks.TaskEvaluation<void, Never>>());
+    expect(modes, [same(closing), same(late)]);
   });
 
   test(
@@ -147,7 +203,7 @@ void main() {
   });
 
   test(
-    'concurrent and repeated close share their Future and first exit',
+    'pending closes share a Future and completed closes reuse the result',
     () async {
       final scope = scopes.createScope();
       final gate = Completer<void>();
@@ -167,7 +223,7 @@ void main() {
       expect(calls, 1);
       gate.complete();
       expect(await first, isNull);
-      expect(scopes.closeScope(scope, const Exit.success(null)), same(first));
+      expect(scopes.closeScope(scope, const Exit.success(null)), isNull);
     },
   );
 
@@ -412,9 +468,9 @@ void main() {
     scopes.addScopeFinalizer(
       child,
       (_) => Task.succeed(null),
-      runFinalizer: (task, scope) {
+      runFinalizer: (task, scope, mode) {
         seen.add(scope);
-        return tasks.evaluateTask(task);
+        return tasks.evaluateTask(task, mode: mode);
       },
     );
 
@@ -422,7 +478,7 @@ void main() {
     expect(seen, [same(child)]);
   });
 
-  test('ten thousand nested empty scopes close without recursion', () async {
+  test('ten thousand nested empty scopes close synchronously', () {
     final root = scopes.createScope();
     var child = root;
     for (var i = 0; i < 10000; i++) {
@@ -430,8 +486,8 @@ void main() {
     }
     expect(scopes.scopeContains(root, child), isTrue);
 
-    expect(await scopes.closeScope(root, const Exit.success(null)), isNull);
-    expect(await scopes.closeScope(child, const Exit.success(null)), isNull);
+    expect(scopes.closeScope(root, const Exit.success(null)), isNull);
+    expect(scopes.closeScope(child, const Exit.success(null)), isNull);
     expect(scopes.scopeContains(root, child), isFalse);
   });
 }

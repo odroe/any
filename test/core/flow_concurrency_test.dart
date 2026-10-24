@@ -793,48 +793,67 @@ void main() {
   });
 
   for (final fromMapper in [true, false]) {
-    test('${fromMapper ? 'mapper' : 'source'} cleanup can request owner '
-        'cancellation without losing its own failure', () async {
-      final controller = CancellationController();
-      const cancellation = Cause<Never>.cancelled('cleanup');
-      final defect = StateError('cleanup defect');
-      final stack = StackTrace.fromString('cleanup stack');
-      final task = Task.succeed(1).ensuring(
-        Task.defer(() {
-          controller.requestCancel(reason: 'owner');
-          return Task.failCause(
-            Cause.combine([
-              cancellation,
-              cancellation,
-              Cause.defect(defect, stack),
-            ]),
+    for (final asynchronous in [false, true]) {
+      test(
+        '${fromMapper ? 'mapper' : 'source'} retains the observed cleanup path '
+        'when cleanup cancels its owner: asynchronous=$asynchronous',
+        () async {
+          final controller = CancellationController();
+          final cleaning = Completer<void>();
+          final release = Completer<void>();
+          const cancellation = Cause<Never>.cancelled('cleanup');
+          final defect = StateError('cleanup defect');
+          final stack = StackTrace.fromString('cleanup stack');
+          final cleanupCause = Cause<Never>.combine([
+            cancellation,
+            cancellation,
+            Cause.defect(defect, stack),
+          ]);
+          final task = Task.succeed(1).ensuring(
+            Task.defer(() {
+              controller.requestCancel(reason: 'owner');
+              if (!asynchronous) return Task.failCause(cleanupCause);
+              // Keep the worker active while its owner begins Scope shutdown.
+              cleaning.complete();
+              return Task.fromFuture<void, Never>(
+                () => release.future,
+                onError: _defect,
+              ).flatMap((_) => Task.failCause(cleanupCause));
+            }),
           );
-        }),
-      );
-      final source = fromMapper ? Flow.fromIterable([1]) : Flow.fromTask(task);
-      final flow = source.mapTask(
-        (value) => fromMapper ? task : Task.succeed(value),
-        concurrency: 2,
-      );
-
-      expect(
-        _causes(
-          _cause(await runtime.run(flow.toList(), signal: controller.signal)),
-        ),
-        [
-          isA<CauseCancelled>().having(
-            (cause) => cause.reason,
-            'reason',
-            'owner',
-          ),
-          isA<CauseDefect>()
+          final source = fromMapper
+              ? Flow.fromIterable([1])
+              : Flow.fromTask(task);
+          final flow = source.mapTask(
+            (value) => fromMapper ? task : Task.succeed(value),
+            concurrency: 2,
+          );
+          final running = runtime.run(flow.toList(), signal: controller.signal);
+          if (asynchronous) {
+            await cleaning.future;
+            release.complete();
+          }
+          final defectMatcher = isA<CauseDefect>()
               .having((cause) => cause.error, 'error', same(defect))
-              .having((cause) => cause.stackTrace, 'stack', same(stack)),
-          same(cancellation),
-          same(cancellation),
-        ],
+              .having((cause) => cause.stackTrace, 'stack', same(stack));
+
+          expect(_causes(_cause(await running)), [
+            isA<CauseCancelled>().having(
+              (cause) => cause.reason,
+              'reason',
+              'owner',
+            ),
+            // An active worker's defect reaches Scope before Flow's finalizer
+            // contributes cancellation. A completed worker delivers its entire
+            // cleanup Cause through Flow in its original order instead.
+            if (asynchronous) defectMatcher,
+            same(cancellation),
+            same(cancellation),
+            if (!asynchronous) defectMatcher,
+          ]);
+        },
       );
-    });
+    }
   }
 
   for (final capture in [true, false]) {
