@@ -308,6 +308,12 @@ final class Task<T, E> {
   /// stack trace, alongside cancellation, without calling [onError]. This also
   /// applies if [create] requests cancellation before throwing synchronously.
   /// While cancellation is masked, normal error mapping and callbacks continue.
+  ///
+  /// To cancel only a caller's wait, start the operation in a longer-lived owner
+  /// with `Runtime.start` or [TaskOperations.forkIn], then wait with [Fiber.join].
+  /// Acquire resources inside that operation so its owner retains them until the
+  /// Future settles. Passing captured objects does not extend their lifetime.
+  /// Use [fromCallback] when the native API can acknowledge that it has stopped.
   static Task<T, E> fromFuture<T, E>(
     Future<T> Function() create, {
     required E Function(Object error, StackTrace stackTrace) onError,
@@ -323,6 +329,10 @@ final class Task<T, E> {
   /// function and awaits its cleanup. A request during registration waits until
   /// [register] returns. An already completed operation is not cancelled; a masked
   /// operation keeps waiting for completion.
+  ///
+  /// The cancellation function must finish only when the operation has stopped
+  /// using its resources. Return its asynchronous stop acknowledgment when needed;
+  /// merely ignoring further callbacks does not make native work safe to release.
   ///
   /// A registration exception becomes a defect even after synchronous completion.
   /// If that completion failed, its cause precedes the registration defect.
@@ -504,6 +514,10 @@ extension TaskOperations<T, E> on Task<T, E> {
   /// that scope; closing it cancels the fiber before releasing them.
   /// Cancellation of the creating task does not cancel the fiber.
   /// Captured objects and service bindings retain their original lifetimes.
+  ///
+  /// A shorter-lived caller can wait with [Fiber.join] and cancel only its wait.
+  /// The explicit owner must remain open for the whole operation. With [fork],
+  /// the creating execution would instead stop and await the unfinished child.
   Task<Fiber<T, E>, Never> forkIn(Scope scope) => Task._(
     _Fork((_, _, parent, context, locals, _, runScope, _, mode) {
       if (!identical(
