@@ -289,6 +289,444 @@ void main() {
     expect(targetCancellations, 0);
   });
 
+  test(
+    'cancellation during exit handoff leaves its defect unobserved',
+    () async {
+      late void Function(Exit<int, Never>) complete;
+      final defect = Cause<Never>.defect(Object(), StackTrace.current);
+      final target = runtime.start(
+        Task.fromCallback<int, Never>((callback) {
+          complete = callback;
+          return () {};
+        }),
+      );
+      final controller = CancellationController();
+      var armed = false;
+      var intercepted = false;
+      var received = false;
+      final waiting = runZoned(
+        () => runtime.run(
+          target.awaitExit().map((_) => received = true),
+          signal: controller.signal,
+        ),
+        zoneSpecification: ZoneSpecification(
+          scheduleMicrotask: (self, parent, zone, callback) {
+            if (armed) {
+              armed = false;
+              intercepted = true;
+              controller.requestCancel(reason: 'handoff');
+            }
+            parent.scheduleMicrotask(zone, callback);
+          },
+        ),
+      );
+      armed = true;
+      complete(Exit.failure(defect));
+
+      expect((_cause(await waiting) as CauseCancelled).reason, 'handoff');
+      expect(intercepted, isTrue);
+      expect(received, isFalse);
+      await _reportsTurn();
+      expect(reports, [same(defect)]);
+    },
+  );
+
+  for (final completed in [false, true]) {
+    test('cancellation at a yield before exit consumption preserves reporting '
+        '(already completed: $completed)', () async {
+      late void Function(Exit<int, Never>) complete;
+      final defect = Cause<Never>.defect(Object(), StackTrace.current);
+      final target = runtime.start(
+        Task.fromCallback<int, Never>((callback) {
+          complete = callback;
+          return () {};
+        }),
+      );
+      if (completed) {
+        complete(Exit.failure(defect));
+        await _turn();
+        expect(reports, isEmpty);
+      }
+      var task = target.awaitExit();
+      final context = Context.from(const []);
+      // Put the completed wait immediately before the executor's cooperative
+      // yield, with only environment restoration before the consuming callback.
+      for (var i = 0; i < 2045; i++) {
+        task = task.provideContext(context);
+      }
+      final controller = CancellationController();
+      var intercepted = false;
+      var received = false;
+      final waiting = runZoned(
+        () => runtime.run(
+          task.map((_) => received = true),
+          signal: controller.signal,
+        ),
+        zoneSpecification: ZoneSpecification(
+          createTimer: (self, parent, zone, duration, callback) {
+            if (!intercepted && duration == Duration.zero) {
+              intercepted = true;
+              controller.requestCancel(reason: 'yield');
+            }
+            return parent.createTimer(zone, duration, callback);
+          },
+        ),
+      );
+      if (!completed) complete(Exit.failure(defect));
+
+      expect((_cause(await waiting) as CauseCancelled).reason, 'yield');
+      expect(intercepted, isTrue);
+      expect(received, isFalse);
+      await _reportsTurn();
+      expect(reports, [same(defect)]);
+    });
+  }
+
+  test('another waiter can observe an exit abandoned during handoff', () async {
+    late void Function(Exit<int, Never>) complete;
+    final defect = Cause<Never>.defect(Object(), StackTrace.current);
+    final target = runtime.start(
+      Task.fromCallback<int, Never>((callback) {
+        complete = callback;
+        return () {};
+      }),
+    );
+    final controller = CancellationController();
+    var armed = false;
+    var received = false;
+    final cancelled = runZoned(
+      () => runtime.run(
+        target.awaitExit().map((_) => received = true),
+        signal: controller.signal,
+      ),
+      zoneSpecification: ZoneSpecification(
+        scheduleMicrotask: (self, parent, zone, callback) {
+          if (armed) {
+            armed = false;
+            controller.requestCancel();
+          }
+          parent.scheduleMicrotask(zone, callback);
+        },
+      ),
+    );
+    final observing = runtime.run(target.awaitExit());
+    armed = true;
+    complete(Exit.failure(defect));
+
+    expect(_cause(await cancelled), isA<CauseCancelled>());
+    expect(received, isFalse);
+    expect(_cause(_value(await observing)), same(defect));
+    await _reportsTurn();
+    expect(reports, isEmpty);
+  });
+
+  test(
+    'cancellation after exit consumption keeps the result observed',
+    () async {
+      final defect = Cause<Never>.defect(Object(), StackTrace.current);
+      final target = runtime.start(Task.failCause(defect));
+      final controller = CancellationController();
+      final seen = <Exit<Never, Never>>[];
+      final exit = await runtime.run(
+        target.awaitExit().map((result) {
+          seen.add(result);
+          controller.requestCancel(reason: 'after consumption');
+        }),
+        signal: controller.signal,
+      );
+
+      expect(_cause(seen.single), same(defect));
+      expect((_cause(exit) as CauseCancelled).reason, 'after consumption');
+      await _reportsTurn();
+      expect(reports, isEmpty);
+    },
+  );
+
+  test(
+    'cancellation during join handoff retains the adopted defect once',
+    () async {
+      late void Function(Exit<int, Never>) complete;
+      final defect = Cause<Never>.defect(Object(), StackTrace.current);
+      final target = runtime.start(
+        Task.fromCallback<int, Never>((callback) {
+          complete = callback;
+          return () {};
+        }),
+      );
+      final controller = CancellationController();
+      var armed = false;
+      final waiting = runZoned(
+        () => runtime.run(target.join(), signal: controller.signal),
+        zoneSpecification: ZoneSpecification(
+          scheduleMicrotask: (self, parent, zone, callback) {
+            if (armed) {
+              armed = false;
+              controller.requestCancel();
+            }
+            parent.scheduleMicrotask(zone, callback);
+          },
+        ),
+      );
+      armed = true;
+      complete(Exit.failure(defect));
+
+      final cause = _cause(await waiting) as CauseGroup<Never>;
+      expect(cause.causes.whereType<CauseDefect>(), [same(defect)]);
+      expect(cause.causes.whereType<CauseCancelled>(), hasLength(1));
+      await _reportsTurn();
+      expect(reports, isEmpty);
+    },
+  );
+
+  for (final cancel in [false, true]) {
+    test('direct exit delivery waits for execution cleanup '
+        '(cancelled: $cancel)', () async {
+      final defect = Cause<Never>.defect(Object(), StackTrace.current);
+      final target = runtime.start(Task.failCause(defect));
+      final controller = CancellationController();
+      final cleaning = Completer<void>();
+      final cleaned = Completer<void>();
+      addTearDown(() {
+        if (!cleaned.isCompleted) cleaned.complete();
+      });
+      final waiting = runtime.run(
+        Task.addFinalizer((_) {
+          cleaning.complete();
+          return _future(cleaned.future);
+        }).flatMap((_) => target.awaitExit()),
+        signal: controller.signal,
+      );
+      await cleaning.future;
+      if (cancel) controller.requestCancel(reason: 'cleanup');
+      await _reportsTurn();
+      expect(reports, isEmpty);
+      cleaned.complete();
+
+      final exit = await waiting;
+      if (cancel) {
+        expect((_cause(exit) as CauseCancelled).reason, 'cleanup');
+      } else {
+        expect(_cause(_value(exit)), same(defect));
+      }
+      await _reportsTurn();
+      expect(reports, cancel ? [same(defect)] : isEmpty);
+    });
+  }
+
+  for (final wrapper in ['scoped', 'exit', 'context', 'local', 'mask']) {
+    test(
+      '$wrapper does not consume an exit before cleanup completes',
+      () async {
+        final defect = Cause<Never>.defect(Object(), StackTrace.current);
+        final target = runtime.start(Task.failCause(defect));
+        final controller = CancellationController();
+        final cleaning = Completer<void>();
+        final cleaned = Completer<void>();
+        addTearDown(() {
+          if (!cleaned.isCompleted) cleaned.complete();
+        });
+        final source = Task.addFinalizer((_) {
+          cleaning.complete();
+          return _future(cleaned.future);
+        }).flatMap((_) => target.awaitExit());
+        final Task<Object?, Never> task = switch (wrapper) {
+          'scoped' => source.scoped(),
+          'exit' => source.exit(),
+          'context' => source.provideContext(Context.from(const [])),
+          'local' => TaskLocal(0).locally(1, source),
+          _ => Task.uninterruptibleMask((restore) => restore(source)),
+        };
+        final waiting = runtime.run(task, signal: controller.signal);
+        await cleaning.future;
+        controller.requestCancel(reason: 'cleanup');
+        await _reportsTurn();
+        expect(reports, isEmpty);
+        cleaned.complete();
+
+        expect((_cause(await waiting) as CauseCancelled).reason, 'cleanup');
+        await _reportsTurn();
+        expect(reports, [same(defect)]);
+      },
+    );
+  }
+
+  for (final scoped in [false, true]) {
+    test('directly returning a child exit excludes its owned cleanup defect '
+        '(scoped: $scoped)', () async {
+      final error = StateError('child cleanup');
+      final cleaned = Completer<void>();
+      final cleaning = Completer<void>();
+      addTearDown(() {
+        if (!cleaned.isCompleted) cleaned.complete();
+      });
+      final child = Task.fromCallback<void, Never>(
+        (_) =>
+            () => throw error,
+      );
+      var task = Scope.open().flatMap((scope) {
+        return child.forkIn(scope).flatMap((fiber) {
+          final closing = scope
+              .close(const Exit.success(null))
+              .ensuring(
+                Task.defer(() {
+                  cleaning.complete();
+                  return _future(cleaned.future);
+                }),
+              );
+          return closing.fork().flatMap((_) => fiber.awaitExit());
+        });
+      });
+      if (scoped) task = task.scoped();
+      final waiting = runtime.run(task);
+      await cleaning.future;
+      await _turn();
+      cleaned.complete();
+      final cause = _cause(_value(await waiting)) as CauseGroup<Never>;
+
+      expect(cause.causes.whereType<CauseDefect>().single.error, same(error));
+      expect(cause.causes.whereType<CauseCancelled>(), hasLength(1));
+      await _reportsTurn();
+      expect(reports, isEmpty);
+    });
+  }
+
+  test(
+    'recovering cleanup failure does not observe a discarded exit',
+    () async {
+      final defect = Cause<Never>.defect(Object(), StackTrace.current);
+      final cleanup = Cause<Never>.defect(Object(), StackTrace.current);
+      final target = runtime.start(Task.failCause(defect));
+      final waiting = Task.addFinalizer((_) => Task.failCause(cleanup))
+          .flatMap((_) => target.awaitExit())
+          .scoped()
+          .recoverCause((cause) {
+            expect(cause, same(cleanup));
+            return Task.succeed(
+              const Exit<Never, Never>.failure(Cause.cancelled()),
+            );
+          });
+
+      expect(_cause(_value(await runtime.run(waiting))), isA<CauseCancelled>());
+      await _reportsTurn();
+      expect(reports, [same(defect)]);
+    },
+  );
+
+  for (final cancel in [false, true]) {
+    test('a detached scope retains a pending exit through outer cleanup '
+        '(cancelled: $cancel)', () async {
+      final error = StateError('child cleanup');
+      final child = Task.fromCallback<void, Never>(
+        (_) =>
+            () => throw error,
+      );
+      final controller = CancellationController();
+      final cleaning = Completer<void>();
+      final cleaned = Completer<void>();
+      addTearDown(() {
+        if (!cleaned.isCompleted) cleaned.complete();
+      });
+      final body = Scope.open().flatMap((scope) {
+        return child.forkIn(scope).flatMap((fiber) {
+          return scope
+              .close(const Exit.success(null))
+              .fork()
+              .flatMap((_) => fiber.awaitExit());
+        });
+      }).scoped();
+      final waiting = runtime.run(
+        Task.addFinalizer((_) {
+          cleaning.complete();
+          return _future(cleaned.future);
+        }).flatMap((_) => body),
+        signal: controller.signal,
+      );
+      await cleaning.future;
+      if (cancel) controller.requestCancel(reason: 'outer cleanup');
+      cleaned.complete();
+      final exit = await waiting;
+      final cause =
+          (cancel ? _cause(exit) : _cause(_value(exit))) as CauseGroup<Never>;
+
+      expect(cause.causes.whereType<CauseDefect>().single.error, same(error));
+      expect(cause.causes.whereType<CauseCancelled>(), hasLength(1));
+      await _reportsTurn();
+      expect(reports, isEmpty);
+    });
+  }
+
+  for (final reuseCause in [false, true]) {
+    test('abandoned cleanup preserves occurrence order '
+        '(same cause reused: $reuseCause)', () async {
+      final inner = Cause<Never>.defect(Object(), StackTrace.current);
+      final outer = reuseCause
+          ? inner
+          : Cause<Never>.defect(Object(), StackTrace.current);
+      final child = _pending<void>().ensuring(Task.failCause(inner));
+      final body = Scope.open().flatMap((scope) {
+        return child.forkIn(scope).flatMap((fiber) {
+          return scope
+              .close(const Exit.success(null))
+              .fork()
+              .flatMap((_) => fiber.awaitExit());
+        });
+      }).scoped();
+      final exit = await runtime.run(
+        Task.addFinalizer((_) => Task.failCause(outer)).flatMap((_) => body),
+      );
+
+      expect((_cause(exit) as CauseGroup<Never>).causes, [
+        same(inner),
+        same(outer),
+      ]);
+      await _reportsTurn();
+      expect(reports, isEmpty);
+    });
+  }
+
+  test(
+    'masked workers can deliver captured exits after cancellation',
+    () async {
+      final controller = CancellationController();
+      final error = StateError('child cleanup');
+      final child = Task.fromCallback<void, Never>(
+        (_) =>
+            () => throw error,
+      );
+      final body = Scope.open().flatMap((scope) {
+        return child.forkIn(scope).flatMap((fiber) {
+          return scope
+              .close(const Exit.success(null))
+              .ensuring(Task.yieldNow())
+              .fork()
+              .flatMap((_) => fiber.awaitExit());
+        });
+      });
+      final worker = Task.addFinalizer(
+        (_) => Task.sync(() {
+          controller.requestCancel(reason: 'masked cleanup');
+        }),
+      ).flatMap((_) => body);
+      var received = false;
+      final task = Task.uninterruptibleMask((_) {
+        return Task.all([worker], concurrency: 2).map((exits) {
+          final cause = _cause(exits.single) as CauseGroup<Never>;
+          expect(
+            cause.causes.whereType<CauseDefect>().single.error,
+            same(error),
+          );
+          received = true;
+        });
+      });
+
+      final exit = await runtime.run(task, signal: controller.signal);
+      expect((_cause(exit) as CauseCancelled).reason, 'masked cleanup');
+      expect(received, isTrue);
+      await _reportsTurn();
+      expect(reports, isEmpty);
+    },
+  );
+
   test('cancel is lazy and waits for cancellation cleanup', () async {
     var cancellations = 0;
     final cleaned = Completer<void>();
