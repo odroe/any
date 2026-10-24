@@ -368,9 +368,18 @@ final class _SharedFlow<T, E> {
           };
           _stop(exit);
           _notify();
-          final stop = _started
-              ? _await(_stopped.future)
-              : _await(closeScope(_work, exit).then((_) => _removeWork()));
+          final Task<void, Never> stop;
+          if (_started) {
+            stop = _await(_stopped.future);
+          } else {
+            final closed = closeScope(_work, exit);
+            if (closed is Future<Cause<Never>?>) {
+              stop = _await(closed).map((_) => _removeWork());
+            } else {
+              _removeWork();
+              stop = Task.succeed(null);
+            }
+          }
           return stop
               .ensuring(
                 _lifetime.finish(exit).exit().map((_) {

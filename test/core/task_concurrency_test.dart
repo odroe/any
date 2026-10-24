@@ -248,35 +248,35 @@ void main() {
     },
   );
 
-  test(
-    'all retains concurrent business failures in observation order',
-    () async {
-      final first = _Gate<int, String>();
-      final second = _Gate<int, String>();
-      final running = runtime.run(
-        Task.all([first.task, second.task], concurrency: 2),
-      );
-      second.fail('second');
-      first.fail('first');
+  test('all retains masked sibling failures in observation order', () async {
+    final first = _Gate<int, String>();
+    final second = _Gate<int, String>();
+    final running = runtime.run(
+      Task.uninterruptibleMask(
+        (_) => Task.all([first.task, second.task], concurrency: 2),
+      ),
+    );
+    second.fail('second');
+    first.fail('first');
 
-      final reasons = _reasons(_cause(await running));
-      expect(reasons.map((cause) => (cause as CauseFailure<String>).error), [
-        'second',
-        'first',
-      ]);
-    },
-  );
+    final reasons = _reasons(_cause(await running));
+    expect(reasons.map((cause) => (cause as CauseFailure<String>).error), [
+      'second',
+      'first',
+    ]);
+  });
 
   test(
     'independent fibers keep identical defect objects as two events',
     () async {
       final defect = Cause<Never>.defect(Object(), StackTrace.current);
+      final first = _Gate<int, Never>();
+      final second = _Gate<int, Never>();
       final running = runtime.run(
-        Task.all([
-          Task.failCause(defect),
-          Task.failCause(defect),
-        ], concurrency: 2),
+        Task.all([first.task, second.task], concurrency: 2),
       );
+      first.complete(Exit.failure(defect));
+      second.complete(Exit.failure(defect));
       expect(_reasons(_cause(await running)), [same(defect), same(defect)]);
     },
   );
@@ -730,30 +730,26 @@ void main() {
     () async {
       final controller = CancellationController();
       final error = StateError('worker');
+      final cleaning = Completer<void>();
+      final release = Completer<void>();
+      addTearDown(() {
+        if (!release.isCompleted) release.complete();
+      });
       var delivered = false;
-      var prefix = Task.succeed(0);
-      // Reach the executor's cooperative yield between producing the result
-      // and closing the operator's scope. This is a lifecycle boundary test,
-      // not a promise about how many maps fit in one execution turn.
-      for (var i = 0; i < 675; i++) {
-        prefix = prefix.map((value) => value);
-      }
-      final task = prefix
-          .flatMap(
-            (_) => Task.allSettled([
-              Task.sync<int>(() {
-                Timer.run(() => controller.requestCancel(reason: 'owner'));
-                throw error;
-              }),
-            ]),
+      final task = Task.allSettled([Task.sync<int>(() => throw error)])
+          .ensuring(
+            Task.sync(() => cleaning.complete())
+                .flatMap((_) => _future(release.future)),
           )
           .map((_) {
             delivered = true;
           });
 
-      final reasons = _reasons(
-        _cause(await runtime.run(task, signal: controller.signal)),
-      );
+      final running = runtime.run(task, signal: controller.signal);
+      await cleaning.future;
+      controller.requestCancel(reason: 'owner');
+      release.complete();
+      final reasons = _reasons(_cause(await running));
       expect(delivered, isFalse);
       expect(reasons.whereType<CauseCancelled>().map((cause) => cause.reason), [
         'owner',

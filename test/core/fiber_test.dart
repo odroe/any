@@ -973,7 +973,6 @@ void main() {
 
   test('a completed poll suppresses an unhandled failure report', () async {
     final fiber = runtime.start(Task.fail('observed'));
-    await _turn();
     expect(fiber.poll(), isA<OptionSome<Exit<Never, String>>>());
     await _reportsTurn();
 

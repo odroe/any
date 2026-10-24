@@ -3,6 +3,7 @@ import 'dart:async';
 import 'cause.dart';
 import 'exit.dart';
 import 'fiber.dart';
+import 'internal/execution_mode.dart';
 import 'task.dart';
 
 /// A lifetime boundary for resources and child fibers.
@@ -252,11 +253,13 @@ T inScopeFinalizer<T>(Scope scope, T Function() run) => runZoned(
 FutureOr<TaskEvaluation<void, Never>?> addScopeFinalizer(
   Scope scope,
   Task<void, Never> Function(Exit<Object?, Object?> exit) finalizer, {
-  required Future<TaskEvaluation<void, Never>> Function(
+  required FutureOr<TaskEvaluation<void, Never>> Function(
     Task<void, Never> task,
     Scope scope,
+    ExecutionMode closingMode,
   )
   runFinalizer,
+  ExecutionMode? mode,
 }) {
   final entry = _Finalizer(finalizer, runFinalizer);
   final closing = scope._closing;
@@ -264,23 +267,28 @@ FutureOr<TaskEvaluation<void, Never>?> addScopeFinalizer(
     scope._finalizers.add(entry);
     return null;
   }
-  return _runFinalizer(scope, entry, closing.exit);
+  return _runFinalizer(scope, entry, closing.exit, mode ?? ExecutionMode());
 }
 
 // Closes [scope], returning only its cleanup failures, or `null` on success.
 //
 // The first call fixes [exit] and synchronously marks all open descendants as
-// closing. Repeated calls share the same Future and result. Children finish
-// before parent finalizers; sibling scopes and finalizers use reverse
-// registration order. Every finalizer is attempted even after failures.
+// closing. Pending calls share one Future; a completed close returns its result
+// synchronously. Children finish before parent finalizers; sibling scopes and
+// finalizers use reverse registration order. Every finalizer is attempted even
+// after failures.
 //
 // A child already closing independently is awaited, and its cleanup cause is
 // included once. A child that closed before this call has detached and is not
 // included again. The body's [exit] is passed to finalizers but never merged
 // into the cleanup result.
-Future<Cause<Never>?> closeScope(Scope scope, Exit<Object?, Object?> exit) {
+FutureOr<Cause<Never>?> closeScope(
+  Scope scope,
+  Exit<Object?, Object?> exit, {
+  ExecutionMode? mode,
+}) {
   final existing = scope._closing;
-  if (existing != null) return existing.completion.future;
+  if (existing != null) return existing.result;
 
   final owner = Object();
   final claimed = <Scope>[];
@@ -299,45 +307,42 @@ Future<Cause<Never>?> closeScope(Scope scope, Exit<Object?, Object?> exit) {
     claimed.add(current);
     pending.addAll(children.reversed);
   }
-  unawaited(_closeClaimed(claimed, owner));
-  return scope._closing!.completion.future;
+  final closing = _closeClaimed(claimed, owner, mode ?? ExecutionMode());
+  if (closing is Future<void>) unawaited(closing);
+  return scope._closing!.result;
 }
 
-Future<void> _closeClaimed(List<Scope> claimed, Object owner) async {
-  try {
-    // Stop every running member before releasing any resource in this tree.
-    // Fiber roots are separate scopes: each member finishes its own cleanup
-    // before its completion can unblock the owning scope.
-    final stopping = <Future<void>>[];
-    final stops = <Fiber<Object?, Object?>, Future<List<FailureEvent>>>{};
-    for (final scope in claimed) {
-      final reason = _cancellationReason(scope._closing!.exit);
-      final closing = scope._closing!;
-      for (final fiber in {
-        ...closing.fibers,
-        for (final borrow in closing.borrowers)
-          if (!borrow.untilReleased) borrow.fiber,
-      }) {
-        stopping.add(
-          stops.putIfAbsent(fiber, () => stopFiber(fiber, reason: reason)).then(
-            (events) {
-              for (final event in events) {
-                _record(scope, event.cause, owner, source: event.source);
-              }
-            },
-          ),
-        );
-      }
-      for (final borrow in closing.borrowers) {
-        if (!borrow.untilReleased) continue;
-        // A dynamic borrower may own this scope's ancestor. Waiting for its
-        // final exit would also wait for the close currently running here.
-        borrow.fiber.requestCancel(reason: reason);
-        stopping.add(borrow.released);
+FutureOr<void> _closeClaimed(
+  List<Scope> claimed,
+  Object owner,
+  ExecutionMode mode,
+) {
+  final pending = <Scope>[claimed.first];
+
+  void recordEvents(Scope scope, Iterable<FailureEvent> events) {
+    for (final event in events) {
+      _record(scope, event.cause, owner, source: event.source);
+    }
+  }
+
+  void recordChild(Scope scope, _Closing child) {
+    for (final event in child.events) {
+      _record(scope, event.cause, owner, source: event.source);
+    }
+  }
+
+  void fail(Object error, StackTrace stackTrace) {
+    // Callback failures are contained below. An internal invariant failure
+    // must still settle the close Futures rather than leave callers suspended.
+    for (final scope in claimed.reversed) {
+      if (!scope._closing!.completion.isCompleted) {
+        _record(scope, Cause.defect(error, stackTrace), owner);
+        _finish(scope);
       }
     }
-    if (stopping.isNotEmpty) await Future.wait(stopping);
-    final pending = <Scope>[claimed.first];
+  }
+
+  FutureOr<void> drain() {
     while (pending.isNotEmpty) {
       final scope = pending.last;
       final closing = scope._closing!;
@@ -350,35 +355,73 @@ Future<void> _closeClaimed(List<Scope> claimed, Object owner) async {
         if (identical(childClosing.owner, owner)) {
           pending.add(child);
         } else {
-          final cause = await childClosing.completion.future;
-          if (cause != null) {
-            for (final event in childClosing.events) {
-              _record(scope, event.cause, owner, source: event.source);
-            }
+          if (!childClosing.completion.isCompleted) {
+            return childClosing.completion.future.then((_) {
+              recordChild(scope, childClosing);
+              return drain();
+            });
           }
+          recordChild(scope, childClosing);
         }
         continue;
       }
       while (scope._finalizers.isNotEmpty) {
-        final result = await _runFinalizer(
+        final result = _runFinalizer(
           scope,
           scope._finalizers.removeLast(),
           closing.exit,
+          mode,
         );
+        if (result is Future<TaskEvaluation<void, Never>>) {
+          return result.then((completed) {
+            _recordEvaluation(scope, completed, owner);
+            return drain();
+          });
+        }
         _recordEvaluation(scope, result, owner);
       }
       _finish(scope);
       pending.removeLast();
     }
-  } catch (error, stackTrace) {
-    // Callback failures are contained below. An internal invariant failure
-    // must still settle the close Futures rather than leave callers suspended.
-    for (final scope in claimed.reversed) {
-      if (!scope._closing!.completion.isCompleted) {
-        _record(scope, Cause.defect(error, stackTrace), owner);
-        _finish(scope);
+  }
+
+  try {
+    // Stop all members before releasing resources. A completed member or
+    // released borrow does not introduce an asynchronous boundary.
+    final stopping = <Future<void>>[];
+    final stops = <Fiber<Object?, Object?>, FutureOr<List<FailureEvent>>>{};
+    for (final scope in claimed) {
+      final reason = _cancellationReason(scope._closing!.exit);
+      final closing = scope._closing!;
+      for (final fiber in {
+        ...closing.fibers,
+        for (final borrow in closing.borrowers)
+          if (!borrow.untilReleased) borrow.fiber,
+      }) {
+        final result = stops.putIfAbsent(
+          fiber,
+          () => stopFiber(fiber, reason: reason),
+        );
+        if (result is Future<List<FailureEvent>>) {
+          stopping.add(result.then((events) => recordEvents(scope, events)));
+        } else {
+          recordEvents(scope, result);
+        }
+      }
+      for (final borrow in closing.borrowers) {
+        if (!borrow.untilReleased) continue;
+        // Dynamic borrows end before the fiber closes its own scope, which may
+        // contain this scope. Waiting for the whole fiber would create a cycle.
+        borrow.fiber.requestCancel(reason: reason);
+        if (!borrow.isReleased) stopping.add(borrow.released);
       }
     }
+    final result = stopping.isEmpty
+        ? drain()
+        : Future.wait(stopping).then((_) => drain());
+    if (result is Future<void>) return result.catchError(fail);
+  } catch (error, stackTrace) {
+    fail(error, stackTrace);
   }
 }
 
@@ -395,15 +438,21 @@ Object? _cancellationReason(Exit<Object?, Object?> exit) {
   return null;
 }
 
-Future<TaskEvaluation<void, Never>> _runFinalizer(
+FutureOr<TaskEvaluation<void, Never>> _runFinalizer(
   Scope scope,
   _Finalizer finalizer,
   Exit<Object?, Object?> exit,
-) async {
+  ExecutionMode mode,
+) {
+  TaskEvaluation<void, Never> failure(Object error, StackTrace stackTrace) =>
+      TaskEvaluation.fresh(Exit.failure(Cause.defect(error, stackTrace)));
   try {
-    return await finalizer.run(finalizer.create(exit), scope);
+    final result = finalizer.run(finalizer.create(exit), scope, mode);
+    return result is Future<TaskEvaluation<void, Never>>
+        ? result.catchError(failure)
+        : result;
   } catch (error, stackTrace) {
-    return TaskEvaluation.fresh(Exit.failure(Cause.defect(error, stackTrace)));
+    return failure(error, stackTrace);
   }
 }
 
@@ -457,6 +506,7 @@ void _finish(Scope scope) {
   closing.borrowers.clear();
   scope._parent?._children.remove(scope);
   scope._parent = null;
+  closing.cause = cause;
   closing.completion.complete(cause);
 }
 
@@ -486,6 +536,9 @@ final class _Closing {
   final List<Fiber<Object?, Object?>> fibers;
   final List<_Borrow> borrowers;
   final completion = Completer<Cause<Never>?>();
+  Cause<Never>? cause;
+  FutureOr<Cause<Never>?> get result =>
+      completion.isCompleted ? cause : completion.future;
   final events = <_CleanupEvent>[];
   final sources = <Object>{};
 }
@@ -500,6 +553,10 @@ final class _Finalizer {
   _Finalizer(this.create, this.run);
 
   final Task<void, Never> Function(Exit<Object?, Object?>) create;
-  final Future<TaskEvaluation<void, Never>> Function(Task<void, Never>, Scope)
+  final FutureOr<TaskEvaluation<void, Never>> Function(
+    Task<void, Never>,
+    Scope,
+    ExecutionMode,
+  )
   run;
 }

@@ -57,7 +57,8 @@ export 'src/core/request_resolver.dart'
     show RequestResolver, RequestResolverOperations;
 export 'src/core/result.dart'
     show Result, ResultSuccess, ResultFailure, ResultOperations;
-export 'src/core/runtime.dart' show Runtime, RuntimeClosed, TaskException;
+export 'src/core/runtime.dart'
+    show Runtime, RuntimeClosed, AsyncTaskException, TaskException;
 export 'src/core/schedule.dart' show Schedule;
 export 'src/core/scope.dart' show Scope;
 export 'src/core/semaphore.dart' show Semaphore, SemaphoreOperations;
