@@ -139,6 +139,7 @@ Fiber<T, E> startFiber<T, E>(
   required void Function(Cause<Object?> cause) report,
   bool inheritHost = true,
   bool deferStart = false,
+  bool interruptible = true,
   CancellationSignal? signal,
   Scope? runScope,
 }) {
@@ -162,6 +163,7 @@ Fiber<T, E> startFiber<T, E>(
             try {
               result = await evaluateTask(
                 task,
+                interruptible: interruptible,
                 signal: fiber._controller.signal,
                 scope: fiber._scope,
                 runScope: runScope,

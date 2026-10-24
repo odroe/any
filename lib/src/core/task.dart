@@ -84,6 +84,10 @@ final class Task<T, E> {
   /// Observed failures are combined in completion order. Cancellation used to stop
   /// siblings adds no separate cause. Owner cancellation also waits for cleanup
   /// and retains defects from interrupted work.
+  ///
+  /// Inputs inherit the caller's cancellation state. An enclosing
+  /// [uninterruptibleMask] protects them until cancellation is restored. Stopping
+  /// a masked sibling waits for its protected work to finish.
   static Task<List<T>, E> all<T, E>(
     Iterable<Task<T, E>> tasks, {
     int concurrency = 1,
@@ -106,9 +110,9 @@ final class Task<T, E> {
   /// and explicit cancellation are represented as exits and do not stop other
   /// inputs. Iteration errors still fail the operation.
   ///
-  /// Concurrency and input requirements follow [all]. Owner cancellation stops
-  /// remaining work and waits for cleanup; defects that have not been delivered
-  /// in the result remain in the cancellation cause.
+  /// Concurrency, cancellation masking, and input requirements follow [all].
+  /// Unmasked owner cancellation stops remaining work and waits for cleanup;
+  /// defects not delivered in the result remain in the cancellation cause.
   static Task<List<Exit<T, E>>, Never> allSettled<T, E>(
     Iterable<Task<T, E>> tasks, {
     int concurrency = 1,
@@ -473,19 +477,7 @@ extension TaskOperations<T, E> on Task<T, E> {
   /// Use [Fiber.join] to propagate the child's value or business failure. An
   /// unobserved failure is reported by the runtime; starting a child does not by
   /// itself make its business failure the parent's result.
-  Task<Fiber<T, E>, Never> fork() => Task._(
-    _Fork(
-      (scope, parent, context, locals, signal, runScope) => startFiber(
-        this,
-        owner: scope,
-        signal: signal,
-        runScope: scopeOwnsScope(runScope, scope) ? runScope : null,
-        context: context,
-        locals: locals,
-        report: fiberReport(parent),
-      ),
-    ),
-  );
+  Task<Fiber<T, E>, Never> fork() => forkTask(this);
 
   /// Starts a fiber whose lifetime belongs to an explicit [scope].
   ///
@@ -494,7 +486,7 @@ extension TaskOperations<T, E> on Task<T, E> {
   /// Cancellation of the creating task does not cancel the fiber.
   Task<Fiber<T, E>, Never> forkIn(Scope scope) => Task._(
     _Fork(
-      (_, parent, context, locals, _, runScope) => startFiber(
+      (_, parent, context, locals, _, runScope, _) => startFiber(
         this,
         owner: scope,
         inheritHost: false,
@@ -679,6 +671,7 @@ final class TaskEvaluation<T, E> {
 // Runtime's execution boundary. This declaration is not exported by any.dart.
 Future<TaskEvaluation<T, E>> evaluateTask<T, E>(
   Task<T, E> task, {
+  bool interruptible = true,
   CancellationSignal? signal,
   Scope? scope,
   Scope? runScope,
@@ -690,6 +683,7 @@ Future<TaskEvaluation<T, E>> evaluateTask<T, E>(
   final ownedScope = scope ?? createScope();
   final (evaluated, cancelled, observed) = await _evaluate(
     task,
+    interruptible: interruptible,
     signal: signal,
     scope: ownedScope,
     runScope: runScope ?? ownedScope,
@@ -700,7 +694,9 @@ Future<TaskEvaluation<T, E>> evaluateTask<T, E>(
   );
   var result = evaluated;
   var cancellationObserved = cancelled;
-  if (!cancellationObserved && (signal?.isCancelled ?? false)) {
+  if (interruptible &&
+      !cancellationObserved &&
+      (signal?.isCancelled ?? false)) {
     result = TaskEvaluation(
       _appendCleanup(result.exit, Cause.cancelled(signal!.reason)),
       result.events,
@@ -715,7 +711,9 @@ Future<TaskEvaluation<T, E>> evaluateTask<T, E>(
       for (final event in result.events) event.source,
     }),
   );
-  if (!cancellationObserved && (signal?.isCancelled ?? false)) {
+  if (interruptible &&
+      !cancellationObserved &&
+      (signal?.isCancelled ?? false)) {
     result = TaskEvaluation(
       _appendCleanup(result.exit, Cause.cancelled(signal!.reason)),
       result.events,
@@ -756,13 +754,34 @@ Task<R, E> provideTaskLocal<T, R, E>(
 Task<T, E> inTaskScope<T, E>(Task<T, E> task, Scope scope) =>
     Task._(_InScope(task._node, scope));
 
+// Structured combinators borrow their caller's cancellation region. A pending
+// request remains on the child signal so an explicit restore can still see it.
+Task<Fiber<T, E>, Never> forkTask<T, E>(
+  Task<T, E> task, {
+  bool inheritCancellation = false,
+}) => Task._(
+  _Fork(
+    (scope, parent, context, locals, signal, runScope, interruptible) =>
+        startFiber(
+          task,
+          owner: scope,
+          signal: signal,
+          interruptible: !inheritCancellation || interruptible,
+          runScope: scopeOwnsScope(runScope, scope) ? runScope : null,
+          context: context,
+          locals: locals,
+          report: fiberReport(parent),
+        ),
+  ),
+);
+
 Task<Fiber<T, E>, Never> forkTaskIn<T, E>(
   Task<T, E> task,
   Scope scope, {
   bool inheritHost = false,
 }) => Task._(
   _Fork(
-    (_, parent, context, locals, _, runScope) => startFiber(
+    (_, parent, context, locals, _, runScope, _) => startFiber(
       task,
       owner: scope,
       inheritHost: inheritHost,
@@ -815,6 +834,7 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
   required Scope scope,
   required Scope runScope,
   required List<Scope> closingScopes,
+  bool interruptible = true,
   CancellationSignal? signal,
   Fiber<Object?, Object?>? fiber,
   required Context context,
@@ -826,7 +846,6 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
   // Finalizers have independent executions, even when they belong to this fiber.
   final observed = <Object>{};
   var evaluating = true;
-  var interruptible = true;
   var currentScope = scope;
   var currentContext = context;
   var currentLocals = locals;
@@ -903,6 +922,7 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>)> _evaluate<T, E>(
               currentLocals,
               signal,
               runScope,
+              interruptible,
             );
             failure = null;
             events = const [];
@@ -1376,6 +1396,7 @@ final class _Fork extends _Node {
     Map<TaskLocal<Object?>, Object?>,
     CancellationSignal?,
     Scope,
+    bool,
   )
   start;
 }
