@@ -295,7 +295,7 @@ final class Pool<T, E> {
           ),
         ),
         concurrency: count,
-      ).map((_) {});
+      ).map((_) {}).scoped();
     });
   }
 }

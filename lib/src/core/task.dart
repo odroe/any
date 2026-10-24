@@ -88,6 +88,10 @@ final class Task<T, E> {
   /// Inputs inherit the caller's cancellation state. An enclosing
   /// [uninterruptibleMask] protects them until cancellation is restored. Stopping
   /// a masked sibling waits for its protected work to finish.
+  ///
+  /// Inputs share the caller's resource scope. Completing a worker leaves its
+  /// resources available to later tasks; use [TaskOperations.scoped] on an input
+  /// when its resources should be released before collecting its result.
   static Task<List<T>, E> all<T, E>(
     Iterable<Task<T, E>> tasks, {
     int concurrency = 1,
@@ -127,6 +131,8 @@ final class Task<T, E> {
   /// Loser business failures do not change the winner. Loser defects, including
   /// cleanup defects, are retained and can turn a winning success into failure.
   /// Cancellation used to stop losers adds no separate cause.
+  /// Resources acquired by participants remain in the caller's scope; apply
+  /// [TaskOperations.scoped] to a participant for a separate resource lifetime.
   static Task<T, E> race<T, E>(Iterable<Task<T, E>> tasks) =>
       computeRace(tasks);
 
@@ -139,6 +145,7 @@ final class Task<T, E> {
   /// A winner recovers other participants' business failures. Defects are always
   /// retained, including loser cleanup failures, and can prevent success. If all
   /// participants fail, their causes are combined in completion order.
+  /// Participants use the caller's resource scope, as in [race].
   static Task<T, E> firstSuccess<T, E>(Iterable<Task<T, E>> tasks) =>
       computeFirstSuccess(tasks);
 
@@ -360,16 +367,24 @@ final class Task<T, E> {
   /// cannot leave a successfully acquired resource without cleanup. A failed
   /// acquisition does not call [release]. An acquisition that never finishes can
   /// therefore delay cancellation indefinitely.
+  ///
+  /// A closing scope rejects new acquisition with a [StateError] defect. An
+  /// acquisition already in progress still registers cleanup before stopping.
   static Task<T, E> acquireRelease<T, E>(
     Task<T, E> acquire, {
     required Task<void, Never> Function(T resource, Exit<Object?, Object?> exit)
     release,
-  }) => uninterruptibleMask(
-    (_) => acquire.flatMap(
-      (resource) =>
-          addFinalizer((exit) => release(resource, exit))
-              .withError<E>()
-              .map((_) => resource),
+  }) => Task._(
+    _Mask(
+      (_) => acquire
+          .flatMap(
+            (resource) =>
+                addFinalizer((exit) => release(resource, exit))
+                    .withError<E>()
+                    .map((_) => resource),
+          )
+          ._node,
+      acquisition: true,
     ),
   );
 
@@ -402,10 +417,11 @@ typedef RestoreCancellation = Task<T, E> Function<T, E>(Task<T, E> task);
 extension TaskOperations<T, E> on Task<T, E> {
   /// Fails with a business error if this computation exceeds [duration].
   ///
-  /// The deadline uses the current context's clock and includes resource cleanup.
-  /// On expiration, the computation is cancelled and fully cleaned up before
-  /// [onTimeout] supplies the error. Cleanup defects remain alongside that error,
-  /// or alongside a defect if [onTimeout] throws.
+  /// The deadline uses the current context's clock and includes completion
+  /// callbacks. On expiration, the computation is stopped before [onTimeout]
+  /// supplies the error. Completion cleanup defects remain alongside that error,
+  /// or alongside a defect if [onTimeout] throws. Acquired resources remain in the
+  /// caller's scope; use `task.scoped().timeout(...)` to include their release.
   ///
   /// This is a cooperative deadline: a non-cancellable [Future] can delay the
   /// result past the deadline. Nonpositive durations use a zero-delay timer, so
@@ -438,10 +454,10 @@ extension TaskOperations<T, E> on Task<T, E> {
   /// failures propagate without retry. [when], if supplied, must also return true;
   /// an exception from it becomes a defect. Exhaustion returns the last failure.
   ///
-  /// Each attempt has its own resource scope and finishes cleanup before the next
-  /// attempt or delay. Cleanup failures prevent retry. Schedule state is fresh per
-  /// execution, and elapsed time includes attempts, cleanup, and waits. Delays use
-  /// the current clock and are cancellable.
+  /// Attempts use the caller's resource scope. Apply [scoped] before [retry] to
+  /// release each attempt's resources before retrying. Completion cleanup is
+  /// awaited and its defects prevent retry. Schedule state is fresh per execution;
+  /// elapsed time includes attempts and waits. Delays use the current clock.
   Task<T, E> retry(Schedule schedule, {bool Function(E error)? when}) =>
       retryTask(this, schedule, when: when);
 
@@ -451,10 +467,10 @@ extension TaskOperations<T, E> on Task<T, E> {
   /// by returning true; otherwise [schedule] decides whether and when to repeat.
   /// A failed attempt stops repetition. An exception from [until] becomes a defect.
   ///
-  /// Each attempt finishes its own resource scope before another begins, including
-  /// cleanup of the last attempt before returning. Schedule state is fresh per
-  /// execution, elapsed time includes attempts and cleanup, and delays use the
-  /// current clock. Cancellation stops further attempts and awaits current cleanup.
+  /// Attempts use the caller's resource scope. Apply [scoped] before [repeat] for
+  /// a separate resource lifetime per attempt. Schedule state is fresh per
+  /// execution, and delays use the current clock. Cancellation stops further
+  /// attempts and awaits completion cleanup.
   Task<T, E> repeat(Schedule schedule, {bool Function(T value)? until}) =>
       repeatTask(this, schedule, until: until);
 
@@ -469,10 +485,11 @@ extension TaskOperations<T, E> on Task<T, E> {
   Task<T, E> provideContext(Context context) =>
       Task._(_ProvideContext(_node, context));
 
-  /// Starts a child fiber owned by the current [Scope].
+  /// Starts a child fiber owned by the current execution.
   ///
-  /// Each execution starts a new fiber. Parent cancellation reaches the child, and
-  /// the scope stops and waits for unfinished children before releasing resources.
+  /// The child borrows the current resource [Scope]. Its completion leaves those
+  /// resources available to the parent. Parent completion cancels and waits for
+  /// unfinished children; closing the borrowed scope also stops them first.
   ///
   /// Use [Fiber.join] to propagate the child's value or business failure. An
   /// unobserved failure is reported by the runtime; starting a child does not by
@@ -482,20 +499,29 @@ extension TaskOperations<T, E> on Task<T, E> {
   /// Starts a fiber whose lifetime belongs to an explicit [scope].
   ///
   /// Use this when the owner should outlive the task that starts the fiber. The
-  /// scope must be open; closing it cancels the fiber and waits for cleanup.
+  /// scope must be open and belong to the same runtime. New resources belong to
+  /// that scope; closing it cancels the fiber before releasing them.
   /// Cancellation of the creating task does not cancel the fiber.
+  /// Captured objects and service bindings retain their original lifetimes.
   Task<Fiber<T, E>, Never> forkIn(Scope scope) => Task._(
-    _Fork(
-      (_, parent, context, locals, _, runScope, _) => startFiber(
+    _Fork((_, _, parent, context, locals, _, runScope, _) {
+      if (!identical(
+        scopeRuntimeId(scope),
+        scopeRuntimeId(fiberScope(parent)),
+      )) {
+        throw StateError('Cannot fork into a scope owned by another runtime.');
+      }
+      return startFiber(
         this,
         owner: scope,
+        resourceScope: scope,
         inheritHost: false,
         runScope: scopeOwnsScope(runScope, scope) ? runScope : null,
         context: context,
         locals: locals,
         report: fiberReport(parent),
-      ),
-    ),
+      );
+    }),
   );
 
   /// Gives this task a local resource lifetime.
@@ -514,14 +540,14 @@ extension TaskOperations<T, E> on Task<T, E> {
 
   /// Runs [cleanup] with this task's outcome before returning its result.
   ///
-  /// Cleanup is registered before the task starts. The callback and its returned
-  /// task run with cancellation masked in the registration [Zone]. Their exceptions
-  /// become cleanup defects, retained alongside any body failure.
+  /// The callback and its task run with cancellation masked in the registration
+  /// environment. Cleanup failures follow the body's failure. Resources acquired
+  /// by cleanup have a temporary scope; body resources keep their original owner.
+  ///
+  /// This observes the wrapped expression, without waiting for children it forked.
+  /// Use `task.scoped().onExit(cleanup)` to observe a local scope's release too.
   Task<T, E> onExit(Task<void, Never> Function(Exit<T, E> exit) cleanup) =>
-      Task.addFinalizer((exit) => cleanup(_typedExit<T, E>(exit)))
-          .withError<E>()
-          .flatMap((_) => this)
-          .scoped();
+      Task._(_OnExit(_node, (exit) => cleanup(_typedExit<T, E>(exit))));
 
   /// Transforms this task's successful value.
   ///
@@ -673,6 +699,7 @@ final class TaskEvaluation<T, E> {
     this.exit,
     this.events, {
     this.cleanupCancellations = const [],
+    this.pendingFailures = const [],
   });
 
   factory TaskEvaluation.fresh(Exit<T, E> exit) =>
@@ -686,6 +713,9 @@ final class TaskEvaluation<T, E> {
   // Only occurrences still present on this failure path, not earlier cleanup
   // failures that have already been captured or recovered.
   final List<CauseCancelled> cleanupCancellations;
+  // Captured failures awaiting delivery as a successful value, such as settled
+  // results. Cancellation before consumption must retain their defects.
+  final List<FailureEvent> pendingFailures;
 }
 
 // Runtime's execution boundary. This declaration is not exported by any.dart.
@@ -694,18 +724,24 @@ Future<TaskEvaluation<T, E>> evaluateTask<T, E>(
   bool interruptible = true,
   CancellationSignal? signal,
   Scope? scope,
+  Scope? resourceScope,
   Scope? runScope,
   Fiber<Object?, Object?>? fiber,
   Context? context,
   Map<TaskLocal<Object?>, Object?> locals = const {},
   List<Scope> closingScopes = const [],
 }) async {
-  final ownedScope = scope ?? createScope();
+  final ownedScope =
+      scope ??
+      createScope(
+        runtimeId: fiber == null ? null : scopeRuntimeId(fiberScope(fiber)),
+      );
   final (evaluated, cancelled, observed, observation) = await _evaluate(
     task,
     interruptible: interruptible,
     signal: signal,
     scope: ownedScope,
+    resourceScope: resourceScope ?? ownedScope,
     runScope: runScope ?? ownedScope,
     closingScopes: closingScopes,
     fiber: fiber,
@@ -758,6 +794,32 @@ Future<TaskEvaluation<T, E>> evaluateTask<T, E>(
   return result;
 }
 
+Future<TaskEvaluation<void, Never>> _evaluateCleanup(
+  Task<void, Never> task, {
+  required List<Scope> closingScopes,
+  required Fiber<Object?, Object?>? fiber,
+  required Context context,
+  required Map<TaskLocal<Object?>, Object?> locals,
+}) {
+  final scope = createScope(
+    runtimeId: fiber == null ? null : scopeRuntimeId(fiberScope(fiber)),
+  );
+  // Cleanup can borrow resources owned elsewhere. Its temporary scope must
+  // participate in self-wait checks just like the main fiber's owned scope.
+  return inScopeFinalizer(
+    scope,
+    () => evaluateTask(
+      task,
+      interruptible: false,
+      scope: scope,
+      closingScopes: [...closingScopes, scope],
+      fiber: fiber,
+      context: context,
+      locals: locals,
+    ),
+  );
+}
+
 // Scope's public operations create instructions without exposing runtime state.
 Task<Scope, Never> openScopeTask() => const Task._(_OpenScope());
 
@@ -797,13 +859,14 @@ Task<Fiber<T, E>, Never> forkTask<T, E>(
   bool inheritCancellation = false,
 }) => Task._(
   _Fork(
-    (scope, parent, context, locals, signal, runScope, interruptible) =>
+    (scope, owner, parent, context, locals, signal, runScope, interruptible) =>
         startFiber(
           task,
-          owner: scope,
+          owner: owner,
+          resourceScope: scope,
           signal: signal,
           interruptible: !inheritCancellation || interruptible,
-          runScope: scopeOwnsScope(runScope, scope) ? runScope : null,
+          runScope: runScope,
           context: context,
           locals: locals,
           report: fiberReport(parent),
@@ -815,13 +878,16 @@ Task<Fiber<T, E>, Never> forkTaskIn<T, E>(
   Task<T, E> task,
   Scope scope, {
   bool inheritHost = false,
+  Scope? resourceScope,
+  bool deferStart = true,
 }) => Task._(
   _Fork(
-    (_, parent, context, locals, _, runScope, _) => startFiber(
+    (_, _, parent, context, locals, _, runScope, _) => startFiber(
       task,
       owner: scope,
+      resourceScope: resourceScope ?? scope,
       inheritHost: inheritHost,
-      deferStart: true,
+      deferStart: deferStart,
       runScope: scopeOwnsScope(runScope, scope) ? runScope : null,
       context: context,
       locals: locals,
@@ -861,7 +927,7 @@ Task<TaskEnvironment, Never> captureTaskEnvironment() => Task._(
 
 Task<T, E> taskFromEvaluation<T, E>(TaskEvaluation<T, E> result) =>
     Task._(switch (result.exit) {
-      ExitSuccess(:final value) => _Success(value),
+      ExitSuccess(:final value) => _Success(value, result.pendingFailures),
       ExitFailure(:final cause) => _Failure(
         cause,
         result.events,
@@ -879,6 +945,7 @@ Future<(TaskEvaluation<T, E>, bool, Set<Object>, _FiberObservation?)>
 _evaluate<T, E>(
   Task<T, E> task, {
   required Scope scope,
+  required Scope resourceScope,
   required Scope runScope,
   required List<Scope> closingScopes,
   bool interruptible = true,
@@ -896,7 +963,8 @@ _evaluate<T, E>(
   // consumes it, or the execution returns it after cleanup.
   _FiberObservation? observation;
   var evaluating = true;
-  var currentScope = scope;
+  var currentScope = resourceScope;
+  var currentOwnedScope = scope;
   var currentContext = context;
   var currentLocals = locals;
   Object? value;
@@ -904,6 +972,7 @@ _evaluate<T, E>(
   var events = const <FailureEvent>[];
   var cleanupCancellations = const <CauseCancelled>[];
   var remaining = 2048;
+  var cancellationObserved = false;
 
   void finishObservation(bool consumed) {
     final pending = observation;
@@ -932,18 +1001,29 @@ _evaluate<T, E>(
 
   while (true) {
     final effectiveSignal = interruptible ? signal : null;
-    if (effectiveSignal?.isCancelled ?? false) {
+    if (!cancellationObserved && (effectiveSignal?.isCancelled ?? false)) {
       finishObservation(false);
-      return (
-        TaskEvaluation(
-          Exit<T, E>.failure(_cancelled(failure, effectiveSignal!.reason)),
+      failure = _cancelled(failure, effectiveSignal!.reason);
+      cancellationObserved = true;
+      // Completion frames already removed from the stack still have to run.
+      current = switch (current) {
+        _FinishScope(:final scope) when evaluating => _FinishScope(
+          scope,
+          Exit.failure(failure!),
           events,
-          cleanupCancellations: cleanupCancellations,
+          cleanupCancellations,
         ),
-        true,
-        observed,
-        null,
-      );
+        _FinishCleanup(:final run) when evaluating => _FinishCleanup(
+          run,
+          Exit.failure(failure!),
+          events,
+          cleanupCancellations,
+        ),
+        _ => current,
+      };
+      if (current is! _FinishScope && current is! _FinishCleanup) {
+        evaluating = false;
+      }
     }
     if (--remaining == 0) {
       remaining = 2048;
@@ -963,7 +1043,10 @@ _evaluate<T, E>(
           case _Environment(:final use):
             current = use(currentScope, currentContext, currentLocals, fiber);
           case _InScope(:final source, scope: final borrowed):
-            frames.add(_Frame(scope: currentScope));
+            final release = fiber == null || identical(scope, borrowed)
+                ? null
+                : borrowScopeFiber(borrowed, fiber, untilReleased: true);
+            frames.add(_Frame(scope: currentScope, releaseBorrow: release));
             currentScope = borrowed;
             current = source;
           case _ReadLocal(:final read):
@@ -999,6 +1082,7 @@ _evaluate<T, E>(
             }
             value = start(
               currentScope,
+              currentOwnedScope,
               fiber,
               currentContext,
               currentLocals,
@@ -1064,7 +1148,14 @@ _evaluate<T, E>(
                 cleanupCancellations = join ? deliveredCleanups : const [];
             }
             evaluating = false;
-          case _Success(value: final result):
+          case _Success(value: final result, :final pendingFailures):
+            if (pendingFailures.isNotEmpty) {
+              observation = (
+                sources: {for (final event in pendingFailures) event.source},
+                cleanup: [...pendingFailures],
+                complete: (_) {},
+              );
+            }
             value = result;
             failure = null;
             events = const [];
@@ -1093,7 +1184,12 @@ _evaluate<T, E>(
             }
           case _Suspend(:final create):
             current = create();
-          case _Mask(:final create):
+          case _Mask(:final create, :final acquisition):
+            if (acquisition && scopeIsClosing(currentScope)) {
+              throw StateError(
+                'Cannot acquire resources in a closing or closed scope.',
+              );
+            }
             final previous = interruptible;
             frames.add(_Frame(interruptible: previous));
             interruptible = false;
@@ -1163,7 +1259,7 @@ _evaluate<T, E>(
               runFinalizer: (task, scope) => zone.run(
                 () => inScopeFinalizer(
                   scope,
-                  () => evaluateTask(
+                  () => _evaluateCleanup(
                     task,
                     closingScopes: [...closingScopes, scope],
                     fiber: fiber,
@@ -1187,23 +1283,76 @@ _evaluate<T, E>(
             };
             value = null;
             evaluating = false;
-          case _Scoped(:final source):
-            final parent = currentScope;
-            // Borrowed application scopes can outlive this execution. A local
-            // scope still belongs to the execution, so its owner cannot claim
-            // its cleanup tree and then wait for this same fiber to close it.
-            final child = createScope(
-              parent: scopeContains(scope, parent) ? parent : scope,
+          case _OnExit(:final source, :final cleanup):
+            final zone = Zone.current;
+            final services = currentContext;
+            final localValues = currentLocals;
+            Future<TaskEvaluation<void, Never>> run(
+              Exit<Object?, Object?> exit,
+            ) => zone.run(
+              () => _evaluateCleanup(
+                Task.defer(() => cleanup(exit)),
+                fiber: fiber,
+                context: services,
+                locals: localValues,
+                closingScopes: closingScopes,
+              ),
             );
-            currentScope = child;
             frames.add(
               _Frame(
+                cleanup: true,
+                success: (value) =>
+                    _FinishCleanup(run, Exit.success(value), const []),
+                failure: (cause, events, cleanups, _) =>
+                    _FinishCleanup(run, Exit.failure(cause), events, cleanups),
+              ),
+            );
+            current = source;
+          case _FinishCleanup(
+            :final run,
+            :final exit,
+            events: final bodyEvents,
+            cleanupCancellations: final bodyCleanups,
+          ):
+            final cleanup = await run(exit);
+            final completed = _appendEvaluation(
+              TaskEvaluation(
+                exit,
+                bodyEvents,
+                cleanupCancellations: bodyCleanups,
+              ),
+              cleanup,
+            );
+            switch (completed.exit) {
+              case ExitSuccess(value: final result):
+                value = result;
+                failure = null;
+              case ExitFailure(:final cause):
+                failure = cause;
+            }
+            events = completed.events;
+            cleanupCancellations = completed.cleanupCancellations;
+            if (failure != null) finishObservation(false);
+            evaluating = false;
+          case _Scoped(:final source):
+            final parent = currentScope;
+            final parentOwned = currentOwnedScope;
+            // Local boundaries belong to this execution's lexical cleanup tree.
+            // A borrowed resource scope may close while this body unwinds.
+            final child = createScope(parent: parentOwned);
+            currentScope = child;
+            currentOwnedScope = child;
+            frames.add(
+              _Frame(
+                cleanup: true,
                 success: (value) {
                   currentScope = parent;
+                  currentOwnedScope = parentOwned;
                   return _FinishScope(child, Exit.success(value), const []);
                 },
                 failure: (cause, events, cleanups, _) {
                   currentScope = parent;
+                  currentOwnedScope = parentOwned;
                   return _FinishScope(
                     child,
                     Exit.failure(cause),
@@ -1300,7 +1449,7 @@ _evaluate<T, E>(
             events,
             cleanupCancellations: cleanupCancellations,
           ),
-          false,
+          cancellationObserved,
           observed,
           observation,
         );
@@ -1308,6 +1457,7 @@ _evaluate<T, E>(
 
       final frame = frames.removeLast();
       if (frame.scope case final restored?) {
+        frame.releaseBorrow?.call();
         currentScope = restored;
         continue;
       }
@@ -1323,6 +1473,7 @@ _evaluate<T, E>(
         interruptible = restored;
         continue;
       }
+      if (cancellationObserved && !frame.cleanup) continue;
       if (failure case final cause?) {
         final resume = frame.failure;
         if (resume == null) continue;
@@ -1357,6 +1508,15 @@ _evaluate<T, E>(
       )) {
         // Closing still has to execute, but cancellation before it starts must
         // retain the body failure that is already being handed to the scope.
+        failure = cause;
+        events = sources;
+        cleanupCancellations = cleanups;
+        evaluating = true;
+      } else if (current case _FinishCleanup(
+        exit: ExitFailure(:final cause),
+        events: final sources,
+        cleanupCancellations: final cleanups,
+      )) {
         failure = cause;
         events = sources;
         cleanupCancellations = cleanups;
@@ -1448,14 +1608,32 @@ TaskEvaluation<T, E> _appendEvaluation<T, E>(
   TaskEvaluation<T, E> result,
   TaskEvaluation<void, Never> cleanup,
 ) {
-  final cause = switch (cleanup.exit) {
+  final cleanupCause = switch (cleanup.exit) {
     ExitFailure(:final cause) => cause,
     _ => null,
   };
-  if (cause == null) return result;
+  if (cleanupCause == null) return result;
+  final sources = {for (final event in result.events) event.source};
+  final pending = cleanup.events.iterator;
+  final causes = <Cause<Never>>[];
+  final events = <FailureEvent>[];
+  for (final cause in switch (cleanupCause) {
+    CauseGroup(:final causes) => causes,
+    _ => [cleanupCause],
+  }) {
+    if (cause is CauseDefect) {
+      pending.moveNext();
+      final event = pending.current;
+      if (!sources.add(event.source)) continue;
+      events.add(event);
+    }
+    causes.add(cause);
+  }
+  if (causes.isEmpty) return result;
+  final cause = Cause<Never>.combine(causes);
   return TaskEvaluation(
     _appendCleanup(result.exit, cause),
-    [...result.events, ...cleanup.events],
+    [...result.events, ...events],
     cleanupCancellations: [
       ...result.cleanupCancellations,
       ..._cancellations(cause),
@@ -1609,6 +1787,7 @@ final class _Fork extends _Node {
   const _Fork(this.start);
   final Object Function(
     Scope,
+    Scope,
     Fiber<Object?, Object?>,
     Context,
     Map<TaskLocal<Object?>, Object?>,
@@ -1677,8 +1856,9 @@ final class _AwaitFiber extends _Node {
 }
 
 final class _Success extends _Node {
-  const _Success(this.value);
+  const _Success(this.value, [this.pendingFailures = const []]);
   final Object? value;
+  final List<FailureEvent> pendingFailures;
 }
 
 final class _Failure extends _Node {
@@ -1704,8 +1884,29 @@ final class _Suspend extends _Node {
 }
 
 final class _Mask extends _Node {
-  const _Mask(this.create);
+  const _Mask(this.create, {this.acquisition = false});
   final _Node Function(bool interruptible) create;
+  final bool acquisition;
+}
+
+final class _OnExit extends _Node {
+  const _OnExit(this.source, this.cleanup);
+  final _Node source;
+  final Task<void, Never> Function(Exit<Object?, Object?>) cleanup;
+}
+
+final class _FinishCleanup extends _Node {
+  const _FinishCleanup(
+    this.run,
+    this.exit,
+    this.events, [
+    this.cleanupCancellations = const [],
+  ]);
+  final Future<TaskEvaluation<void, Never>> Function(Exit<Object?, Object?>)
+  run;
+  final Exit<Object?, Object?> exit;
+  final List<FailureEvent> events;
+  final List<CauseCancelled> cleanupCancellations;
 }
 
 final class _Interruptibility extends _Node {
@@ -1777,6 +1978,8 @@ final class _Frame {
     this.context,
     this.locals,
     this.scope,
+    this.releaseBorrow,
+    this.cleanup = false,
   });
   final _Node Function(Object?)? success;
   final bool consumesValue;
@@ -1791,4 +1994,6 @@ final class _Frame {
   final Context? context;
   final Map<TaskLocal<Object?>, Object?>? locals;
   final Scope? scope;
+  final void Function()? releaseBorrow;
+  final bool cleanup;
 }

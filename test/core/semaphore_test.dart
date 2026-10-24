@@ -30,6 +30,36 @@ void main() {
     expect(await secondRun, isA<ExitSuccess<void, Never>>());
   });
 
+  test(
+    'permits return while body resources remain in the caller scope',
+    () async {
+      final semaphore = await runtime.runOrThrow(Semaphore.create(1));
+      var released = false;
+      final resource = Object();
+      final acquired = Task.acquireRelease(
+        Task.succeed(resource),
+        release: (_, _) => Task.sync(() => released = true),
+      );
+
+      final result = await runtime.runOrThrow(
+        semaphore
+            .withPermits(1, acquired)
+            .flatMap(
+              (value) => semaphore.withPermits(
+                1,
+                Task.sync(() {
+                  expect(released, isFalse);
+                  return value;
+                }),
+              ),
+            ),
+      );
+
+      expect(result, same(resource));
+      expect(released, isTrue);
+    },
+  );
+
   test('invalid capacity fails lazily with a range defect', () async {
     for (final permits in [-1, 0]) {
       final create = Semaphore.create(permits);
@@ -307,7 +337,7 @@ void main() {
                         .flatMap((_) => cleanup.task),
               ).scoped(),
             );
-    final running = runtime.run(semaphore.withPermits(1, body));
+    final running = runtime.run(semaphore.withPermits(1, body.scoped()));
     await cleanup.started.future;
     final waiting = runtime.run(
       semaphore.withPermits(1, Task.sync(() => events.add('next body'))),

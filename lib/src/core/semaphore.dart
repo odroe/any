@@ -8,7 +8,8 @@ import 'task.dart';
 /// Use [SemaphoreOperations.withPermits] to run tasks under a shared limit.
 /// Requesting one permit limits the number of concurrent operations; requesting
 /// several lets more expensive operations consume a larger share of capacity.
-/// Permits remain held until the task's scoped resources finish closing.
+/// Permits remain held until the wrapped task completes. To include resource
+/// cleanup in that limit, pass a task wrapped in [TaskOperations.scoped].
 ///
 /// Requests are served in arrival order. A smaller request waits behind an
 /// earlier request even when enough permits are available for the smaller one.
@@ -58,7 +59,7 @@ final class Semaphore {
 
 /// Runs tasks within a semaphore's capacity.
 extension SemaphoreOperations on Semaphore {
-  /// Runs [task] with [count] permits and releases them after cleanup.
+  /// Runs [task] with [count] permits and releases them when it completes.
   ///
   /// Waits for enough permits, then returns the task's result or failure.
   /// [count] must be positive and no greater than capacity; an invalid value
@@ -69,6 +70,9 @@ extension SemaphoreOperations on Semaphore {
   /// success, failure, or cancellation, including cancellation before [task]
   /// starts.
   ///
+  /// Resources acquired by [task] belong to the caller's scope. Use
+  /// `withPermits(count, task.scoped())` to keep the permits through cleanup.
+  ///
   /// Nested requests do not reuse permits held by the caller. They can wait
   /// forever when the caller holds permits they need.
   Task<T, E> withPermits<T, E>(int count, Task<T, E> task) =>
@@ -76,22 +80,20 @@ extension SemaphoreOperations on Semaphore {
         RangeError.checkValueInInterval(count, 1, _capacity, 'count');
         final request = _PermitRequest(count);
 
-        // Register before waiting so cancellation immediately after a grant
-        // still returns the permits, even before the next continuation runs.
-        return Task.addFinalizer((_) => Task.sync(() => _release(request)))
-            .flatMap(
-              (_) => restore(
-                Task.fromCallback<void, Never>((complete) {
-                  request.complete = complete;
-                  _waiting.addLast(request);
-                  _drain();
-                  return () => _release(request);
-                }),
-              ),
+        // Install completion cleanup before waiting so a grant cannot be lost
+        // when cancellation prevents the body from starting.
+        return restore(
+              Task.fromCallback<void, Never>((complete) {
+                request.complete = complete;
+                _waiting.addLast(request);
+                _drain();
+                return () => _release(request);
+              }),
             )
             .withError<E>()
-            .flatMap((_) => restore(task));
-      }).scoped();
+            .flatMap((_) => restore(task))
+            .onExit((_) => Task.sync(() => _release(request)));
+      });
 }
 
 final class _PermitRequest {

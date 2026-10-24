@@ -305,7 +305,7 @@ void main() {
       controller.requestCancel();
 
       expect(_cause(await running), isA<CauseCancelled>());
-      expect(seen, ['inner', 'default']);
+      expect(seen, ['default', 'inner']);
       expect(await runtime.runOrThrow(local.get()), 'default');
     },
   );

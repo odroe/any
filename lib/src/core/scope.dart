@@ -11,8 +11,8 @@ import 'task.dart';
 /// [TaskOperations.scoped] to give a computation a local lifetime. Use [open] and
 /// [close] when work needs an explicit owner, such as [TaskOperations.forkIn].
 ///
-/// Closing a scope stops and waits for its child fibers before releasing
-/// resources. Child scopes close before their parent's finalizers; sibling
+/// Closing a scope stops and waits for owned fibers and resource borrowers before
+/// releasing resources. Child scopes close before their parent's finalizers; sibling
 /// scopes and finalizers close in reverse registration order. Every finalizer
 /// runs, with cancellation masked, even if another finalizer fails.
 ///
@@ -33,7 +33,7 @@ import 'task.dart';
 /// Cleanup failures join the computation's cause. They do not prevent remaining
 /// resources from being released.
 final class Scope {
-  Scope._(this._parent);
+  Scope._(this._parent, this._runtimeId);
 
   /// Returns a task that opens a child of the current scope.
   ///
@@ -54,8 +54,10 @@ final class Scope {
       closeScopeTask(this, exit);
 
   Scope? _parent;
+  final Object _runtimeId;
   final _children = <Scope>{};
   final _fibers = <Fiber<Object?, Object?>>{};
+  final _borrowers = <_Borrow>{};
   final _closeDependencies = <Object, Scope>{};
   final _finalizers = <_Finalizer>[];
   _Closing? _closing;
@@ -73,6 +75,35 @@ void attachScopeFiber(Scope scope, Fiber<Object?, Object?> fiber) {
 void detachScopeFiber(Scope scope, Fiber<Object?, Object?> fiber) {
   scope._fibers.remove(fiber);
 }
+
+// Borrowing protects resources without transferring execution ownership.
+void Function() borrowScopeFiber(
+  Scope scope,
+  Fiber<Object?, Object?> fiber, {
+  bool untilReleased = false,
+}) {
+  if (scope._closing != null) {
+    throw StateError('Cannot borrow a closing or closed scope.');
+  }
+  final borrow = _Borrow(fiber, untilReleased);
+  scope._borrowers.add(borrow);
+  return () {
+    if (!scope._borrowers.remove(borrow)) return;
+    borrow.release();
+  };
+}
+
+Object scopeRuntimeId(Scope scope) => scope._runtimeId;
+
+Iterable<Fiber<Object?, Object?>> _members(Scope scope) => {
+  ...scope._fibers,
+  ...scope._borrowers.map((borrow) => borrow.fiber),
+  if (!(scope._closing?.completion.isCompleted ?? true)) ...[
+    ...scope._closing!.fibers,
+    for (final borrow in scope._closing!.borrowers)
+      if (!borrow.untilReleased || !borrow.isReleased) borrow.fiber,
+  ],
+};
 
 // Fiber roots and leased resources are separate cleanup trees. Their lifetime
 // dependencies still participate in self-wait detection without transferring
@@ -92,9 +123,9 @@ bool scopeWaitsForFiber(Scope scope, Fiber<Object?, Object?> target) {
   while (pending.isNotEmpty) {
     final current = pending.removeLast();
     if (!visited.add(current)) continue;
-    if (current._fibers.contains(target)) return true;
+    if (_members(current).contains(target)) return true;
     pending.addAll(current._children);
-    pending.addAll(current._fibers.map(fiberScope));
+    pending.addAll(_members(current).map(fiberScope));
     for (final dependency in current._closeDependencies.values) {
       if (scopeContains(fiberScope(target), dependency)) return true;
       pending.add(dependency);
@@ -132,14 +163,15 @@ TaskEvaluation<void, Never> scopeCleanupFor(
   );
 }
 
-// Creates a root scope, or registers a child of [parent].
+// Creates a root scope, or registers a child of [parent]. An independent root
+// can retain another scope's runtime identity without becoming its child.
 //
 // Throws a [StateError] when [parent] is closing or closed.
-Scope createScope({Scope? parent}) {
+Scope createScope({Scope? parent, Object? runtimeId}) {
   if (parent?._closing != null) {
     throw StateError('Cannot create a child in a closing or closed scope.');
   }
-  final scope = Scope._(parent);
+  final scope = Scope._(parent, parent?._runtimeId ?? runtimeId ?? Object());
   parent?._children.add(scope);
   return scope;
 }
@@ -186,7 +218,7 @@ bool scopeCloseWouldDeadlock(Scope target, Scope current) {
       }
     }
     pending.addAll(candidate._children);
-    pending.addAll(candidate._fibers.map(fiberScope));
+    pending.addAll(_members(candidate).map(fiberScope));
     pending.addAll(candidate._closeDependencies.values);
   }
   return false;
@@ -262,6 +294,7 @@ Future<Cause<Never>?> closeScope(Scope scope, Exit<Object?, Object?> exit) {
       owner,
       children,
       current._fibers.toList(),
+      current._borrowers.toList(),
     );
     claimed.add(current);
     pending.addAll(children.reversed);
@@ -276,16 +309,31 @@ Future<void> _closeClaimed(List<Scope> claimed, Object owner) async {
     // Fiber roots are separate scopes: each member finishes its own cleanup
     // before its completion can unblock the owning scope.
     final stopping = <Future<void>>[];
+    final stops = <Fiber<Object?, Object?>, Future<List<FailureEvent>>>{};
     for (final scope in claimed) {
       final reason = _cancellationReason(scope._closing!.exit);
-      for (final fiber in scope._closing!.fibers) {
+      final closing = scope._closing!;
+      for (final fiber in {
+        ...closing.fibers,
+        for (final borrow in closing.borrowers)
+          if (!borrow.untilReleased) borrow.fiber,
+      }) {
         stopping.add(
-          stopFiber(fiber, reason: reason).then((events) {
-            for (final event in events) {
-              _record(scope, event.cause, owner, source: event.source);
-            }
-          }),
+          stops.putIfAbsent(fiber, () => stopFiber(fiber, reason: reason)).then(
+            (events) {
+              for (final event in events) {
+                _record(scope, event.cause, owner, source: event.source);
+              }
+            },
+          ),
         );
+      }
+      for (final borrow in closing.borrowers) {
+        if (!borrow.untilReleased) continue;
+        // A dynamic borrower may own this scope's ancestor. Waiting for its
+        // final exit would also wait for the close currently running here.
+        borrow.fiber.requestCancel(reason: reason);
+        stopping.add(borrow.released);
       }
     }
     if (stopping.isNotEmpty) await Future.wait(stopping);
@@ -406,18 +454,37 @@ void _finish(Scope scope) {
       : Cause<Never>.combine(closing.events.map((event) => event.cause));
   closing.children.clear();
   closing.fibers.clear();
+  closing.borrowers.clear();
   scope._parent?._children.remove(scope);
   scope._parent = null;
   closing.completion.complete(cause);
 }
 
+final class _Borrow {
+  _Borrow(this.fiber, this.untilReleased);
+
+  final Fiber<Object?, Object?> fiber;
+  final bool untilReleased;
+  Completer<void>? _released;
+  var isReleased = false;
+
+  Future<void> get released =>
+      isReleased ? Future.value() : (_released ??= Completer<void>()).future;
+
+  void release() {
+    isReleased = true;
+    _released?.complete();
+  }
+}
+
 final class _Closing {
-  _Closing(this.exit, this.owner, this.children, this.fibers);
+  _Closing(this.exit, this.owner, this.children, this.fibers, this.borrowers);
 
   final Exit<Object?, Object?> exit;
   final Object owner;
   final List<Scope> children;
   final List<Fiber<Object?, Object?>> fibers;
+  final List<_Borrow> borrowers;
   final completion = Completer<Cause<Never>?>();
   final events = <_CleanupEvent>[];
   final sources = <Object>{};

@@ -19,17 +19,21 @@ extension FlowCombinationOperations<T, E> on Flow<T, E> {
   ///
   /// Each consumption starts both inputs independently, with at most one pending
   /// read or waiting value per input. New reads require downstream demand.
-  /// Delivered values keep their resources alive through downstream use.
+  /// User tasks in both inputs borrow the consuming task's resource scope.
   ///
   /// Failure stops both inputs. Stopping early waits for pending reads and cleanup,
   /// preserving observed defects and cleanup failures. A non-cancellable [Future]
   /// must settle before its read can stop.
   Flow<T, E> merge(Flow<T, E> other) => flowFromCursor(
-    Scope.open().withError<E>().flatMap((owner) {
-      final merging = _Merged([
-        _PullSlot(openFlowCursor(this), owner),
-        _PullSlot(openFlowCursor(other), owner),
-      ], owner);
+    (resources) => Scope.open().withError<E>().flatMap((owner) {
+      final merging = _Merged(
+        [
+          _PullSlot(openFlowCursor(this, resourceScope: resources), owner),
+          _PullSlot(openFlowCursor(other, resourceScope: resources), owner),
+        ],
+        owner,
+        resources,
+      );
       return inTaskScope(
         Task.addFinalizer(merging.cleanup),
         owner,
@@ -51,16 +55,17 @@ extension FlowCombinationOperations<T, E> on Flow<T, E> {
   /// ```
   ///
   /// Both inputs are read concurrently, at most once each per requested pair.
-  /// Resources from both values remain alive until the pair is consumed. When one
-  /// input ends, any unpaired value is released and the other read is cancelled.
+  /// When one input ends, any unpaired value is discarded and the other read is
+  /// cancelled. User resources remain in the consuming task's scope.
   /// Failure or stopping early waits for both inputs and cleanup, including any
   /// non-cancellable [Future].
   Flow<(T, U), E> zip<U>(Flow<U, E> other) => flowFromCursor(
-    Scope.open().withError<E>().flatMap((owner) {
+    (resources) => Scope.open().withError<E>().flatMap((owner) {
       final zipped = _Zipped(
-        _PullSlot(openFlowCursor(this), owner),
-        _PullSlot(openFlowCursor(other), owner),
+        _PullSlot(openFlowCursor(this, resourceScope: resources), owner),
+        _PullSlot(openFlowCursor(other, resourceScope: resources), owner),
         owner,
+        resources,
       );
       return inTaskScope(
         Task.addFinalizer(zipped.cleanup),
@@ -85,17 +90,18 @@ extension FlowCombinationOperations<T, E> on Flow<T, E> {
   ///
   /// A completed input keeps contributing its last value. An input that ends empty
   /// ends the result immediately. Both inputs run concurrently, each retaining a
-  /// latest value and at most one pending read or waiting update. Latest values
-  /// and emitted pairs keep their resources alive while in use.
+  /// latest value and at most one pending read or waiting update. Replacing a
+  /// latest value does not close resources acquired in the consuming task's scope.
   ///
   /// Failure or stopping early waits for both inputs and cleanup, including any
   /// non-cancellable [Future].
   Flow<(T, U), E> combineLatest<U>(Flow<U, E> other) => flowFromCursor(
-    Scope.open().withError<E>().flatMap((owner) {
+    (resources) => Scope.open().withError<E>().flatMap((owner) {
       final combined = _Latest(
-        _PullSlot(openFlowCursor(this), owner),
-        _PullSlot(openFlowCursor(other), owner),
+        _PullSlot(openFlowCursor(this, resourceScope: resources), owner),
+        _PullSlot(openFlowCursor(other, resourceScope: resources), owner),
         owner,
+        resources,
       );
       return inTaskScope(
         Task.addFinalizer(combined.cleanup),
@@ -157,9 +163,10 @@ final class _PullSlot<T, E> {
 // The two inputs share stop, observation, and failure handling. Values stay in
 // their own typed slots; this coordinator never erases their types.
 final class _Readers<E> {
-  _Readers(this.owner);
+  _Readers(this.owner, this.resources);
 
   final Scope owner;
+  final Scope resources;
   final _active = <Fiber<void, E>>{};
   final _stopReason = Object();
   final _failures = <_ReadFailure<E>>[];
@@ -190,6 +197,7 @@ final class _Readers<E> {
               return cause;
             }),
             owner,
+            resourceScope: resources,
             inheritHost: true,
           ).map((fiber) {
             input.fiber = fiber;
@@ -207,8 +215,15 @@ final class _Readers<E> {
                 }
                 _failures.add(
                   _ReadFailure(
-                    TaskEvaluation(exit, fiberFailureEvents(fiber)),
-                    explicitCancellation,
+                    TaskEvaluation(
+                      exit,
+                      fiberFailureEvents(fiber),
+                      cleanupCancellations: fiberCleanupCancellations(fiber),
+                    ),
+                    [
+                      ...explicitCancellation,
+                      ...fiberCleanupCancellations(fiber),
+                    ],
                   ),
                 );
                 stop();
@@ -268,9 +283,12 @@ final class _Readers<E> {
   }) {
     final causes = <Cause<F>>[];
     final events = <FailureEvent>[];
+    final cleanupCancellations = <CauseCancelled>[];
     final seen = <Object>{};
     for (final failure in _failures) {
       final result = failure.result;
+      final cancellations = [...failure.explicitCancellation];
+      final cleanups = [...result.cleanupCancellations];
       if (result.exit case ExitFailure(:final cause)) {
         final sources = Map<CauseDefect, Queue<FailureEvent>>.identity();
         for (final event in result.events) {
@@ -288,10 +306,12 @@ final class _Readers<E> {
               if (!defectsOnly) causes.add(Cause.failure(error as F));
             case CauseCancelled():
               if ((!defectsOnly ||
-                      (!_failureDelivered &&
-                          failure.explicitCancellation.contains(reason))) &&
+                      (!_failureDelivered && cancellations.remove(reason))) &&
                   !identical(reason.reason, _stopReason)) {
                 causes.add(reason);
+                if (cleanups.remove(reason)) {
+                  cleanupCancellations.add(reason);
+                }
               }
             case CauseGroup():
               throw StateError('Cause groups must be flat.');
@@ -304,16 +324,18 @@ final class _Readers<E> {
           ? Exit.success(success())
           : Exit.failure(Cause.combine(causes)),
       List.unmodifiable(events),
+      cleanupCancellations: List.unmodifiable(cleanupCancellations),
     );
   }
 }
 
-// An output has its own callback scope and holds its inputs plus the enclosing
+// An output owns a transport scope and holds its inputs plus the enclosing
 // operator alive until every downstream lease releases that output.
 final class _Output {
-  _Output(this.owner);
+  _Output(this.owner, this.resources);
 
   final Scope owner;
+  final Scope resources;
   late final lifetime = FlowProducer(owner);
   FlowProducer? current;
 
@@ -343,9 +365,9 @@ final class _Output {
 }
 
 final class _Merged<T, E> {
-  _Merged(this.inputs, Scope owner)
-    : readers = _Readers(owner),
-      output = _Output(owner);
+  _Merged(this.inputs, Scope owner, Scope resources)
+    : readers = _Readers(owner, resources),
+      output = _Output(owner, resources);
 
   final List<_PullSlot<T, E>> inputs;
   final _Readers<E> readers;
@@ -357,6 +379,7 @@ final class _Merged<T, E> {
     () => output.scope,
     _finish,
     output.producers,
+    resourceScope: output.resources,
   );
 
   Task<void, Never> _start(_PullSlot<T, E> input) => readers.start(
@@ -431,9 +454,9 @@ final class _Merged<T, E> {
 }
 
 final class _Zipped<A, B, E> {
-  _Zipped(this.left, this.right, Scope owner)
-    : readers = _Readers(owner),
-      output = _Output(owner);
+  _Zipped(this.left, this.right, Scope owner, Scope resources)
+    : readers = _Readers(owner, resources),
+      output = _Output(owner, resources);
 
   final _PullSlot<A, E> left;
   final _PullSlot<B, E> right;
@@ -445,6 +468,7 @@ final class _Zipped<A, B, E> {
     () => output.scope,
     _finish,
     output.producers,
+    resourceScope: output.resources,
   );
 
   bool get _ended =>
@@ -517,9 +541,9 @@ final class _Zipped<A, B, E> {
 enum _Side { left, right }
 
 final class _Latest<A, B, E> {
-  _Latest(this.left, this.right, Scope owner)
-    : readers = _Readers(owner),
-      output = _Output(owner);
+  _Latest(this.left, this.right, Scope owner, Scope resources)
+    : readers = _Readers(owner, resources),
+      output = _Output(owner, resources);
 
   final _PullSlot<A, E> left;
   final _PullSlot<B, E> right;
@@ -534,6 +558,7 @@ final class _Latest<A, B, E> {
     () => output.scope,
     _finish,
     output.producers,
+    resourceScope: output.resources,
   );
 
   bool get _ended =>

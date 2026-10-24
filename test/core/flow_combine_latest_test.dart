@@ -142,7 +142,7 @@ void main() {
   test('an empty input stops a sibling that is still opening', () async {
     final pending = _Gate<FlowCursor<int, Never>, Never>();
     final running = runtime.run(
-      flowFromCursor(pending.task)
+      flowFromCursor((_) => pending.task)
           .combineLatest(Flow.fromIterable(<String>[]))
           .toList(),
     );
@@ -204,43 +204,40 @@ void main() {
     },
   );
 
-  test(
-    'replacing an initial latest releases its resources before the first pair',
-    () async {
-      final left = _Source<int>(3);
-      final right = _Source<String>(1);
-      final resources = <_Resource>[];
-      final source = left.flow.flatMap(
-        (index) => Flow.fromTask(
-          Task.acquireRelease(
-            Task.sync(() {
-              final value = _Resource(index);
-              resources.add(value);
-              return value;
-            }),
-            release: (value, _) => Task.sync(value.close),
-          ),
+  test('replacing an initial latest preserves resources until the consumer scope closes', () async {
+    final left = _Source<int>(3);
+    final right = _Source<String>(1);
+    final resources = <_Resource>[];
+    final source = left.flow.flatMap(
+      (index) => Flow.fromTask(
+        Task.acquireRelease(
+          Task.sync(() {
+            final value = _Resource(index);
+            resources.add(value);
+            return value;
+          }),
+          release: (value, _) => Task.sync(value.close),
         ),
-      );
-      final running = runtime.run(
-        source.combineLatest(right.flow).take(1).map((pair) {
-          expect(pair.$1.closed, isFalse);
-          return (pair.$1.index, pair.$2);
-        }).toList(),
-      );
-      await left.emit(0, 0);
-      await left.emit(1, 1);
-      await left.gates[2].started.future;
-      expect(resources[0].closed, isTrue);
-      expect(resources[1].closed, isFalse);
-      await right.emit(0, 'a');
-      expect(_value(await running), [(1, 'a')]);
-      expect(resources.every((resource) => resource.closed), isTrue);
-    },
-  );
+      ),
+    );
+    final running = runtime.run(
+      source.combineLatest(right.flow).take(1).map((pair) {
+        expect(pair.$1.closed, isFalse);
+        return (pair.$1.index, pair.$2);
+      }).toList(),
+    );
+    await left.emit(0, 0);
+    await left.emit(1, 1);
+    await left.gates[2].started.future;
+    expect(resources[0].closed, isFalse);
+    expect(resources[1].closed, isFalse);
+    await right.emit(0, 'a');
+    expect(_value(await running), [(1, 'a')]);
+    expect(resources.every((resource) => resource.closed), isTrue);
+  });
 
   test(
-    'older outputs retain independent leases after a latest value advances',
+    'earlier and current output resources share the consuming scope',
     () async {
       final left = _Source<int>(3);
       final right = _Source<int>(2);
@@ -290,7 +287,8 @@ void main() {
       expect(leftResources[0].closed, isFalse);
       expect(rightResources.single.closed, isFalse);
       finish[0].complete();
-      await leftResources[0].released.future;
+      await _turn();
+      expect(leftResources[0].closed, isFalse);
       expect(leftResources[1].closed, isFalse);
       expect(rightResources.single.closed, isFalse);
       await left.end(2);
@@ -398,45 +396,41 @@ void main() {
     },
   );
 
-  test(
-    'replacement cleanup failure stops production and releases the new latest',
-    () async {
-      final left = _Source<int>(3);
-      final right = _Source<String>(1);
-      final closed = <int>[];
-      final fault = StateError('replacement');
-      final resources = left.flow.flatMap(
-        (value) => Flow.fromTask(
-          Task.acquireRelease(
-            Task.succeed(value),
-            release: (value, _) => Task.sync(() => closed.add(value)).flatMap(
-              (_) => value == 0
-                  ? Task.failCause(
-                      Cause<Never>.combine([
-                        const Cause.cancelled('cleanup'),
-                        Cause.defect(fault, StackTrace.current),
-                      ]),
-                    )
-                  : Task.succeed(null),
-            ),
+  test('replaced user resource cleanup is deferred and still fails the consuming scope', () async {
+    final left = _Source<int>(3);
+    final right = _Source<String>(1);
+    final closed = <int>[];
+    final fault = StateError('replacement');
+    final resources = left.flow.flatMap(
+      (value) => Flow.fromTask(
+        Task.acquireRelease(
+          Task.succeed(value),
+          release: (value, _) => Task.sync(() => closed.add(value)).flatMap(
+            (_) => value == 0
+                ? Task.failCause(
+                    Cause<Never>.combine([
+                      const Cause.cancelled('cleanup'),
+                      Cause.defect(fault, StackTrace.current),
+                    ]),
+                  )
+                : Task.succeed(null),
           ),
         ),
-      );
-      final running = runtime.run(
-        resources.combineLatest(right.flow).toList().exit(),
-      );
-      await left.emit(0, 0);
-      await left.emit(1, 1);
-      final exit = _value(await running);
-      expect(_defects(exit), [same(fault)]);
-      expect(
-        _causes(exit).whereType<CauseCancelled>().single.reason,
-        'cleanup',
-      );
-      expect(closed, [0, 1]);
-      expect(right.gates[0].cancelled, isTrue);
-    },
-  );
+      ),
+    );
+    final running = runtime.run(
+      resources.combineLatest(right.flow).toList().scoped().exit(),
+    );
+    await left.emit(0, 0);
+    await left.emit(1, 1);
+    expect(closed, isEmpty);
+    await left.end(2);
+    await right.end(0);
+    final exit = _value(await running);
+    expect(_defects(exit), [same(fault)]);
+    expect(_causes(exit).whereType<CauseCancelled>().single.reason, 'cleanup');
+    expect(closed, [1, 0]);
+  });
 
   test('failure after initialization stops the other input and releases latest values', () async {
     final left = _Source<int>(2);
@@ -520,6 +514,7 @@ void main() {
               .combineLatest(Flow.fromIterable(['a', 'b']))
               .take(1)
               .toList()
+              .scoped()
               .exit(),
         ),
       );

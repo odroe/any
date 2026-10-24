@@ -134,6 +134,59 @@ void main() {
     await runtime.close();
   });
 
+  for (final finalizer in [false, true]) {
+    test(
+      'cleanup cannot close a runtime awaiting its lease: $finalizer',
+      () async {
+        final owner = Runtime();
+        final borrower = Runtime();
+        addTearDown(owner.close);
+        addTearDown(borrower.close);
+        final ready = Completer<SharedResource<int, Never>>();
+        var acquisitions = 0;
+        var releases = 0;
+        owner.start(
+          SharedResource.create(
+            Task.acquireRelease(
+              Task.sync(() => ++acquisitions),
+              release: (_, _) => Task.sync(() => releases++),
+            ),
+          ).flatMap((resource) {
+            ready.complete(resource);
+            return Task.fromCallback<void, Never>((_) => () {});
+          }),
+        );
+        final resource = await ready.future;
+        Task<void, Never> cleanup(Task<void, Never> use) => finalizer
+            ? Task.addFinalizer((_) => use)
+            : Task.succeed(null).ensuring(use);
+
+        await borrower.runOrThrow(
+          cleanup(resource.acquire().map((value) => expect(value, 1))),
+        );
+        expect(releases, 1);
+
+        await borrower.runOrThrow(
+          cleanup(
+            resource.acquire().flatMap(
+              (_) =>
+                  Task.fromFuture(
+                    () => owner.close().timeout(const Duration(seconds: 2)),
+                    onError: Error.throwWithStackTrace,
+                  ).map((exit) {
+                    final cause = (exit as ExitFailure).cause as CauseDefect;
+                    expect(cause.error, isA<StateError>());
+                  }),
+            ),
+          ),
+        );
+        expect(acquisitions, 2);
+        expect(releases, 2);
+        expect(await owner.runOrThrow(Task.succeed(42)), 42);
+      },
+    );
+  }
+
   test('completion removes the external cancellation listener', () async {
     final runtime = Runtime();
     final controller = CancellationController();

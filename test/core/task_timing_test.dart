@@ -71,7 +71,7 @@ void main() {
     },
   );
 
-  test('retry closes each attempt before starting another', () async {
+  test('explicitly scoped retry closes each attempt before another', () async {
     var attempts = 0;
     final events = <String>[];
     final task =
@@ -87,7 +87,10 @@ void main() {
           (attempt) => attempt < 3 ? Task.fail('retry') : Task.succeed(attempt),
         );
 
-    expect(_value(await runtime.run(task.retry(Schedule.recurs(4)))), 3);
+    expect(
+      _value(await runtime.run(task.scoped().retry(Schedule.recurs(4)))),
+      3,
+    );
     expect(events, [
       'acquire 1',
       'release 1',
@@ -96,6 +99,29 @@ void main() {
       'acquire 3',
       'release 3',
     ]);
+  });
+
+  test('retry retains every attempt resource in the caller scope', () async {
+    var attempts = 0;
+    final released = <int>[];
+    final task = Task.acquireRelease(
+      Task.sync(() {
+        expect(released, isEmpty);
+        return ++attempts;
+      }).withError<String>(),
+      release: (value, _) => Task.sync(() => released.add(value)),
+    ).flatMap((value) => value < 3 ? Task.fail('retry') : Task.succeed(value));
+
+    expect(
+      await runtime.runOrThrow(
+        task.retry(Schedule.recurs(4)).map((value) {
+          expect(released, isEmpty);
+          return value;
+        }),
+      ),
+      3,
+    );
+    expect(released, [3, 2, 1]);
   });
 
   test('retry predicates see only single business failures', () async {
@@ -275,16 +301,53 @@ void main() {
     },
   );
 
-  test('repeat closes the last attempt before returning its value', () async {
-    var acquired = 0;
-    var released = 0;
-    final task = Task.acquireRelease(
-      Task.sync(() => ++acquired),
-      release: (_, _) => Task.sync(() => released++),
-    ).repeat(Schedule.recurs(2));
-    expect(_value(await runtime.run(task)), 3);
-    expect(released, 3);
-  });
+  test(
+    'repeat retains attempt resources until the caller scope closes',
+    () async {
+      var acquired = 0;
+      var released = 0;
+      final task = Task.acquireRelease(
+        Task.sync(() => ++acquired),
+        release: (_, _) => Task.sync(() => released++),
+      ).repeat(Schedule.recurs(2));
+      expect(
+        _value(
+          await runtime.run(
+            task.map((value) {
+              expect(released, 0);
+              return value;
+            }),
+          ),
+        ),
+        3,
+      );
+      expect(released, 3);
+    },
+  );
+
+  test(
+    'explicitly scoped repeat releases each attempt before continuing',
+    () async {
+      var acquired = 0;
+      var released = 0;
+      final task = Task.acquireRelease(
+        Task.sync(() {
+          expect(released, acquired);
+          return ++acquired;
+        }),
+        release: (_, _) => Task.sync(() => released++),
+      ).scoped().repeat(Schedule.recurs(2));
+      expect(
+        await runtime.runOrThrow(
+          task.map((value) {
+            expect(released, 3);
+            return value;
+          }),
+        ),
+        3,
+      );
+    },
+  );
 
   test(
     'large zero-delay repeats remain stack safe and cooperatively cancellable',

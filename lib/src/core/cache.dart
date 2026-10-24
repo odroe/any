@@ -187,8 +187,11 @@ final class Cache<K, V, E> {
   Task<void, Never> _start(_Entry<K, V, E> entry) => Task.defer(() {
     if (entry.starting || entry.result != null) return Task.succeed(null);
     entry.starting = true;
-    return Task.defer(() => _load(entry.key))
-        .forkIn(_scope)
+    return forkTaskIn(
+          Task.defer(() => _load(entry.key)).scoped(),
+          _scope,
+          deferStart: false,
+        )
         .map((fiber) {
           entry.fiber = fiber;
           if (entry.cancelling) fiber.requestCancel(reason: entry.stopReason);

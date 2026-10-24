@@ -497,14 +497,18 @@ void main() {
             Task.succeed(1),
             release: (_, _) => Task.sync(() => events.add('resource')),
           ).flatMap(
-            (value) =>
-                Task.fromCallback<void, Never>(
-                      (_) =>
-                          () => events.add('background stopped'),
-                    )
-                    .ensuring(Task.sync(() => events.add('background cleanup')))
-                    .fork()
-                    .map((_) => value),
+            (value) => Scope.open().flatMap(
+              (scope) =>
+                  Task.fromCallback<void, Never>(
+                        (_) =>
+                            () => events.add('background stopped'),
+                      )
+                      .ensuring(
+                        Task.sync(() => events.add('background cleanup')),
+                      )
+                      .forkIn(scope)
+                      .map((_) => value),
+            ),
           );
       final runtime = _value(await create(key.layer(acquire)));
       expect(events, isEmpty);
@@ -531,6 +535,58 @@ void main() {
       expect(
         _defects(_cause(await runtime.run(Task.service(key)))).single.error,
         isA<RuntimeClosed>(),
+      );
+      expect(await runtime.close(), isA<ExitSuccess<void, Never>>());
+    },
+  );
+
+  test(
+    'provided resources remain available after bindings are restored',
+    () async {
+      final key = ServiceKey<Object>('resource');
+      final resource = Object();
+      var released = false;
+      final runtime = Runtime(onUnhandledError: reports.add);
+      final layer = key.layer(
+        Task.acquireRelease(
+          Task.succeed(resource),
+          release: (_, _) => Task.sync(() => released = true),
+        ),
+      );
+
+      final result = await runtime.runOrThrow(
+        Task.service(key).provide(layer).map((value) {
+          expect(released, isFalse);
+          return value;
+        }),
+      );
+      expect(result, same(resource));
+      expect(released, isTrue);
+      expect(await runtime.close(), isA<ExitSuccess<void, Never>>());
+    },
+  );
+
+  test(
+    'explicitly scoped provision releases services before continuing',
+    () async {
+      final key = ServiceKey<int>('scoped');
+      var released = false;
+      final runtime = Runtime(onUnhandledError: reports.add);
+      final layer = key.layer(
+        Task.acquireRelease(
+          Task.succeed(1),
+          release: (_, _) => Task.sync(() => released = true),
+        ),
+      );
+
+      expect(
+        await runtime.runOrThrow(
+          Task.service(key).provide(layer).scoped().map((value) {
+            expect(released, isTrue);
+            return value;
+          }),
+        ),
+        1,
       );
       expect(await runtime.close(), isA<ExitSuccess<void, Never>>());
     },
@@ -573,7 +629,7 @@ void main() {
   });
 
   test(
-    'local construction failure skips the body and closes partial resources',
+    'local construction failure leaves partial resources in the caller scope',
     () async {
       final runtime = Runtime(onUnhandledError: reports.add);
       final a = ServiceKey<int>('a');
@@ -590,7 +646,10 @@ void main() {
           .withError<String>()
           .merge(b.layer(Task.fail('failed')));
       final exit = await runtime.run(
-        Task.sync(() => bodyRan = true).withError<String>().provide(layer),
+        Task.sync(() => bodyRan = true)
+            .withError<String>()
+            .provide(layer)
+            .onExit((_) => Task.sync(() => expect(released, isFalse))),
       );
       expect((_cause(exit) as CauseFailure<String>).error, 'failed');
       expect(bodyRan, isFalse);

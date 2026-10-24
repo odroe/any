@@ -28,7 +28,7 @@ extension FlowTimingOperations<T, E> on Flow<T, E> {
     Schedule schedule, {
     bool Function(E error)? when,
   }) => flowFromCursor(
-    accessTaskEnvironment(
+    (resources) => accessTaskEnvironment(
       (owner, _) => Task.service(Clock.key).withError<E>().flatMap(
         (clock) => Task.service(RandomSource.key).withError<E>().map((random) {
           final started = clock.elapsed;
@@ -39,7 +39,10 @@ extension FlowTimingOperations<T, E> on Flow<T, E> {
             final source = current;
             final next = source != null
                 ? source.pull()
-                : inTaskScope(openFlowCursor(this), owner).flatMap((opened) {
+                : inTaskScope(
+                    openFlowCursor(this, resourceScope: resources),
+                    owner,
+                  ).flatMap((opened) {
                     current = opened;
                     return opened.pull();
                   });
@@ -81,6 +84,7 @@ extension FlowTimingOperations<T, E> on Flow<T, E> {
             (exit) =>
                 Task.defer(() => current?.finish(exit) ?? Task.succeed(null)),
             () => current?.producers() ?? [],
+            resourceScope: resources,
           );
         }),
       ),
@@ -99,12 +103,15 @@ extension FlowTimingOperations<T, E> on Flow<T, E> {
   /// and [TaskOperations.timeout]'s duration and error rules.
   Flow<T, E> timeout(Duration duration, {required E Function() onTimeout}) =>
       flowFromCursor(
-        accessTaskEnvironment((owner, _) {
+        (resources) => accessTaskEnvironment((owner, _) {
           FlowCursor<T, E>? current;
           final pull = Task.defer(() {
             final source = current;
             if (source != null) return source.pull();
-            return inTaskScope(openFlowCursor(this), owner).flatMap((opened) {
+            return inTaskScope(
+              openFlowCursor(this, resourceScope: resources),
+              owner,
+            ).flatMap((opened) {
               current = opened;
               return opened.pull();
             });
@@ -116,6 +123,7 @@ extension FlowTimingOperations<T, E> on Flow<T, E> {
               (exit) =>
                   Task.defer(() => current?.finish(exit) ?? Task.succeed(null)),
               () => current?.producers() ?? [],
+              resourceScope: resources,
             ),
           );
         }),

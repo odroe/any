@@ -642,6 +642,50 @@ void main() {
   });
 
   test(
+    'protected resources remain available after the outcome is counted',
+    () async {
+      final breaker = await create(threshold: 1);
+      final resource = Object();
+      var released = false;
+      final result = await runtime.runOrThrow(
+        breaker
+            .protect(
+              Task.acquireRelease(
+                Task.succeed(resource),
+                release: (_, _) => Task.sync(() => released = true),
+              ),
+              onOpen: () => 'open',
+            )
+            .map((value) {
+              expect(released, isFalse);
+              expect(breaker.snapshot.state, CircuitBreakerState.closed);
+              return value;
+            }),
+      );
+
+      expect(result, same(resource));
+      expect(released, isTrue);
+    },
+  );
+
+  test('only explicitly scoped resource cleanup affects the breaker', () async {
+    for (final scoped in [false, true]) {
+      final breaker = await create(threshold: 1);
+      final error = StateError('resource cleanup');
+      final task = Task.addFinalizer((_) => Task.sync(() => throw error));
+      final exit = await runtime.run(
+        breaker.protect(scoped ? task.scoped() : task, onOpen: () => 'open'),
+      );
+
+      expect(_cause(exit), _defect(error));
+      expect(
+        breaker.snapshot.state,
+        scoped ? CircuitBreakerState.open : CircuitBreakerState.closed,
+      );
+    }
+  });
+
+  test(
     'cleanup defects turn a successful body into a counted failure',
     () async {
       final breaker = await create(threshold: 1);

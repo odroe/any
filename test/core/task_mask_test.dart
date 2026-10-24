@@ -115,12 +115,12 @@ void main() {
         }, onError: Error.throwWithStackTrace);
       }).flatMap((_) => Task.succeed(1));
       final task = Task.uninterruptibleMask<void, Never>((_) {
-        return Task.all([worker, Task.succeed(2)], concurrency: 2).map((
-          values,
-        ) {
-          expect(values, [1, 2]);
-          events.add('collected');
-        });
+        return Task.all([worker.scoped(), Task.succeed(2)], concurrency: 2).map(
+          (values) {
+            expect(values, [1, 2]);
+            events.add('collected');
+          },
+        );
       }).map((_) => fail('Cancellation must be restored outside the mask'));
 
       final running = _run(task, signal: controller.signal);

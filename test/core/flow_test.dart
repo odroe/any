@@ -193,22 +193,25 @@ void main() {
     },
   );
 
-  test('flatMap consumes and cleans up inner flows sequentially', () async {
-    final events = <String>[];
-    final flow = Flow.fromIterable([1, 2]).flatMap(
-      (value) => Flow.fromTask(
-        Task.acquireRelease(
-          Task.sync(() {
-            events.add('open $value');
-            return value;
-          }),
-          release: (_, _) => Task.sync(() => events.add('close $value')),
-        ),
-      ).concat(Flow.fromIterable([value * 10])),
-    );
-    expect(_value(await runtime.run(flow.toList())), [1, 10, 2, 20]);
-    expect(events, ['open 1', 'close 1', 'open 2', 'close 2']);
-  });
+  test(
+    'flatMap shares user resource ownership across sequential inner flows',
+    () async {
+      final events = <String>[];
+      final flow = Flow.fromIterable([1, 2]).flatMap(
+        (value) => Flow.fromTask(
+          Task.acquireRelease(
+            Task.sync(() {
+              events.add('open $value');
+              return value;
+            }),
+            release: (_, _) => Task.sync(() => events.add('close $value')),
+          ),
+        ).concat(Flow.fromIterable([value * 10])),
+      );
+      expect(_value(await runtime.run(flow.toList())), [1, 10, 2, 20]);
+      expect(events, ['open 1', 'open 2', 'close 2', 'close 1']);
+    },
+  );
 
   test('resource remains alive in consuming callbacks after take', () async {
     var alive = false;
@@ -240,23 +243,26 @@ void main() {
     expect(events, ['consume', 'close']);
   });
 
-  test('concat closes the first producer before starting the second', () async {
-    final events = <String>[];
-    final first = Flow.fromTask(
-      Task.acquireRelease(
-        Task.succeed(1),
-        release: (_, _) => Task.sync(() => events.add('close first')),
-      ),
-    );
-    final second = Flow.fromTask(
-      Task.sync(() {
-        events.add('start second');
-        return 2;
-      }),
-    );
-    expect(_value(await runtime.run(first.concat(second).toList())), [1, 2]);
-    expect(events, ['close first', 'start second']);
-  });
+  test(
+    'concat preserves user resources while starting the second source',
+    () async {
+      final events = <String>[];
+      final first = Flow.fromTask(
+        Task.acquireRelease(
+          Task.succeed(1),
+          release: (_, _) => Task.sync(() => events.add('close first')),
+        ),
+      );
+      final second = Flow.fromTask(
+        Task.sync(() {
+          events.add('start second');
+          return 2;
+        }),
+      );
+      expect(_value(await runtime.run(first.concat(second).toList())), [1, 2]);
+      expect(events, ['start second', 'close first']);
+    },
+  );
 
   test(
     'body and cleanup defects retain their identity and order once',
@@ -277,23 +283,20 @@ void main() {
     },
   );
 
-  test(
-    'recover closes the failed producer before opening replacement',
-    () async {
-      final events = <String>[];
-      final failing = Task.acquireRelease(
-        Task.succeed(1).withError<String>(),
-        release: (_, _) => Task.sync(() => events.add('close failed')),
-      ).flatMap<int>((_) => Task.fail('broken'));
-      final flow = Flow.fromTask(failing).recover((error) {
-        expect(error, 'broken');
-        events.add('replace');
-        return Flow.fromIterable([2, 3]);
-      });
-      expect(_value(await runtime.run(flow.toList())), [2, 3]);
-      expect(events, ['close failed', 'replace']);
-    },
-  );
+  test('recover preserves user resources while opening replacement', () async {
+    final events = <String>[];
+    final failing = Task.acquireRelease(
+      Task.succeed(1).withError<String>(),
+      release: (_, _) => Task.sync(() => events.add('close failed')),
+    ).flatMap<int>((_) => Task.fail('broken'));
+    final flow = Flow.fromTask(failing).recover((error) {
+      expect(error, 'broken');
+      events.add('replace');
+      return Flow.fromIterable([2, 3]);
+    });
+    expect(_value(await runtime.run(flow.toList())), [2, 3]);
+    expect(events, ['replace', 'close failed']);
+  });
 
   test(
     'recover preserves prior output and does not recover replacement again',
@@ -323,45 +326,48 @@ void main() {
     },
   );
 
-  test('cleanup defects prevent recovery and concat from continuing', () async {
-    final cleanup = StateError('cleanup');
-    var recovered = false;
-    var nextStarted = false;
-    final failed =
-        Flow.fromTask(
-          Task.acquireRelease(
-            Task.succeed(1).withError<String>(),
-            release: (_, _) => Task.sync(() => throw cleanup),
-          ).flatMap<int>((_) => Task.fail('business')),
-        ).recover((_) {
-          recovered = true;
-          return Flow.fromIterable([2]);
-        });
-    final reasons = _reasons(_cause(await runtime.run(failed.drain())));
-    expect(reasons, hasLength(2));
-    expect(reasons.first, isA<CauseFailure<String>>());
-    expect((reasons.last as CauseDefect).error, same(cleanup));
-    expect(recovered, isFalse);
-    final success = Flow.fromTask(
-      Task.acquireRelease(
-        Task.succeed(1),
-        release: (_, _) => Task.sync(() => throw cleanup),
-      ),
-    );
-    final next = Flow.fromTask(
-      Task.sync(() {
-        nextStarted = true;
-        return 2;
-      }),
-    );
-    expect(
-      _defects(_cause(await runtime.run(success.concat(next).drain())))
-          .single
-          .error,
-      same(cleanup),
-    );
-    expect(nextStarted, isFalse);
-  });
+  test(
+    'explicit local cleanup prevents recovery and concat from continuing',
+    () async {
+      final cleanup = StateError('cleanup');
+      var recovered = false;
+      var nextStarted = false;
+      final failed =
+          Flow.fromTask(
+            Task.acquireRelease(
+              Task.succeed(1).withError<String>(),
+              release: (_, _) => Task.sync(() => throw cleanup),
+            ).flatMap<int>((_) => Task.fail('business')).scoped(),
+          ).recover((_) {
+            recovered = true;
+            return Flow.fromIterable([2]);
+          });
+      final reasons = _reasons(_cause(await runtime.run(failed.drain())));
+      expect(reasons, hasLength(2));
+      expect(reasons.first, isA<CauseFailure<String>>());
+      expect((reasons.last as CauseDefect).error, same(cleanup));
+      expect(recovered, isFalse);
+      final success = Flow.fromTask(
+        Task.acquireRelease(
+          Task.succeed(1),
+          release: (_, _) => Task.sync(() => throw cleanup),
+        ).scoped(),
+      );
+      final next = Flow.fromTask(
+        Task.sync(() {
+          nextStarted = true;
+          return 2;
+        }),
+      );
+      expect(
+        _defects(_cause(await runtime.run(success.concat(next).drain())))
+            .single
+            .error,
+        same(cleanup),
+      );
+      expect(nextStarted, isFalse);
+    },
+  );
 
   test(
     'mapError transforms producer failures while preserving defects',
@@ -517,64 +523,68 @@ void main() {
     },
   );
 
-  test('active concat producer owns downstream resource lifetimes', () async {
-    final events = <String>[];
-    Flow<int, Never> source(int value) => Flow.fromTask(
-      Task.acquireRelease(
-        Task.succeed(value),
-        release: (_, _) => Task.sync(() => events.add('source $value')),
-      ),
-    );
-    final flow = source(1)
-        .concat(source(2))
-        .mapTask(
-          (value) => Task.acquireRelease(
-            Task.succeed(value),
-            release: (_, _) => Task.sync(() => events.add('mapped $value')),
-          ),
-        );
-    expect(_value(await runtime.run(flow.toList())), [1, 2]);
-    expect(events, ['mapped 1', 'source 1', 'mapped 2', 'source 2']);
-  });
-
   test(
-    'take closes a nested composite inner before concat continues',
+    'concatenated user tasks register resources in one consuming scope',
     () async {
       final events = <String>[];
       Flow<int, Never> source(int value) => Flow.fromTask(
         Task.acquireRelease(
           Task.succeed(value),
-          release: (_, _) => Task.sync(() => events.add('close $value')),
+          release: (_, _) => Task.sync(() => events.add('source $value')),
         ),
       );
-      final flow = source(0)
-          .flatMap((_) => source(1).concat(source(2)))
-          .take(2)
-          .concat(
-            Flow.fromTask(
-              Task.sync(() {
-                events.add('next');
-                return 3;
-              }),
+      final flow = source(1)
+          .concat(source(2))
+          .mapTask(
+            (value) => Task.acquireRelease(
+              Task.succeed(value),
+              release: (_, _) => Task.sync(() => events.add('mapped $value')),
             ),
           );
-      expect(_value(await runtime.run(flow.toList())), [1, 2, 3]);
-      expect(events, ['close 1', 'close 2', 'close 0', 'next']);
+      expect(_value(await runtime.run(flow.toList())), [1, 2]);
+      expect(events, ['mapped 2', 'source 2', 'mapped 1', 'source 1']);
     },
   );
+
+  test('take stops nested production without closing user resources', () async {
+    final events = <String>[];
+    Flow<int, Never> source(int value) => Flow.fromTask(
+      Task.acquireRelease(
+        Task.succeed(value),
+        release: (_, _) => Task.sync(() => events.add('close $value')),
+      ),
+    );
+    final flow = source(0)
+        .flatMap((_) => source(1).concat(source(2)))
+        .take(2)
+        .concat(
+          Flow.fromTask(
+            Task.sync(() {
+              events.add('next');
+              return 3;
+            }),
+          ),
+        );
+    expect(_value(await runtime.run(flow.toList())), [1, 2, 3]);
+    expect(events, ['next', 'close 2', 'close 1', 'close 0']);
+  });
 
   test('early termination waits for asynchronous producer cleanup', () async {
     final releasing = Completer<void>();
     final released = Completer<void>();
     var nextStarted = false;
-    final first = Flow.fromTask(
-      Task.acquireRelease(
-        Task.succeed(1),
-        release: (_, _) => Task.fromFuture(() {
-          releasing.complete();
-          return released.future;
-        }, onError: _defect),
-      ),
+    late StreamController<int> source;
+    source = StreamController<int>(
+      onListen: () => source.add(1),
+      onCancel: () {
+        releasing.complete();
+        return released.future;
+      },
+    );
+    addTearDown(source.close);
+    final first = Flow.fromStream<int, Never>(
+      () => source.stream,
+      onError: _defect,
     );
     final running = runtime.run(
       first
@@ -697,7 +707,7 @@ void main() {
               },
               onError: _defect,
             ).flatMap((_) => Task.sync(() => throw cleanupError)),
-          ).flatMap<int>((_) => Task.fail('business')),
+          ).flatMap<int>((_) => Task.fail('business')).scoped(),
         ).recover((_) {
           recovered = true;
           return Flow.fromIterable([2]);

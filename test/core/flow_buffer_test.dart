@@ -676,7 +676,7 @@ void main() {
                   ended.complete();
                   return Task.failCause(const Cause.cancelled());
                 }),
-              ),
+              ).scoped(),
             ).filter((_) => false),
           )
           .buffer(2);
@@ -714,7 +714,7 @@ void main() {
                   },
                   onError: _defect,
                 ).flatMap((_) => Task.failCause(const Cause.cancelled())),
-              ),
+              ).scoped(),
             ).filter((_) => false),
           )
           .buffer(2);
@@ -756,7 +756,7 @@ void main() {
                       ]),
                     ),
                   ),
-            ),
+            ).scoped(),
           ).filter((_) => false),
         )
         .buffer(2);

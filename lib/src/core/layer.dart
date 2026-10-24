@@ -10,8 +10,8 @@ import 'task.dart';
 ///
 /// A layer produces a [Context] when supplied to `Runtime.create` or
 /// [TaskLayerOperations.provide]. Building a layer acquires its services; merely
-/// constructing a layer runs no tasks. Resources live for the receiving runtime
-/// or local computation.
+/// constructing a layer runs no tasks. Resources belong to the receiving
+/// runtime or the task's current resource scope.
 ///
 /// Create services with [ServiceLayerOperations.layer], connect dependencies
 /// with [LayerOperations.provide], and combine independent outputs with
@@ -134,16 +134,17 @@ extension InfallibleLayerOperations on Layer<Never> {
 extension TaskLayerOperations<T, E> on Task<T, E> {
   /// Runs this task with services acquired from [layer].
   ///
-  /// Each execution builds independently and owns the services until the task and
-  /// its children finish. Layer bindings replace matching input services; other
-  /// services remain available.
+  /// Each execution builds independently. Acquired services belong to the
+  /// caller's resource scope and remain available after this task returns.
+  /// Layer bindings replace matching input services during the task; other
+  /// services remain available. The original bindings are restored afterward.
   ///
-  /// If construction fails, the task does not start and acquired resources are
-  /// released. Success, failure, and cancellation all wait for owned work and
-  /// resource cleanup before returning.
+  /// If construction fails, the task does not start; acquired resources are
+  /// released when the caller's scope closes. Use `provide(layer).scoped()`
+  /// when the service lifetime should end with this operation.
   Task<T, E> provide(Layer<E> layer) => accessTaskEnvironment(
     (scope, _) => buildLayer(layer, scope).flatMap(provideContext),
-  ).scoped();
+  );
 }
 
 // Runtime and local provision share this construction boundary.
@@ -168,7 +169,7 @@ final class _BuildSession {
         // Publish the entry before starting work. Masking makes reservation and
         // publication atomic with respect to cancellation of the first waiter.
         return forkTaskIn(
-          inTaskScope(Task.defer(() => layer._create(this)), scope),
+          Task.defer(() => layer._create(this)),
           scope,
         ).exit().withError<E>().flatMap((started) {
           if (started case ExitSuccess(:final value)) {
