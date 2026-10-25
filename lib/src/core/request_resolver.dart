@@ -347,10 +347,11 @@ final class _Run<K, V, E> {
           context: environment.context,
           locals: environment.locals,
           report: environment.report,
+          reportFailure: false,
           deferStart: true,
         );
         batch.fiber = fiber;
-        listenFiber(fiber, (exit) {
+        fiber.onExit((exit) {
           finish(batch, TaskEvaluation(exit, fiberFailureEvents(fiber)));
         });
       } catch (error, stackTrace) {
@@ -475,57 +476,64 @@ final class _Call<K, V, E> {
   var detached = false;
   final stopped = <_Batch<K, V, E>>{};
 
-  Task<TaskEvaluation<List<Result<V, E>>, E>, Never>
-  awaitResults() => Task.fromCallback((complete) {
-    void check() {
-      if (entries.any((entry) => entry.result == null)) return;
-      wake = null;
-      final failures = <Object, _Entry<K, V, E>>{};
-      for (final entry in entries) {
-        if (entry.result!.exit is ExitFailure) {
-          failures[entry.batch ?? entry] = entry;
-        }
-      }
-      if (failures.isEmpty) {
-        complete(
-          Exit.success(
-            TaskEvaluation(
+  Task<TaskEvaluation<List<Result<V, E>>, E>, Never> awaitResults() =>
+      Task.fromCallback((complete) {
+        void check() {
+          if (entries.any((entry) => entry.result == null)) return;
+          wake = null;
+          final failures = <Object, _Entry<K, V, E>>{};
+          for (final entry in entries) {
+            if (entry.result!.exit is ExitFailure) {
+              failures[entry.batch ?? entry] = entry;
+            }
+          }
+          if (failures.isEmpty) {
+            complete(
               Exit.success(
-                List<Result<V, E>>.unmodifiable([
-                  for (final entry in entries)
-                    (entry.result!.exit as ExitSuccess<Result<V, E>, E>).value,
-                ]),
+                TaskEvaluation(
+                  Exit.success(
+                    List<Result<V, E>>.unmodifiable([
+                      for (final entry in entries)
+                        (entry.result!.exit as ExitSuccess<Result<V, E>, E>)
+                            .value,
+                    ]),
+                  ),
+                  const [],
+                ),
               ),
-              const [],
-            ),
-          ),
-        );
-      } else {
-        final ordered = failures.values.toList()
-          ..sort((a, b) => a.order.compareTo(b.order));
-        final events = _uniqueEvents(
-          ordered.expand((entry) => entry.result!.events),
-        );
-        complete(
-          Exit.success(
-            TaskEvaluation(
-              Exit.failure(
-                Cause.combine([
-                  for (final entry in ordered)
-                    (entry.result!.exit as ExitFailure<Result<V, E>, E>).cause,
-                ]),
+            );
+          } else {
+            final ordered = failures.values.toList()
+              ..sort((a, b) => a.order.compareTo(b.order));
+            final reasons = <Cause<E>>[];
+            final events = <FailureEvent>[];
+            final seen = <FailureSource>{};
+            for (final entry in ordered) {
+              final result = entry.result!;
+              final sources = result.events.iterator;
+              final cause = (result.exit as ExitFailure<Result<V, E>, E>).cause;
+              for (final reason in _reasons(cause)) {
+                if (reason is! CauseCancelled) {
+                  sources.moveNext();
+                  final event = sources.current;
+                  if (!seen.add(event.source)) continue;
+                  events.add(event);
+                }
+                reasons.add(reason);
+              }
+            }
+            complete(
+              Exit.success(
+                TaskEvaluation(Exit.failure(Cause.combine(reasons)), events),
               ),
-              events,
-            ),
-          ),
-        );
-      }
-    }
+            );
+          }
+        }
 
-    wake = check;
-    check();
-    return detach;
-  });
+        wake = check;
+        check();
+        return detach;
+      });
 
   void detach() {
     if (detached) return;
@@ -573,7 +581,9 @@ final class _Call<K, V, E> {
         };
         var stoppedCancellationRemoved = false;
         final evaluation = entry.result!;
-        final sources = evaluation.events.iterator;
+        final sources = evaluation.events
+            .where((event) => event.cause is CauseDefect)
+            .iterator;
         final cause = (evaluation.exit as ExitFailure<Result<V, E>, E>).cause;
         for (final reason in _reasons(cause)) {
           switch (reason) {
@@ -628,14 +638,6 @@ bool _localsIdentical(
     }
   }
   return true;
-}
-
-List<FailureEvent> _uniqueEvents(Iterable<FailureEvent> events) {
-  final seen = <Object>{};
-  return [
-    for (final event in events)
-      if (seen.add(event.source)) event,
-  ];
 }
 
 List<Cause<T>> _reasons<T>(Cause<T> cause) => switch (cause) {

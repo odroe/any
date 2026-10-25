@@ -17,6 +17,7 @@ void main() {
         deferStart: true,
         signal: controller.signal,
         report: (_) => fail('Unexpected report'),
+        reportFailure: false,
       );
       expect(started, isFalse);
       controller.requestCancel(reason: 'before start');
@@ -41,6 +42,7 @@ void main() {
         context: Context.from([]),
         deferStart: true,
         report: (_) => fail('Unexpected report'),
+        reportFailure: false,
       );
       final closed = scopes.closeScope(owner, const Exit.success(null));
       expect(await closed, isNull);

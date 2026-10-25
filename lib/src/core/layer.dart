@@ -1,5 +1,3 @@
-import 'dart:async';
-
 import 'context.dart';
 import 'exit.dart';
 import 'fiber.dart';
@@ -181,10 +179,6 @@ final class _BuildSession {
           owner,
           resourceScope: scope,
         ).exit().withError<E>().flatMap((started) {
-          if (started case ExitSuccess(:final value)) {
-            // The build session owns the result even if every waiter left.
-            unawaited(fiberCompletion(value));
-          }
           entry.ready.complete(started);
           return restore(entry.wait<E>());
         });

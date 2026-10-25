@@ -170,7 +170,7 @@ void main() {
   );
 
   test(
-    'a host Future timeout neither cancels nor unobserves Runtime.run',
+    'a host Future timeout leaves Runtime.run as the result receiver',
     () async {
       final native = _NativeCall();
       addTearDown(native.finish);
@@ -255,7 +255,17 @@ void main() {
         expect(client.releases, 1);
         expect(cancellations, 1);
         await Future<void>.delayed(Duration.zero);
-        expect(reports, isEmpty);
+        if (stopFails) {
+          expect(
+            (reports.single as CauseGroup).causes
+                .whereType<CauseDefect>()
+                .single
+                .error,
+            same(error),
+          );
+        } else {
+          expect(reports, isEmpty);
+        }
       },
     );
   }

@@ -153,7 +153,7 @@ final class _Run<A, T, E> {
     ).flatMap((fiber) {
       active[index] = fiber;
       if (stopping) fiber.requestCancel(reason: stopReason);
-      listenFiber(fiber, (exit) {
+      fiber.onExit((exit) {
         active.remove(index);
         exits[index] = exit;
         final completion = _Completion(
@@ -229,7 +229,7 @@ final class _Run<A, T, E> {
         final keepCause = !defectsOnly && include(completion);
         final keepDefects =
             defectsOnly || mode != _Mode.settled || stopping || keepCause;
-        final sources = Map<CauseDefect, List<FailureEvent>>.identity();
+        final sources = Map<Cause<Object?>, List<FailureEvent>>.identity();
         for (final event in completion.result.events.reversed) {
           (sources[event.cause] ??= []).add(event);
         }
@@ -249,7 +249,12 @@ final class _Run<A, T, E> {
                 reasons.add(Cause.cancelled(reason));
               }
             case CauseFailure(:final error):
-              if (keepCause) reasons.add(Cause<F>.failure(error as F));
+              if (!keepCause) continue;
+              final event = sources[reason]!.removeLast();
+              if (!seen.add(event.source)) continue;
+              final mapped = Cause<F>.failure(error as F);
+              reasons.add(mapped);
+              events.add(FailureEvent(mapped, event.source));
             case CauseGroup():
               throw StateError('Cause groups must be flat.');
           }
@@ -263,7 +268,9 @@ final class _Run<A, T, E> {
       List.unmodifiable(events),
       pendingFailures: reasons.isEmpty && mode == _Mode.settled && !defectsOnly
           ? List.unmodifiable([
-              for (final completion in completed) ...completion.result.events,
+              for (final completion in completed)
+                for (final event in completion.result.events)
+                  if (event.cause is CauseDefect) event,
             ])
           : const [],
     );

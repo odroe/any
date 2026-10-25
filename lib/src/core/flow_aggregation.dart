@@ -312,7 +312,7 @@ final class _TimedAggregation<T, E> {
         inheritHost: true,
       ).map((fiber) {
         _active = fiber;
-        listenFiber(fiber, (exit) {
+        fiber.onExit((exit) {
           _active = null;
           final result = TaskEvaluation(
             exit,
@@ -459,7 +459,10 @@ final class _TimedAggregation<T, E> {
           causes.isEmpty
               ? const Exit.success(null)
               : Exit.failure(Cause.combine(causes)),
-          _failure?.events ?? const [],
+          [
+            for (final event in _failure?.events ?? const <FailureEvent>[])
+              if (event.cause is CauseDefect) event,
+          ],
           cleanupCancellations: [
             for (final cause in causes)
               if (cause is CauseCancelled && cleanups.remove(cause)) cause,

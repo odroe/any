@@ -203,7 +203,7 @@ final class _Readers<E> {
             input.fiber = fiber;
             _active.add(fiber);
             if (stopping) fiber.requestCancel(reason: _stopReason);
-            listenFiber(fiber, (exit) {
+            fiber.onExit((exit) {
               input.fiber = null;
               _active.remove(fiber);
               if (exit is ExitFailure<void, E>) {
@@ -284,13 +284,13 @@ final class _Readers<E> {
     final causes = <Cause<F>>[];
     final events = <FailureEvent>[];
     final cleanupCancellations = <CauseCancelled>[];
-    final seen = <Object>{};
+    final seen = <FailureSource>{};
     for (final failure in _failures) {
       final result = failure.result;
       final cancellations = [...failure.explicitCancellation];
       final cleanups = [...result.cleanupCancellations];
       if (result.exit case ExitFailure(:final cause)) {
-        final sources = Map<CauseDefect, Queue<FailureEvent>>.identity();
+        final sources = Map<Cause<Object?>, Queue<FailureEvent>>.identity();
         for (final event in result.events) {
           (sources[event.cause] ??= Queue()).addLast(event);
         }
@@ -303,7 +303,12 @@ final class _Readers<E> {
                 events.add(event);
               }
             case CauseFailure(:final error):
-              if (!defectsOnly) causes.add(Cause.failure(error as F));
+              final event = sources[reason]!.removeFirst();
+              if (!defectsOnly && seen.add(event.source)) {
+                final failure = Cause.failure(error as F);
+                causes.add(failure);
+                events.add(FailureEvent(failure, event.source));
+              }
             case CauseCancelled():
               if ((!defectsOnly ||
                       (!_failureDelivered && cancellations.remove(reason))) &&

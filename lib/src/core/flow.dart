@@ -790,14 +790,14 @@ final class _StreamSource<T> {
   }
 
   void _fault(Object error, StackTrace stackTrace) {
-    _faults.add(FailureEvent(CauseDefect(error, stackTrace), Object()));
+    _faults.add(FailureEvent(CauseDefect(error, stackTrace), FailureSource()));
     _ended = true;
   }
 
   Task<A, Never> _failure<A>() => taskFromEvaluation(
     TaskEvaluation(
       Exit<A, Never>.failure(
-        Cause.combine(_faults.map((event) => event.cause)),
+        Cause.combine(_faults.map((event) => event.cause as CauseDefect)),
       ),
       List.unmodifiable(_faults),
     ),
@@ -1048,7 +1048,7 @@ final class _Buffered<T, E> {
         inheritHost: true,
       ).withError<E>().flatMap((fiber) {
         _driver = fiber;
-        listenFiber(fiber, (exit) {
+        fiber.onExit((exit) {
           _terminal = TaskEvaluation(
             exit,
             fiberFailureEvents(fiber),
@@ -1182,7 +1182,10 @@ final class _Buffered<T, E> {
     _stop();
     _current = null;
     _values.clear();
-    final events = _terminal?.events ?? const <FailureEvent>[];
+    final events = [
+      for (final event in _terminal?.events ?? const <FailureEvent>[])
+        if (event.cause is CauseDefect) event,
+    ];
     final cancellations = [..._explicitCancellation];
     final cleanups = [...?_terminal?.cleanupCancellations];
     final causes = <Cause<Never>>[];
@@ -1291,7 +1294,7 @@ final class _ConcurrentMap<T, U, E> {
         inheritHost: true,
       ).withError<E>().flatMap((fiber) {
         _driver = fiber;
-        listenFiber(fiber, (exit) {
+        fiber.onExit((exit) {
           _driverDone = true;
           if (exit is ExitFailure<void, E>) {
             _recordFailure(fiber, exit, cancellations);
@@ -1401,7 +1404,7 @@ final class _ConcurrentMap<T, U, E> {
             ).withError<E>().flatMap((fiber) {
               _active.add(fiber);
               if (_stopping) fiber.requestCancel(reason: _stopReason);
-              listenFiber(fiber, (exit) {
+              fiber.onExit((exit) {
                 _active.remove(fiber);
                 final result = TaskEvaluation(
                   exit,
@@ -1514,13 +1517,13 @@ final class _ConcurrentMap<T, U, E> {
     final causes = <Cause<F>>[];
     final events = <FailureEvent>[];
     final cleanupCancellations = <CauseCancelled>[];
-    final seen = <Object>{};
+    final seen = <FailureSource>{};
     for (final failure in _failures) {
       final result = failure.result;
       final cancellations = [...failure.cancellations];
       final cleanups = [...result.cleanupCancellations];
       if (result.exit case ExitFailure(:final cause)) {
-        final sources = Map<CauseDefect, Queue<FailureEvent>>.identity();
+        final sources = Map<Cause<Object?>, Queue<FailureEvent>>.identity();
         for (final event in result.events) {
           (sources[event.cause] ??= Queue()).addLast(event);
         }
@@ -1533,7 +1536,12 @@ final class _ConcurrentMap<T, U, E> {
                 events.add(event);
               }
             case CauseFailure(:final error):
-              if (!defectsOnly) causes.add(Cause.failure(error as F));
+              final event = sources[reason]!.removeFirst();
+              if (!defectsOnly && seen.add(event.source)) {
+                final failure = Cause.failure(error as F);
+                causes.add(failure);
+                events.add(FailureEvent(failure, event.source));
+              }
             case CauseCancelled():
               if ((!defectsOnly ||
                       (!_failureDelivered && cancellations.remove(reason))) &&

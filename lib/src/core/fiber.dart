@@ -4,6 +4,7 @@ import 'cancellation.dart';
 import 'cause.dart';
 import 'context.dart';
 import 'exit.dart';
+import 'internal/completion.dart';
 import 'internal/execution_mode.dart';
 import 'option.dart';
 import 'scope.dart';
@@ -25,45 +26,55 @@ import 'task_local.dart';
 /// more than once. Cancelling a waiter leaves the fiber running; use [cancel] to
 /// stop it and wait, or [requestCancel] to request cancellation without waiting.
 final class Fiber<T, E> {
-  Fiber._(this._scope, this._report);
+  Fiber._(this._scope, this._report, this._reportFailure);
 
   final Scope _scope;
   final void Function(Cause<Object?>) _report;
   final _controller = CancellationController();
-  final _completion = Completer<Exit<T, E>>();
-  final _listeners = <Object, void Function(Exit<T, E>)>{};
+  final _completion = Completion<Exit<T, E>>();
   final _zone = Zone.current;
   late final List<FailureEvent> _finalEvents;
   late final List<CauseCancelled> _cleanupCancellations;
-  Exit<T, E>? _exit;
+  Exit<T, E>? get _exit => _completion.value;
   var _active = true;
-  var _observed = false;
-  var _pendingObservations = 0;
-  var _reportReady = false;
-  var _defectsHandledByOwner = false;
+  bool _reportFailure;
+  var _cleanupOwned = false;
 
   /// Returns the completed exit, or [OptionNone] if the fiber is still running.
   ///
-  /// A fiber remains running until its cleanup finishes. Returning [OptionSome]
-  /// counts as observing the result for unhandled-failure reporting.
-  Option<Exit<T, E>> poll() {
-    final exit = _exit;
-    if (exit == null) return const Option.none();
-    _observed = true;
-    return Option.some(exit);
-  }
+  /// Completion includes owned cleanup. Polling does not change how the
+  /// execution's owner propagates or reports failures.
+  Option<Exit<T, E>> poll() => switch (_exit) {
+    null => const Option.none(),
+    final exit => Option.some(exit),
+  };
+
+  /// Calls [listener] once when execution and owned cleanup have finished.
+  ///
+  /// If this fiber has already completed, the callback runs immediately. The
+  /// returned function removes only this registration and can be called more
+  /// than once; it does not cancel the fiber.
+  ///
+  /// Callbacks run in their registration [Zone]. A callback exception is reported
+  /// to that zone without changing the exit or preventing other callbacks. Like
+  /// [poll], listening does not change the owner's failure handling.
+  ///
+  /// ```dart
+  /// final stopWatching = fiber.onExit((exit) => print(exit));
+  /// // Remove this listener when its UI or observer no longer needs updates.
+  /// stopWatching();
+  /// ```
+  void Function() onExit(void Function(Exit<T, E>) listener) =>
+      _completion.listen(listener);
 
   /// Returns a task that waits for this fiber's value or failure as an [Exit].
   ///
-  /// Cancelling the wait leaves the fiber running and does not mark an undelivered
-  /// result as observed. The result is observed when a continuation receives it
-  /// or the waiting execution returns it. Waiting on oneself, or on work that
-  /// must wait for the caller, fails with a [StateError] defect instead of
-  /// deadlocking.
+  /// Cancelling the wait leaves the fiber and its resource leases running.
+  /// Waiting does not change the execution owner's failure reporting. Use
+  /// [cancel] to stop the target itself.
   ///
-  /// The target's owner retains its work and resource leases after a waiter
-  /// cancels. An undelivered failure remains eligible for the owner's unhandled-
-  /// failure reporting. Use [cancel] to stop the target itself.
+  /// Waiting on oneself, or on work that must wait for the caller, fails with a
+  /// [StateError] defect instead of deadlocking.
   Task<Exit<T, E>, Never> awaitExit() => awaitFiberTask(this);
 
   /// Returns a task that waits for this fiber and adopts its value or failure.
@@ -88,58 +99,40 @@ final class Fiber<T, E> {
   Task<Exit<T, E>, Never> cancel({Object? reason}) =>
       awaitFiberTask(this, cancel: true, reason: reason);
 
-  void Function() _listen(
-    void Function(Exit<T, E>) listener, {
-    required bool observe,
-  }) {
-    void notify(Exit<T, E> exit) {
-      if (observe) _observed = true;
-      listener(exit);
-    }
-
-    final exit = _exit;
-    if (exit != null) {
-      notify(exit);
-      return () {};
-    }
-    final token = Object();
-    _listeners[token] = Zone.current.bindUnaryCallbackGuarded(notify);
-    return () => _listeners.remove(token);
-  }
-
   void _finish(TaskEvaluation<T, E> result) {
-    final exit = result.exit;
     _finalEvents = result.events;
     _cleanupCancellations = result.cleanupCancellations;
     _active = false;
-    _exit = exit;
-    _completion.complete(exit);
-    for (final token in _listeners.keys.toList()) {
-      final listener = _listeners.remove(token);
-      if (listener != null) listener(exit);
-    }
-
-    if (exit case ExitFailure(:final cause)) {
-      final reasons = _reasons(cause);
-      if (!reasons.any((reason) => reason is! CauseCancelled)) return;
-      _zone.run(() {
-        Timer.run(() {
-          _reportReady = true;
-          _reportUnhandled();
-        });
-      });
+    _completion.complete(result.exit);
+    if (_reportFailure && _finalEvents.isNotEmpty) {
+      _zone.run(() => Timer.run(_reportIndependentFailure));
     }
   }
 
-  void _reportUnhandled() {
-    if (!_reportReady || _observed || _pendingObservations != 0) return;
-    _reportReady = false;
-    final reasons = _reasons((_exit as ExitFailure<T, E>).cause);
-    final unhandled = _defectsHandledByOwner
-        ? reasons.whereType<CauseFailure<E>>().toList()
-        : reasons;
-    if (unhandled.isEmpty) return;
-    _zone.runGuarded(() => _report(Cause.combine(unhandled)));
+  void _reportIndependentFailure() {
+    final failures = <Cause<Object?>>[];
+    final events = _finalEvents.iterator;
+    final cause = (_exit as ExitFailure<T, E>).cause;
+    var hasFailure = false;
+    for (final reason in switch (cause) {
+      CauseGroup(:final causes) => causes,
+      _ => [cause],
+    }) {
+      if (reason is CauseCancelled) {
+        if (!_cleanupOwned) failures.add(reason);
+        continue;
+      }
+      events.moveNext();
+      final event = events.current;
+      // Scope shutdown receives cleanup defects through its own result.
+      if (_cleanupOwned && reason is CauseDefect) continue;
+      if (!event.source.reportedTo.add(_report)) continue;
+      hasFailure = true;
+      failures.add(reason);
+    }
+    if (hasFailure) {
+      _zone.runGuarded(() => _report(Cause.combine(failures)));
+    }
   }
 }
 
@@ -160,6 +153,7 @@ Fiber<T, E> startFiber<T, E>(
   required Context context,
   Map<TaskLocal<Object?>, Object?> locals = const {},
   required void Function(Cause<Object?> cause) report,
+  required bool reportFailure,
   bool inheritHost = true,
   bool deferStart = false,
   bool interruptible = true,
@@ -171,6 +165,7 @@ Fiber<T, E> startFiber<T, E>(
   final fiber = Fiber<T, E>._(
     createScope(runtimeId: scopeRuntimeId(owner)),
     report,
+    reportFailure,
   );
   attachScopeFiber(owner, fiber);
   final void Function()? releaseBorrow;
@@ -253,8 +248,9 @@ Fiber<T, E> startFiber<T, E>(
 Fiber<T, E> completedFiber<T, E>(
   Exit<T, E> exit, {
   required void Function(Cause<Object?> cause) report,
+  required bool reportFailure,
 }) {
-  final fiber = Fiber<T, E>._(createScope(), report);
+  final fiber = Fiber<T, E>._(createScope(), report, reportFailure);
   final closing = closeScope(fiber._scope, exit);
   if (closing is Future<Cause<Never>?>) unawaited(closing);
   fiber._finish(TaskEvaluation.fresh(exit));
@@ -277,36 +273,15 @@ List<CauseCancelled> fiberCleanupCancellations(Fiber<Object?, Object?> fiber) =>
 List<Fiber<Object?, Object?>> currentFibers() =>
     Zone.current[_currentFibers] as List<Fiber<Object?, Object?>>? ?? const [];
 
-// Captured exits can defer observation until their consumer accepts delivery.
-void Function() listenFiber<T, E>(
-  Fiber<T, E> fiber,
-  void Function(Exit<T, E> exit) listener, {
-  bool observe = true,
-}) => fiber._listen(listener, observe: observe);
-
-// Delay reporting while an exit is being handed to a cancellable consumer.
-// Commit only when consumed; abandoning the last delivery releases the report.
-void Function(bool) reserveFiberObservation(Fiber<Object?, Object?> fiber) {
-  fiber._pendingObservations++;
-  var pending = true;
-  return (observed) {
-    if (!pending) return;
-    pending = false;
-    if (observed) fiber._observed = true;
-    fiber._pendingObservations--;
-    fiber._reportUnhandled();
-  };
+// Runtime.runSync transfers an unfinished execution to runtime supervision.
+void superviseFiber(Fiber<Object?, Object?> fiber) {
+  fiber._reportFailure = true;
 }
 
-Future<Exit<T, E>> fiberCompletion<T, E>(
-  Fiber<T, E> fiber, {
-  bool observe = true,
-}) {
-  if (!observe) return fiber._completion.future;
-  return fiber._completion.future.then((exit) {
-    fiber._observed = true;
-    return exit;
-  });
+Future<Exit<T, E>> fiberCompletion<T, E>(Fiber<T, E> fiber) {
+  final completion = Completer<Exit<T, E>>();
+  fiber.onExit(completion.complete);
+  return completion.future;
 }
 
 // Stops owned work and retains defects without converting business failures.
@@ -314,21 +289,25 @@ FutureOr<List<FailureEvent>> stopFiber(
   Fiber<Object?, Object?> fiber, {
   Object? reason,
 }) {
-  fiber._defectsHandledByOwner = true;
+  fiber._cleanupOwned = true;
   fiber.requestCancel(reason: reason);
-  if (fiber._exit != null) return fiber._finalEvents;
-  return fiberCompletion(fiber, observe: false).then((_) => fiber._finalEvents);
+  List<FailureEvent> defects() => [
+    for (final event in fiber._finalEvents)
+      if (event.cause is CauseDefect) event,
+  ];
+  if (fiber._exit != null) return defects();
+  return fiberCompletion(fiber).then((_) => defects());
 }
 
-// One defect occurrence retained across internal ownership boundaries.
+// One failure occurrence retained across execution and ownership boundaries.
 final class FailureEvent {
   const FailureEvent(this.cause, this.source);
 
-  final CauseDefect cause;
-  final Object source;
+  final Cause<Object?> cause;
+  final FailureSource source;
 }
 
-List<Cause<E>> _reasons<E>(Cause<E> cause) => switch (cause) {
-  CauseGroup(:final causes) => causes,
-  _ => [cause],
-};
+// Only explicit reporting marks an occurrence. Reads and listeners never do.
+final class FailureSource {
+  final reportedTo = <void Function(Cause<Object?>)>{};
+}
