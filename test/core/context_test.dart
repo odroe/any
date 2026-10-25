@@ -72,26 +72,12 @@ void main() {
       expect(context.read(count), 7);
     });
 
-    test('rejects duplicate keys, including identical bindings', () {
+    test('the last binding wins, including identical bindings', () {
       final count = ServiceKey<int>('count');
       final binding = count.bind(7);
 
-      expect(
-        () => Context.from([binding, binding]),
-        throwsA(
-          isA<DuplicateService>()
-              .having((error) => error.key, 'key', same(count))
-              .having(
-                (error) => error.toString(),
-                'diagnostic',
-                contains('count'),
-              ),
-        ),
-      );
-      expect(
-        () => Context.from([binding, count.bind(9)]),
-        throwsA(isA<DuplicateService>()),
-      );
+      expect(Context.from([binding, binding]).read(count), 7);
+      expect(Context.from([binding, count.bind(9)]).read(count), 9);
     });
   });
 
@@ -162,21 +148,14 @@ void main() {
       expect(second.find(count), isA<OptionNone<int>>());
     });
 
-    test('rejects overlapping keys without changing either input', () {
+    test('the right binding wins without changing either input', () {
       final count = ServiceKey<int>('count');
       final first = Context.from([count.bind(7)]);
       final second = Context.from([count.bind(9)]);
 
-      expect(
-        () => first.merge(second),
-        throwsA(
-          isA<DuplicateService>().having(
-            (error) => error.key,
-            'key',
-            same(count),
-          ),
-        ),
-      );
+      expect(first.merge(second).read(count), 9);
+      expect(second.merge(first).read(count), 7);
+      expect(first.merge(first).read(count), 7);
       expect(first.read(count), 7);
       expect(second.read(count), 9);
     });
@@ -191,13 +170,13 @@ void main() {
     });
   });
 
-  group('replace', () {
+  group('add', () {
     test('changes only the named binding in a new context', () {
       final count = ServiceKey<int>('count');
       final other = ServiceKey<int>('other');
       final original = Context.from([count.bind(7), other.bind(11)]);
 
-      final replaced = original.replace(count.bind(9));
+      final replaced = original.add(count.bind(9));
 
       expect(replaced.read(count), 9);
       expect(replaced.read(other), 11);
@@ -208,27 +187,35 @@ void main() {
       final label = ServiceKey<String?>('label');
       final original = Context.from([label.bind(null)]);
 
-      final replaced = original.replace(label.bind('example'));
+      final replaced = original.add(label.bind('example'));
 
       expect(replaced.read(label), 'example');
       expect(original.read(label), isNull);
     });
 
-    test('rejects a missing key', () {
+    test('inserts a missing key without changing the input', () {
       final count = ServiceKey<int>('count');
       final context = Context.from([]);
 
-      expect(
-        () => context.replace(count.bind(7)),
-        throwsA(
-          isA<MissingService>().having(
-            (error) => error.key,
-            'key',
-            same(count),
-          ),
-        ),
-      );
+      expect(context.add(count.bind(7)).read(count), 7);
       expect(context.find(count), isA<OptionNone<int>>());
     });
+  });
+
+  test('a later null binding replaces the value in every combination', () {
+    final label = ServiceKey<String?>('label');
+    final original = Context.from([label.bind('original')]);
+    final emptyValue = label.bind(null);
+    final contexts = [
+      Context.from([label.bind('original'), emptyValue]),
+      original.merge(Context.from([emptyValue])),
+      original.add(emptyValue),
+    ];
+
+    for (final context in contexts) {
+      expect(context.read(label), isNull);
+      expect(context.find(label), isA<OptionSome<String?>>());
+    }
+    expect(original.read(label), 'original');
   });
 }

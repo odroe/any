@@ -529,30 +529,79 @@ void main() {
     expect(stopped, isTrue);
   });
 
-  test('parallel duplicate detection follows declaration order after out-of-order builds', () async {
-    final first = ServiceKey<int>('first duplicate');
-    final second = ServiceKey<int>('second duplicate');
-    final gate = Completer<int>();
-    final layers = [
-      first.layer(
-        Task.fromFuture(
-          () => gate.future,
-          onError: (e, s) => Error.throwWithStackTrace(e, s),
+  test(
+    'parallel replacement follows declaration order after out-of-order builds',
+    () async {
+      final key = ServiceKey<int>('service');
+      final gate = Completer<int>();
+      final laterCompleted = Completer<void>();
+      final completionOrder = <int>[];
+      final layers = [
+        key.layer(
+          Task.fromFuture(
+            () => gate.future,
+            onError: (e, s) => Error.throwWithStackTrace(e, s),
+          ).map((value) {
+            completionOrder.add(value);
+            return value;
+          }),
         ),
-      ),
-      Layer.value(first.bind(2)),
-      Layer.value(second.bind(1)),
-      Layer.value(second.bind(2)),
-    ];
-    final opening = Runtime.create(
-      Layer.mergeAll(layers, concurrency: 4),
-      onUnhandledError: reports.add,
-    );
-    await _turn();
-    gate.complete(1);
-    final errors = _reasons(_cause(await opening)).whereType<CauseDefect>();
-    expect((errors.single.error as DuplicateService).key, same(first));
-  });
+        key.layer(
+          Task.sync(() {
+            completionOrder.add(2);
+            laterCompleted.complete();
+            return 2;
+          }),
+        ),
+      ];
+      final opening = Runtime.create(
+        Layer.mergeAll(layers, concurrency: 2),
+        onUnhandledError: reports.add,
+      );
+      await laterCompleted.future;
+      expect(completionOrder, [2]);
+      gate.complete(1);
+      final runtime = _value(await opening);
+      expect(completionOrder, [2, 1]);
+      expect(_value(await runtime.run(Task.service(key))), 2);
+      await runtime.close();
+    },
+  );
+
+  test(
+    'a later successful output cannot hide an earlier branch failure',
+    () async {
+      final key = ServiceKey<int>('service');
+      final gate = Completer<void>();
+      final laterCompleted = Completer<void>();
+      var released = false;
+      final failed = key.layer(
+        Task.fromFuture<void, String>(
+          () => gate.future,
+          onError: Error.throwWithStackTrace,
+        ).flatMap((_) => Task.fail('earlier build failed')),
+      );
+      final replacement = key.layer(
+        Task.acquireRelease(
+          Task.sync(() {
+            laterCompleted.complete();
+            return 2;
+          }),
+          release: (_, _) => Task.sync(() => released = true),
+        ),
+      );
+      final opening = Runtime.create(
+        failed.merge(replacement, concurrency: 2),
+        onUnhandledError: reports.add,
+      );
+      await laterCompleted.future;
+      expect(released, isFalse);
+      gate.complete();
+      final cause = _cause(await opening) as CauseFailure<String>;
+      expect(cause.error, 'earlier build failed');
+      expect(released, isTrue);
+    },
+  );
 }
 
 T _value<T, E>(Exit<T, E> exit) => switch (exit) {

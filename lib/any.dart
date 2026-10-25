@@ -18,7 +18,7 @@ export 'src/core/config.dart' show Config, ConfigOperations;
 export 'src/core/config_provider.dart'
     show ConfigProvider, ConfigError, ConfigIssue, ConfigIssueKind;
 export 'src/core/context.dart'
-    show ServiceKey, ServiceBinding, Context, MissingService, DuplicateService;
+    show ServiceKey, ServiceBinding, Context, MissingService;
 export 'src/core/deferred.dart' show Deferred;
 export 'src/core/exit.dart' show Exit, ExitSuccess, ExitFailure, ExitMapping;
 export 'src/core/fiber.dart' show Fiber;

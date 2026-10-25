@@ -1173,7 +1173,7 @@ FutureOr<_EvaluationResult<T, E>> _evaluate<T, E>(
               evaluating = false;
             case _ProvideContext(:final source, :final context):
               frames.add(_Frame(context: currentContext));
-              currentContext = overlayContexts(currentContext, context);
+              currentContext = currentContext.merge(context);
               current = source;
             case _Fork(:final start):
               if (fiber == null) {
