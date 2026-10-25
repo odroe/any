@@ -321,7 +321,9 @@ FutureOr<void> _closeClaimed(
 
   void recordEvents(Scope scope, Iterable<FailureEvent> events) {
     for (final event in events) {
-      _record(scope, event.cause, owner, source: event.source);
+      if (event.cause case final CauseDefect cause) {
+        _record(scope, cause, owner, source: event.source);
+      }
     }
   }
 
@@ -468,7 +470,7 @@ void _recordEvaluation(
     };
     final defects = result.events.iterator;
     for (final reason in reasons) {
-      Object? source;
+      FailureSource? source;
       if (reason is CauseDefect) {
         defects.moveNext();
         source = defects.current.source;
@@ -480,7 +482,12 @@ void _recordEvaluation(
 
 // Record each cleanup event once in every ancestor owned by the same close.
 // Child completion does not merge the same cause into those ancestors again.
-void _record(Scope scope, Cause<Never> cause, Object owner, {Object? source}) {
+void _record(
+  Scope scope,
+  Cause<Never> cause,
+  Object owner, {
+  FailureSource? source,
+}) {
   final events = switch (cause) {
     CauseGroup(:final causes) => [
       for (final item in causes) _CleanupEvent(item),
@@ -540,13 +547,14 @@ final class _Closing {
   FutureOr<Cause<Never>?> get result =>
       completion.isCompleted ? cause : completion.future;
   final events = <_CleanupEvent>[];
-  final sources = <Object>{};
+  final sources = <FailureSource>{};
 }
 
 final class _CleanupEvent {
-  _CleanupEvent(this.cause, [Object? source]) : source = source ?? Object();
+  _CleanupEvent(this.cause, [FailureSource? source])
+    : source = source ?? FailureSource();
   final Cause<Never> cause;
-  final Object source;
+  final FailureSource source;
 }
 
 final class _Finalizer {

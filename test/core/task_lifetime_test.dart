@@ -347,6 +347,9 @@ void main() {
   );
 
   test('borrowed child and lexical cleanup failures remain distinct', () async {
+    final reports = <Cause<Object?>>[];
+    final runtime = Runtime(onUnhandledError: reports.add);
+    addTearDown(runtime.close);
     final ready = Completer<Scope>();
     final started = Completer<void>();
     final defect = Cause<Never>.defect(Object(), StackTrace.current);
@@ -376,6 +379,11 @@ void main() {
     final causes = (result.cause as CauseGroup).causes;
     expect(causes.whereType<CauseCancelled>(), hasLength(1));
     expect(causes.whereType<CauseDefect>(), [same(defect), same(defect)]);
+    await Future<void>.delayed(Duration.zero);
+    expect((reports.single as CauseGroup).causes.whereType<CauseDefect>(), [
+      same(defect),
+      same(defect),
+    ]);
   });
 
   test(

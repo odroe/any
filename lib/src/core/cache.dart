@@ -196,7 +196,7 @@ final class Cache<K, V, E> {
         .map((fiber) {
           entry.fiber = fiber;
           if (entry.cancelling) fiber.requestCancel(reason: entry.stopReason);
-          listenFiber(fiber, (exit) {
+          fiber.onExit((exit) {
             _finish(entry, TaskEvaluation(exit, fiberFailureEvents(fiber)));
           });
         })
@@ -225,7 +225,7 @@ final class Cache<K, V, E> {
             ExitFailure(:final cause) => Cause.combine([cause, defect]),
             _ => defect,
           }),
-          [...result.events, FailureEvent(defect, Object())],
+          [...result.events, FailureEvent(defect, FailureSource())],
         );
         keep = false;
       }
@@ -319,7 +319,10 @@ final class Cache<K, V, E> {
           cleanup.isEmpty
               ? const Exit.success(null)
               : Exit.failure(Cause.combine(cleanup)),
-          result.events,
+          [
+            for (final event in result.events)
+              if (event.cause is CauseDefect) event,
+          ],
         ),
       );
     });

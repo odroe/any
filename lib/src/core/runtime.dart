@@ -53,8 +53,10 @@ final class Runtime {
   /// logging, tracing, and metrics default to no-ops. Supplied service objects keep
   /// their caller-managed lifetime.
   ///
-  /// [onUnhandledError] receives business failures and defects that remain
-  /// unobserved on the next event-loop turn. Each failure is reported once;
+  /// [onUnhandledError] receives independent failures from [start] and public
+  /// forks on the next event-loop turn. Reading their results does not suppress
+  /// reporting. [run] and synchronous results go directly to their caller. Each
+  /// failure occurrence is reported once;
   /// cancellation alone is not reported. Without a handler, a [TaskException]
   /// is reported to the creating [Zone]. Exceptions thrown by the handler are
   /// also reported to that zone and cannot interrupt cleanup.
@@ -110,8 +112,9 @@ final class Runtime {
       context: context,
       onUnhandledError: onUnhandledError,
     );
-    final building = runtime.start(
+    final building = runtime._start(
       buildLayer(services, runtime._scope),
+      reportFailure: false,
       signal: signal,
     );
     final unsubscribe = signal?.onCancel((reason) {
@@ -147,8 +150,9 @@ final class Runtime {
   /// Starts [task] and returns a handle to its independent execution.
   ///
   /// [signal] can cancel this execution without affecting other roots. The fiber
-  /// completes after its child work and resource cleanup. Observe its result with
-  /// [Fiber.join], [Fiber.awaitExit], or [Fiber.poll] to handle failures directly.
+  /// completes after its child work and resource cleanup. Failures go to this
+  /// runtime's handler, independently of [Fiber.onExit], [Fiber.poll], or waiting
+  /// for the result. Use [run] to receive a result without a background report.
   ///
   /// To let a page stop waiting without cancelling native work, pass the page's
   /// signal to a separate [run] of [Fiber.join]. Acquire leases inside the owned
@@ -188,12 +192,13 @@ final class Runtime {
   /// A closing or closed runtime returns a completed fiber with a [RuntimeClosed]
   /// defect; the task does not start.
   Fiber<T, E> start<T, E>(Task<T, E> task, {CancellationSignal? signal}) =>
-      _start(task, signal: signal);
+      _start(task, signal: signal, reportFailure: true);
 
   Fiber<T, E> _start<T, E>(
     Task<T, E> task, {
     CancellationSignal? signal,
     ExecutionMode? mode,
+    required bool reportFailure,
   }) {
     if (_closing != null) {
       return completedFiber(
@@ -201,12 +206,14 @@ final class Runtime {
           Cause.defect(const RuntimeClosed(), StackTrace.current),
         ),
         report: _report,
+        reportFailure: reportFailure,
       );
     }
     return startFiber(
       task,
       owner: _scope,
       report: _report,
+      reportFailure: reportFailure,
       signal: signal,
       context: _context,
       mode: mode,
@@ -215,19 +222,18 @@ final class Runtime {
 
   /// Runs [task] and returns its value or complete failure as an [Exit].
   ///
-  /// The result includes child completion and resource cleanup, and counts as an
-  /// observed fiber result for failure reporting.
+  /// The result includes child completion and resource cleanup. This entry sends
+  /// the result to its caller without also reporting it as a background failure.
   ///
   /// [signal] cancels only this execution. An already cancelled signal prevents
   /// the task from starting. Cancellation waits for any in-flight,
   /// non-cancellable [Future] to settle before returning.
   ///
   /// Applying [Future.timeout] to the returned Future does not cancel this task.
-  /// This entry still observes its eventual exit, even if the host abandons that
-  /// Future. Use [start] and a separately cancellable [Fiber.join] when work must
+  /// The eventual exit remains on that Future, even if the host abandons it. Use [start] and a separately cancellable [Fiber.join] when work must
   /// remain supervised after its caller stops waiting.
   Future<Exit<T, E>> run<T, E>(Task<T, E> task, {CancellationSignal? signal}) =>
-      fiberCompletion(start(task, signal: signal));
+      fiberCompletion(_start(task, signal: signal, reportFailure: false));
 
   /// Runs [task] and returns its value, throwing [TaskException] on failure.
   ///
@@ -254,7 +260,8 @@ final class Runtime {
   /// callback that delivers its result during registration can finish synchronously.
   ///
   /// At an asynchronous boundary, cancellation is requested and this runtime
-  /// continues supervising the original execution. The exception's
+  /// continues supervising and reporting failures from the original execution.
+  /// Reading the exception's completion does not change that responsibility. Its
   /// [AsyncTaskException.completion] exposes its eventual exit. Effects already
   /// performed are not repeated or rolled back; cancellation still respects
   /// masks and waits for non-cancellable work and cleanup.
@@ -266,11 +273,12 @@ final class Runtime {
     final mode = ExecutionMode(automaticYield: false);
     final Fiber<T, E> fiber;
     try {
-      fiber = _start(task, signal: signal, mode: mode);
+      fiber = _start(task, signal: signal, mode: mode, reportFailure: false);
     } finally {
       mode.automaticYield = true;
     }
     if (fiber.poll() case OptionSome(:final value)) return value;
+    superviseFiber(fiber);
     fiber.requestCancel();
     throw AsyncTaskException<T, E>._(fiber);
   }
@@ -370,9 +378,8 @@ final class AsyncTaskException<T, E> implements Exception {
 
   /// The original execution's exit after owned work and cleanup finish.
   ///
-  /// Reading this property observes the eventual result for unhandled-failure
-  /// reporting, as [Runtime.run] does. Ignoring the exception leaves reporting
-  /// with its runtime. A non-cancellable operation can delay completion.
+  /// The runtime reports independent failures whether or not this property is
+  /// read. A non-cancellable operation can delay completion.
   Future<Exit<T, E>> get completion => fiberCompletion(_fiber);
 
   @override

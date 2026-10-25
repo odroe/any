@@ -88,7 +88,7 @@ void main() {
       expect((cause.causes.first as CauseFailure<String>).error, 'business');
       expect(cause.causes.last, same(defect));
       await _reportsTurn();
-      expect(reports, isEmpty);
+      expect((reports.single as CauseGroup).causes, hasLength(2));
     },
   );
 
@@ -264,33 +264,36 @@ void main() {
     expect(cause.causes, [same(defect), same(defect)]);
   });
 
-  test('a cancelled waiter neither cancels nor observes its target', () async {
-    late void Function(Exit<int, String>) complete;
-    var targetCancellations = 0;
-    final fiber = runtime.start(
-      Task.fromCallback<int, String>((callback) {
-        complete = callback;
-        return () {
-          targetCancellations++;
-        };
-      }),
-    );
-    final controller = CancellationController();
-    final waiting = runtime.run(fiber.awaitExit(), signal: controller.signal);
-    controller.requestCancel(reason: 'wait only');
+  test(
+    'a cancelled waiter leaves the target and its report route running',
+    () async {
+      late void Function(Exit<int, String>) complete;
+      var targetCancellations = 0;
+      final fiber = runtime.start(
+        Task.fromCallback<int, String>((callback) {
+          complete = callback;
+          return () {
+            targetCancellations++;
+          };
+        }),
+      );
+      final controller = CancellationController();
+      final waiting = runtime.run(fiber.awaitExit(), signal: controller.signal);
+      controller.requestCancel(reason: 'wait only');
 
-    expect((_cause(await waiting) as CauseCancelled).reason, 'wait only');
-    expect(fiber.poll(), isA<OptionNone<Exit<int, String>>>());
-    expect(targetCancellations, 0);
-    complete(const Exit.failure(Cause.failure('unobserved')));
-    await _reportsTurn();
-    expect(reports, hasLength(1));
-    expect((reports.single as CauseFailure<Object?>).error, 'unobserved');
-    expect(targetCancellations, 0);
-  });
+      expect((_cause(await waiting) as CauseCancelled).reason, 'wait only');
+      expect(fiber.poll(), isA<OptionNone<Exit<int, String>>>());
+      expect(targetCancellations, 0);
+      complete(const Exit.failure(Cause.failure('unobserved')));
+      await _reportsTurn();
+      expect(reports, hasLength(1));
+      expect((reports.single as CauseFailure<Object?>).error, 'unobserved');
+      expect(targetCancellations, 0);
+    },
+  );
 
   test(
-    'cancellation during exit handoff leaves its defect unobserved',
+    'cancellation during exit handoff preserves independent reporting',
     () async {
       late void Function(Exit<int, Never>) complete;
       final defect = Cause<Never>.defect(Object(), StackTrace.current);
@@ -331,9 +334,9 @@ void main() {
     },
   );
 
-  for (final completed in [false, true]) {
-    test('cancellation at a yield before exit consumption preserves reporting '
-        '(already completed: $completed)', () async {
+  test(
+    'another waiter can receive an exit without changing reporting',
+    () async {
       late void Function(Exit<int, Never>) complete;
       final defect = Cause<Never>.defect(Object(), StackTrace.current);
       final target = runtime.start(
@@ -342,86 +345,38 @@ void main() {
           return () {};
         }),
       );
-      if (completed) {
-        complete(Exit.failure(defect));
-        await _turn();
-        expect(reports, isEmpty);
-      }
-      var task = target.awaitExit();
-      final context = Context.from(const []);
-      // Put the completed wait immediately before the executor's cooperative
-      // yield, with only environment restoration before the consuming callback.
-      for (var i = 0; i < 2045; i++) {
-        task = task.provideContext(context);
-      }
       final controller = CancellationController();
-      var intercepted = false;
+      var armed = false;
       var received = false;
-      final waiting = runZoned(
+      final cancelled = runZoned(
         () => runtime.run(
-          task.map((_) => received = true),
+          target.awaitExit().map((_) => received = true),
           signal: controller.signal,
         ),
         zoneSpecification: ZoneSpecification(
-          createTimer: (self, parent, zone, duration, callback) {
-            if (!intercepted && duration == Duration.zero) {
-              intercepted = true;
-              controller.requestCancel(reason: 'yield');
+          scheduleMicrotask: (self, parent, zone, callback) {
+            if (armed) {
+              armed = false;
+              controller.requestCancel();
             }
-            return parent.createTimer(zone, duration, callback);
+            parent.scheduleMicrotask(zone, callback);
           },
         ),
       );
-      if (!completed) complete(Exit.failure(defect));
+      final observing = runtime.run(target.awaitExit());
+      armed = true;
+      complete(Exit.failure(defect));
 
-      expect((_cause(await waiting) as CauseCancelled).reason, 'yield');
-      expect(intercepted, isTrue);
+      expect(_cause(await cancelled), isA<CauseCancelled>());
       expect(received, isFalse);
+      expect(_cause(_value(await observing)), same(defect));
       await _reportsTurn();
       expect(reports, [same(defect)]);
-    });
-  }
-
-  test('another waiter can observe an exit abandoned during handoff', () async {
-    late void Function(Exit<int, Never>) complete;
-    final defect = Cause<Never>.defect(Object(), StackTrace.current);
-    final target = runtime.start(
-      Task.fromCallback<int, Never>((callback) {
-        complete = callback;
-        return () {};
-      }),
-    );
-    final controller = CancellationController();
-    var armed = false;
-    var received = false;
-    final cancelled = runZoned(
-      () => runtime.run(
-        target.awaitExit().map((_) => received = true),
-        signal: controller.signal,
-      ),
-      zoneSpecification: ZoneSpecification(
-        scheduleMicrotask: (self, parent, zone, callback) {
-          if (armed) {
-            armed = false;
-            controller.requestCancel();
-          }
-          parent.scheduleMicrotask(zone, callback);
-        },
-      ),
-    );
-    final observing = runtime.run(target.awaitExit());
-    armed = true;
-    complete(Exit.failure(defect));
-
-    expect(_cause(await cancelled), isA<CauseCancelled>());
-    expect(received, isFalse);
-    expect(_cause(_value(await observing)), same(defect));
-    await _reportsTurn();
-    expect(reports, isEmpty);
-  });
+    },
+  );
 
   test(
-    'cancellation after exit consumption keeps the result observed',
+    'cancellation after exit delivery does not suppress reporting',
     () async {
       final defect = Cause<Never>.defect(Object(), StackTrace.current);
       final target = runtime.start(Task.failCause(defect));
@@ -438,7 +393,7 @@ void main() {
       expect(_cause(seen.single), same(defect));
       expect((_cause(exit) as CauseCancelled).reason, 'after consumption');
       await _reportsTurn();
-      expect(reports, isEmpty);
+      expect(reports, [same(defect)]);
     },
   );
 
@@ -474,7 +429,7 @@ void main() {
       expect(cause.causes.whereType<CauseDefect>(), [same(defect)]);
       expect(cause.causes.whereType<CauseCancelled>(), hasLength(1));
       await _reportsTurn();
-      expect(reports, isEmpty);
+      expect(reports, [same(defect)]);
     },
   );
 
@@ -499,7 +454,7 @@ void main() {
       await cleaning.future;
       if (cancel) controller.requestCancel(reason: 'cleanup');
       await _reportsTurn();
-      expect(reports, isEmpty);
+      expect(reports, [same(defect)]);
       cleaned.complete();
 
       final exit = await waiting;
@@ -509,45 +464,8 @@ void main() {
         expect(_cause(_value(exit)), same(defect));
       }
       await _reportsTurn();
-      expect(reports, cancel ? [same(defect)] : isEmpty);
+      expect(reports, [same(defect)]);
     });
-  }
-
-  for (final wrapper in ['scoped', 'exit', 'context', 'local', 'mask']) {
-    test(
-      '$wrapper does not consume an exit before cleanup completes',
-      () async {
-        final defect = Cause<Never>.defect(Object(), StackTrace.current);
-        final target = runtime.start(Task.failCause(defect));
-        final controller = CancellationController();
-        final cleaning = Completer<void>();
-        final cleaned = Completer<void>();
-        addTearDown(() {
-          if (!cleaned.isCompleted) cleaned.complete();
-        });
-        final source = Task.addFinalizer((_) {
-          cleaning.complete();
-          return _future(cleaned.future);
-        }).flatMap((_) => target.awaitExit());
-        final Task<Object?, Never> task = switch (wrapper) {
-          'scoped' => source.scoped(),
-          'exit' => source.exit(),
-          'context' => source.provideContext(Context.from(const [])),
-          'local' => TaskLocal(0).locally(1, source),
-          _ => Task.uninterruptibleMask((restore) => restore(source)),
-        };
-        final waiting = runtime.run(task, signal: controller.signal);
-        await cleaning.future;
-        controller.requestCancel(reason: 'cleanup');
-        await _reportsTurn();
-        expect(reports, isEmpty);
-        cleaned.complete();
-
-        expect((_cause(await waiting) as CauseCancelled).reason, 'cleanup');
-        await _reportsTurn();
-        expect(reports, [same(defect)]);
-      },
-    );
   }
 
   for (final scoped in [false, true]) {
@@ -591,7 +509,7 @@ void main() {
   }
 
   test(
-    'recovering cleanup failure does not observe a discarded exit',
+    'recovering waiter cleanup does not handle the target failure',
     () async {
       final defect = Cause<Never>.defect(Object(), StackTrace.current);
       final cleanup = Cause<Never>.defect(Object(), StackTrace.current);
@@ -940,11 +858,11 @@ void main() {
     expect((_cause(exit) as CauseDefect).error, isA<RuntimeClosed>());
     expect(started, isFalse);
     await _reportsTurn();
-    expect(reports, isEmpty);
+    expect((reports.single as CauseDefect).error, isA<RuntimeClosed>());
   });
 
   test(
-    'unobserved business failures report once without waiting for shutdown',
+    'independent business failures report once without waiting for shutdown',
     () async {
       final fiber = runtime.start(Task.fail('unobserved'));
       await _reportsTurn();
@@ -962,7 +880,7 @@ void main() {
     },
   );
 
-  test('constructing a wait does not count as observing a failure', () async {
+  test('constructing a wait does not change failure reporting', () async {
     final fiber = runtime.start(Task.fail('not executed'));
     fiber.awaitExit();
     fiber.join();
@@ -971,13 +889,16 @@ void main() {
     expect(reports, hasLength(1));
   });
 
-  test('a completed poll suppresses an unhandled failure report', () async {
-    final fiber = runtime.start(Task.fail('observed'));
-    expect(fiber.poll(), isA<OptionSome<Exit<Never, String>>>());
-    await _reportsTurn();
+  test(
+    'a completed poll leaves independent failure reporting unchanged',
+    () async {
+      final fiber = runtime.start(Task.fail('observed'));
+      expect(fiber.poll(), isA<OptionSome<Exit<Never, String>>>());
+      await _reportsTurn();
 
-    expect(reports, isEmpty);
-  });
+      expect((reports.single as CauseFailure<Object?>).error, 'observed');
+    },
+  );
 
   test(
     'cancellation-only exits are not reported as unhandled errors',
@@ -992,7 +913,7 @@ void main() {
   );
 
   test(
-    'owner shutdown handles defects while retaining unobserved business errors',
+    'owner shutdown receives defects while business failures are reported',
     () async {
       final gate = Completer<void>();
       addTearDown(() {

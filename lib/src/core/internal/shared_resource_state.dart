@@ -119,10 +119,11 @@ final class SharedResourceState<K, T, E> {
         context: _environment.context,
         locals: _environment.locals,
         report: _environment.report,
+        reportFailure: false,
         inheritHost: false,
         deferStart: true,
       );
-      listenFiber(fiber, (exit) {
+      fiber.onExit((exit) {
         _loaded(generation, TaskEvaluation(exit, fiberFailureEvents(fiber)));
       });
     } catch (error, stackTrace) {
@@ -159,7 +160,7 @@ final class SharedResourceState<K, T, E> {
       return true;
     } catch (error, stackTrace) {
       generation.faults.add(
-        FailureEvent(CauseDefect(error, stackTrace), Object()),
+        FailureEvent(CauseDefect(error, stackTrace), FailureSource()),
       );
       return false;
     }
@@ -250,7 +251,7 @@ final class SharedResourceState<K, T, E> {
       return Task.succeed(null);
     } catch (error, stackTrace) {
       generation.faults.add(
-        FailureEvent(CauseDefect(error, stackTrace), Object()),
+        FailureEvent(CauseDefect(error, stackTrace), FailureSource()),
       );
       return _await(_beginClose(generation, exit));
     }
@@ -428,12 +429,14 @@ TaskEvaluation<void, Never> _defects(Iterable<FailureEvent> events) {
   final seen = <Object>{};
   final unique = [
     for (final event in events)
-      if (seen.add(event.source)) event,
+      if (event.cause is CauseDefect && seen.add(event.source)) event,
   ];
   return TaskEvaluation(
     unique.isEmpty
         ? const Exit.success(null)
-        : Exit.failure(Cause.combine(unique.map((event) => event.cause))),
+        : Exit.failure(
+            Cause.combine(unique.map((event) => event.cause as CauseDefect)),
+          ),
     unique,
   );
 }

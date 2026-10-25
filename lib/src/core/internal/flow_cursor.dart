@@ -102,10 +102,10 @@ TaskEvaluation<void, Never> mergeFlowEvaluations(
   final causes = <Cause<Never>>[];
   final events = <FailureEvent>[];
   final cleanupCancellations = <CauseCancelled>[];
-  final seen = <Object>{};
+  final seen = <FailureSource>{};
   for (final result in results) {
     if (result.exit case ExitFailure(:final cause)) {
-      final sources = Map<CauseDefect, Queue<FailureEvent>>.identity();
+      final sources = Map<Cause<Object?>, Queue<FailureEvent>>.identity();
       for (final event in result.events) {
         (sources[event.cause] ??= Queue()).addLast(event);
       }

@@ -105,7 +105,7 @@ final class _SharedFlow<T, E> {
   final _subscriptions = <_SharedSubscription<T, E>>{};
   final _waiting = <void Function()>{};
   final _failures = <_SharedFailure<E>>[];
-  final _defects = <Object>{};
+  final _failureSources = <FailureSource>{};
   late final FlowProducer _lifetime;
   late final void Function() _removeResources;
   late final void Function() _removeWork;
@@ -195,10 +195,11 @@ final class _SharedFlow<T, E> {
       context: environment.context,
       locals: environment.locals,
       report: environment.report,
+      reportFailure: false,
       inheritHost: false,
       deferStart: true,
     );
-    listenFiber(_driver!, (exit) => unawaited(_driverEnded(exit)));
+    _driver!.onExit((exit) => unawaited(_driverEnded(exit)));
   }
 
   Future<void> _driverEnded(Exit<void, E> exit) async {
@@ -292,10 +293,10 @@ final class _SharedFlow<T, E> {
       var removedStop = false;
       for (final cause in _causes(cause)) {
         FailureEvent? event;
-        if (cause is CauseDefect) {
+        if (cause is CauseFailure || cause is CauseDefect) {
           events.moveNext();
           event = events.current;
-          if (!_defects.add(event.source)) continue;
+          if (!_failureSources.add(event.source)) continue;
         }
         if (stop &&
             !removedStop &&

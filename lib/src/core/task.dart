@@ -502,17 +502,19 @@ extension TaskOperations<T, E> on Task<T, E> {
   /// resources available to the parent. Parent completion cancels and waits for
   /// unfinished children; closing the borrowed scope also stops them first.
   ///
-  /// Use [Fiber.join] to propagate the child's value or business failure. An
-  /// unobserved failure is reported by the runtime; starting a child does not by
-  /// itself make its business failure the parent's result.
-  Task<Fiber<T, E>, Never> fork() => forkTask(this);
+  /// Use [Fiber.join] to propagate the child's value or failure. The runtime
+  /// reports independent failures even if the result is read or joined; starting
+  /// a child does not by itself make its business failure the parent's result.
+  /// Owning combinators such as [Task.all] receive their workers' results directly.
+  Task<Fiber<T, E>, Never> fork() => forkTask(this, reportFailure: true);
 
   /// Starts a fiber whose lifetime belongs to an explicit [scope].
   ///
   /// Use this when the owner should outlive the task that starts the fiber. The
   /// scope must be open and belong to the same runtime. New resources belong to
   /// that scope; closing it cancels the fiber before releasing them.
-  /// Cancellation of the creating task does not cancel the fiber.
+  /// Cancellation of the creating task does not cancel the fiber. Independent
+  /// failures are reported as with [fork], regardless of listeners or reads.
   /// Captured objects and service bindings retain their original lifetimes.
   ///
   /// A shorter-lived caller can wait with [Fiber.join] and cancel only its wait.
@@ -535,6 +537,7 @@ extension TaskOperations<T, E> on Task<T, E> {
         context: context,
         locals: locals,
         report: fiberReport(parent),
+        reportFailure: true,
         mode: mode,
       );
     }),
@@ -610,6 +613,7 @@ extension TaskOperations<T, E> on Task<T, E> {
           _mapErrors(cause, (error) => transform(error as E), signal),
           events,
           cleanups,
+          preserveOrder: true,
         ),
       ),
     ),
@@ -654,11 +658,14 @@ extension TaskOperations<T, E> on Task<T, E> {
     _Continue(
       _node,
       _Frame(
-        failure: (cause, events, cleanups, _) => _preserveFailure(
-          transform(_typedCause<E>(cause)),
-          events,
-          cleanups,
-        ),
+        failure: (cause, events, cleanups, _) {
+          final typed = _typedCause<E>(cause);
+          return _preserveFailure(
+            transform(typed),
+            identical(typed, cause) ? events : _retagEvents(typed, events),
+            cleanups,
+          );
+        },
       ),
     ),
   );
@@ -693,6 +700,7 @@ extension TaskOperations<T, E> on Task<T, E> {
           _defects(cause, StackTrace.current),
           events,
           cleanups,
+          preserveOrder: true,
         ),
       ),
     ),
@@ -756,7 +764,7 @@ FutureOr<TaskEvaluation<T, E>> evaluateTask<T, E>(
       );
 
   FutureOr<TaskEvaluation<T, E>> finish(_EvaluationResult<T, E> evaluated) {
-    var (result, cancellationObserved, observed, observation) = evaluated;
+    var (result, cancellationObserved, handledSources, pendingExit) = evaluated;
     if (interruptible &&
         !cancellationObserved &&
         (signal?.isCancelled ?? false)) {
@@ -770,16 +778,16 @@ FutureOr<TaskEvaluation<T, E>> evaluateTask<T, E>(
 
     TaskEvaluation<T, E> complete() {
       final excluded = {
-        ...observed,
+        ...handledSources,
         for (final event in result.events) event.source,
       };
       var cleanup = scopeCleanupFor(ownedScope, {
         ...excluded,
-        ...?observation?.sources,
+        ...?pendingExit?.sources,
       });
       // Pending exits can be returned only if cleanup and cancellation preserve
       // the successful value. Otherwise retain their defects in owner cleanup.
-      if (observation != null &&
+      if (pendingExit != null &&
           (result.exit is ExitFailure<T, E> ||
               cleanup.exit is ExitFailure<void, Never> ||
               (interruptible && (signal?.isCancelled ?? false)))) {
@@ -798,10 +806,9 @@ FutureOr<TaskEvaluation<T, E>> evaluateTask<T, E>(
       if (result.exit is ExitFailure<T, E>) {
         result = _prependPendingCleanup(
           result,
-          observation?.cleanup ?? const [],
+          pendingExit?.cleanup ?? const [],
         );
       }
-      observation?.complete(result.exit is ExitSuccess<T, E>);
       return result;
     }
 
@@ -894,6 +901,7 @@ Task<T, E> inTaskScope<T, E>(Task<T, E> task, Scope scope) =>
 Task<Fiber<T, E>, Never> forkTask<T, E>(
   Task<T, E> task, {
   bool inheritCancellation = false,
+  bool reportFailure = false,
 }) => Task._(
   _Fork(
     (
@@ -916,6 +924,7 @@ Task<Fiber<T, E>, Never> forkTask<T, E>(
       context: context,
       locals: locals,
       report: fiberReport(parent),
+      reportFailure: reportFailure,
       mode: mode,
     ),
   ),
@@ -939,6 +948,7 @@ Task<Fiber<T, E>, Never> forkTaskIn<T, E>(
       context: context,
       locals: locals,
       report: fiberReport(parent),
+      reportFailure: false,
       mode: mode,
     ),
   ),
@@ -983,17 +993,13 @@ Task<T, E> taskFromEvaluation<T, E>(TaskEvaluation<T, E> result) =>
       ),
     });
 
-typedef _FiberObservation = ({
-  Set<Object> sources,
-  List<FailureEvent> cleanup,
-  void Function(bool) complete,
-});
+typedef _PendingExit = ({Set<Object> sources, List<FailureEvent> cleanup});
 
 typedef _EvaluationResult<T, E> = (
   TaskEvaluation<T, E>,
   bool,
   Set<Object>,
-  _FiberObservation?,
+  _PendingExit?,
 );
 
 FutureOr<_EvaluationResult<T, E>> _evaluate<T, E>(
@@ -1011,12 +1017,12 @@ FutureOr<_EvaluationResult<T, E>> _evaluate<T, E>(
 }) {
   var current = task._node;
   final frames = <_Frame>[];
-  // Observation affects automatic cleanup merging within this execution only.
+  // Accepted results affect cleanup merging within this execution only.
   // Finalizers have independent executions, even when they belong to this fiber.
-  final observed = <Object>{};
+  final handledSources = <Object>{};
   // A captured fiber exit is still only a pending value until a continuation
   // consumes it, or the execution returns it after cleanup.
-  _FiberObservation? observation;
+  _PendingExit? pendingExit;
   var evaluating = true;
   var currentScope = resourceScope;
   var currentOwnedScope = scope;
@@ -1029,11 +1035,11 @@ FutureOr<_EvaluationResult<T, E>> _evaluate<T, E>(
   var remaining = 2048;
   var cancellationObserved = false;
 
-  void finishObservation(bool consumed) {
-    final pending = observation;
+  void finishPendingExit(bool consumed) {
+    final pending = pendingExit;
     if (pending == null) return;
     if (consumed) {
-      observed.addAll(pending.sources);
+      handledSources.addAll(pending.sources);
     } else {
       final completed = _prependPendingCleanup(
         TaskEvaluation<Object?, Object?>(
@@ -1050,8 +1056,7 @@ FutureOr<_EvaluationResult<T, E>> _evaluate<T, E>(
       events = completed.events;
       cleanupCancellations = completed.cleanupCancellations;
     }
-    pending.complete(consumed);
-    observation = null;
+    pendingExit = null;
   }
 
   late FutureOr<_EvaluationResult<T, E>> Function() run;
@@ -1096,8 +1101,9 @@ FutureOr<_EvaluationResult<T, E>> _evaluate<T, E>(
     while (true) {
       final effectiveSignal = interruptible ? signal : null;
       if (!cancellationObserved && (effectiveSignal?.isCancelled ?? false)) {
-        finishObservation(false);
+        finishPendingExit(false);
         failure = _cancelled(failure, effectiveSignal!.reason);
+        events = _failureEvents(failure!, events);
         cancellationObserved = true;
         // Completion frames already removed from the stack still have to run.
         current = switch (current) {
@@ -1207,24 +1213,20 @@ FutureOr<_EvaluationResult<T, E>> _evaluate<T, E>(
               var delivered = const <FailureEvent>[];
               var deliveredCleanups = const <CauseCancelled>[];
               if (!join) {
-                observation = (
-                  sources: <Object>{},
-                  cleanup: <FailureEvent>[],
-                  complete: reserveFiberObservation(target),
-                );
+                pendingExit = (sources: <Object>{}, cleanup: <FailureEvent>[]);
               }
               final pending = _runCallback(
-                (complete) => listenFiber(target, (exit) {
+                (complete) => target.onExit((exit) {
                   delivered = fiberFailureEvents(target);
                   deliveredCleanups = fiberCleanupCancellations(target);
                   final sources = delivered.map((event) => event.source);
                   if (join) {
-                    observed.addAll(sources);
+                    handledSources.addAll(sources);
                   } else {
-                    observation!.sources.addAll(sources);
+                    pendingExit!.sources.addAll(sources);
                   }
                   complete(join ? exit : Exit.success(exit));
-                }, observe: join),
+                }),
                 effectiveSignal,
               );
               final suspended = waitFor(pending, (exit) {
@@ -1244,10 +1246,9 @@ FutureOr<_EvaluationResult<T, E>> _evaluate<T, E>(
               if (suspended != null) return suspended;
             case _Success(value: final result, :final pendingFailures):
               if (pendingFailures.isNotEmpty) {
-                observation = (
+                pendingExit = (
                   sources: {for (final event in pendingFailures) event.source},
                   cleanup: [...pendingFailures],
-                  complete: (_) {},
                 );
               }
               value = result;
@@ -1451,7 +1452,7 @@ FutureOr<_EvaluationResult<T, E>> _evaluate<T, E>(
                 }
                 events = completed.events;
                 cleanupCancellations = completed.cleanupCancellations;
-                if (failure != null) finishObservation(false);
+                if (failure != null) finishPendingExit(false);
                 evaluating = false;
               });
               if (suspended != null) return suspended;
@@ -1494,19 +1495,19 @@ FutureOr<_EvaluationResult<T, E>> _evaluate<T, E>(
                 _,
               ) {
                 final excluded = {
-                  ...observed,
+                  ...handledSources,
                   for (final event in bodyEvents) event.source,
                 };
                 final fullCleanup = scopeCleanupFor(scope, excluded);
                 final filteredCleanup = scopeCleanupFor(scope, {
                   ...excluded,
-                  ...?observation?.sources,
+                  ...?pendingExit?.sources,
                 });
                 final canDeliver =
                     exit is ExitSuccess &&
                     filteredCleanup.exit is ExitSuccess<void, Never> &&
                     !(effectiveSignal?.isCancelled ?? false);
-                if (observation case final pending? when canDeliver) {
+                if (pendingExit case final pending? when canDeliver) {
                   // This scope detaches after closing. Keep the excluded occurrences
                   // until delivery so a later cancellation or failure can retain them.
                   pending.cleanup.addAll(
@@ -1532,7 +1533,7 @@ FutureOr<_EvaluationResult<T, E>> _evaluate<T, E>(
                 }
                 events = completed.events;
                 cleanupCancellations = completed.cleanupCancellations;
-                if (!canDeliver) finishObservation(false);
+                if (!canDeliver) finishPendingExit(false);
                 evaluating = false;
               });
               if (suspended != null) return suspended;
@@ -1561,7 +1562,7 @@ FutureOr<_EvaluationResult<T, E>> _evaluate<T, E>(
                 };
                 events = completed.events;
                 cleanupCancellations = completed.cleanupCancellations;
-                observed.addAll(events.map((event) => event.source));
+                handledSources.addAll(events.map((event) => event.source));
                 value = null;
                 evaluating = false;
               });
@@ -1574,6 +1575,10 @@ FutureOr<_EvaluationResult<T, E>> _evaluate<T, E>(
           final Exit<T, E> exit = failure == null
               ? Exit.success(value as T)
               : Exit.failure(_typedCause<E>(failure!));
+          if (exit case ExitFailure(:final cause)
+              when !identical(cause, failure)) {
+            events = _retagEvents(cause, events);
+          }
           return (
             TaskEvaluation(
               exit,
@@ -1581,8 +1586,8 @@ FutureOr<_EvaluationResult<T, E>> _evaluate<T, E>(
               cleanupCancellations: cleanupCancellations,
             ),
             cancellationObserved,
-            observed,
-            observation,
+            handledSources,
+            pendingExit,
           );
         }
 
@@ -1608,7 +1613,7 @@ FutureOr<_EvaluationResult<T, E>> _evaluate<T, E>(
         if (failure case final cause?) {
           final resume = frame.failure;
           if (resume == null) continue;
-          finishObservation(false);
+          finishPendingExit(false);
           current = resume(
             failure ?? cause,
             events,
@@ -1618,7 +1623,7 @@ FutureOr<_EvaluationResult<T, E>> _evaluate<T, E>(
         } else {
           final resume = frame.success;
           if (resume == null) continue;
-          if (frame.consumesValue) finishObservation(true);
+          if (frame.consumesValue) finishPendingExit(true);
           current = resume(value);
         }
         // A continuation has already produced this failure. Record it before the
@@ -1672,7 +1677,7 @@ List<FailureEvent> _failureEvents(
   Cause<Object?> cause, [
   Iterable<FailureEvent> previous = const [],
 ]) {
-  final available = Map<CauseDefect, List<FailureEvent>>.identity();
+  final available = Map<Cause<Object?>, List<FailureEvent>>.identity();
   for (final event in previous.toList().reversed) {
     (available[event.cause] ??= []).add(event);
   }
@@ -1682,12 +1687,35 @@ List<FailureEvent> _failureEvents(
   };
   return List.unmodifiable([
     for (final reason in reasons)
-      if (reason is CauseDefect)
+      if (reason is! CauseCancelled)
         if (available[reason] case final candidates? when candidates.isNotEmpty)
           candidates.removeLast()
         else
-          FailureEvent(reason, Object()),
+          FailureEvent(reason, FailureSource()),
   ]);
+}
+
+// Type casts, mapError, and orDie keep the same ordered failure occurrences.
+List<FailureEvent> _retagEvents(
+  Cause<Object?> cause,
+  List<FailureEvent> previous,
+) {
+  final sources = previous.iterator;
+  final events = <FailureEvent>[];
+  for (final reason in switch (cause) {
+    CauseGroup(:final causes) => causes,
+    _ => [cause],
+  }) {
+    if (reason is CauseCancelled) continue;
+    sources.moveNext();
+    final event = sources.current;
+    events.add(
+      identical(reason, event.cause)
+          ? event
+          : FailureEvent(reason, event.source),
+    );
+  }
+  return List.unmodifiable(events);
 }
 
 List<CauseCancelled> _cancellations(Cause<Object?> cause) => switch (cause) {
@@ -1699,13 +1727,17 @@ List<CauseCancelled> _cancellations(Cause<Object?> cause) => switch (cause) {
 _Failure _preserveFailure(
   Cause<Object?> cause,
   List<FailureEvent> events,
-  List<CauseCancelled> cleanupCancellations,
-) {
+  List<CauseCancelled> cleanupCancellations, {
+  bool preserveOrder = false,
+}) {
+  final retained = preserveOrder
+      ? _retagEvents(cause, events)
+      : _failureEvents(cause, events);
   if (cleanupCancellations.isEmpty) {
-    return _Failure(cause, _failureEvents(cause, events));
+    return _Failure(cause, retained);
   }
   final available = [...cleanupCancellations];
-  return _Failure(cause, _failureEvents(cause, events), [
+  return _Failure(cause, retained, [
     for (final cancellation in _cancellations(cause))
       if (available.remove(cancellation)) cancellation,
   ]);
@@ -1719,13 +1751,13 @@ TaskEvaluation<T, E> _prependPendingCleanup<T, E>(
   final sources = {for (final event in result.events) event.source};
   final events = [
     for (final event in pending)
-      if (sources.add(event.source)) event,
+      if (event.cause is CauseDefect && sources.add(event.source)) event,
   ];
   if (events.isEmpty) return result;
   return TaskEvaluation(
     Exit.failure(
       Cause<E>.combine([
-        for (final event in events) event.cause,
+        for (final event in events) event.cause as CauseDefect,
         if (result.exit case ExitFailure(:final cause)) cause,
       ]),
     ),
@@ -1847,7 +1879,7 @@ typedef _RegisterCallback = _CancelCallback Function(
 );
 
 Cause<E> _typedCause<E>(Cause<Object?> cause) =>
-    cause.mapError((error) => error as E);
+    cause is Cause<E> ? cause : cause.mapError((error) => error as E);
 
 Exit<T, E> _typedExit<T, E>(Exit<Object?, Object?> exit) => switch (exit) {
   ExitSuccess(:final value) => Exit.success(value as T),
