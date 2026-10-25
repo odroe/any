@@ -14,7 +14,6 @@ import 'option.dart';
 import 'result.dart';
 import 'schedule.dart';
 import 'scope.dart';
-import 'task_local.dart';
 
 /// A reusable description of work that produces a value or a typed error.
 ///
@@ -521,7 +520,7 @@ extension TaskOperations<T, E> on Task<T, E> {
   /// The explicit owner must remain open for the whole operation. With [fork],
   /// the creating execution would instead stop and await the unfinished child.
   Task<Fiber<T, E>, Never> forkIn(Scope scope) => Task._(
-    _Fork((_, _, parent, context, locals, _, runScope, _, mode) {
+    _Fork((_, _, parent, context, _, runScope, _, mode) {
       if (!identical(
         scopeRuntimeId(scope),
         scopeRuntimeId(fiberScope(parent)),
@@ -535,7 +534,6 @@ extension TaskOperations<T, E> on Task<T, E> {
         inheritHost: false,
         runScope: scopeOwnsScope(runScope, scope) ? runScope : null,
         context: context,
-        locals: locals,
         report: fiberReport(parent),
         reportFailure: true,
         mode: mode,
@@ -752,7 +750,6 @@ FutureOr<TaskEvaluation<T, E>> evaluateTask<T, E>(
   Scope? runScope,
   Fiber<Object?, Object?>? fiber,
   Context? context,
-  Map<TaskLocal<Object?>, Object?> locals = const {},
   List<Scope> closingScopes = const [],
   ExecutionMode? mode,
 }) {
@@ -828,7 +825,6 @@ FutureOr<TaskEvaluation<T, E>> evaluateTask<T, E>(
     closingScopes: closingScopes,
     fiber: fiber,
     context: context ?? Context.from(const []),
-    locals: locals,
     mode: executionMode,
   );
   return evaluated is Future<_EvaluationResult<T, E>>
@@ -841,7 +837,6 @@ FutureOr<TaskEvaluation<void, Never>> _evaluateCleanup(
   required List<Scope> closingScopes,
   required Fiber<Object?, Object?>? fiber,
   required Context context,
-  required Map<TaskLocal<Object?>, Object?> locals,
   required ExecutionMode mode,
 }) {
   final scope = createScope(
@@ -858,7 +853,6 @@ FutureOr<TaskEvaluation<void, Never>> _evaluateCleanup(
       closingScopes: [...closingScopes, scope],
       fiber: fiber,
       context: context,
-      locals: locals,
       mode: mode,
     ),
   );
@@ -879,17 +873,15 @@ Task<Exit<T, E>, Never> awaitFiberTask<T, E>(
 Task<T, E> joinFiberTask<T, E>(Fiber<T, E> target) =>
     Task._(_AwaitFiber(target, join: true));
 
-Task<T, Never> readTaskLocal<T>(TaskLocal<T> local, T defaultValue) => Task._(
-  _ReadLocal(
-    (values) => values.containsKey(local) ? values[local] as T : defaultValue,
+// An absent local reads its default without adding a binding to the context.
+Task<T, Never> readTaskLocal<T>(ServiceKey<T> key, T defaultValue) => Task._(
+  _Service(
+    (context) => switch (context.find(key)) {
+      OptionSome(:final value) => value,
+      OptionNone() => defaultValue,
+    },
   ),
 );
-
-Task<R, E> provideTaskLocal<T, R, E>(
-  TaskLocal<T> local,
-  T value,
-  Task<R, E> task,
-) => Task._(_ProvideLocal(task._node, local, value));
 
 // Layer construction borrows resource ownership without changing the root
 // scope that this execution must close before it finishes.
@@ -904,29 +896,19 @@ Task<Fiber<T, E>, Never> forkTask<T, E>(
   bool reportFailure = false,
 }) => Task._(
   _Fork(
-    (
-      scope,
-      owner,
-      parent,
-      context,
-      locals,
-      signal,
-      runScope,
-      interruptible,
-      mode,
-    ) => startFiber(
-      task,
-      owner: owner,
-      resourceScope: scope,
-      signal: signal,
-      interruptible: !inheritCancellation || interruptible,
-      runScope: runScope,
-      context: context,
-      locals: locals,
-      report: fiberReport(parent),
-      reportFailure: reportFailure,
-      mode: mode,
-    ),
+    (scope, owner, parent, context, signal, runScope, interruptible, mode) =>
+        startFiber(
+          task,
+          owner: owner,
+          resourceScope: scope,
+          signal: signal,
+          interruptible: !inheritCancellation || interruptible,
+          runScope: runScope,
+          context: context,
+          report: fiberReport(parent),
+          reportFailure: reportFailure,
+          mode: mode,
+        ),
   ),
 );
 
@@ -938,7 +920,7 @@ Task<Fiber<T, E>, Never> forkTaskIn<T, E>(
   bool deferStart = true,
 }) => Task._(
   _Fork(
-    (_, _, parent, context, locals, _, runScope, _, mode) => startFiber(
+    (_, _, parent, context, _, runScope, _, mode) => startFiber(
       task,
       owner: scope,
       resourceScope: resourceScope ?? scope,
@@ -946,7 +928,6 @@ Task<Fiber<T, E>, Never> forkTaskIn<T, E>(
       deferStart: deferStart,
       runScope: scopeOwnsScope(runScope, scope) ? runScope : null,
       context: context,
-      locals: locals,
       report: fiberReport(parent),
       reportFailure: false,
       mode: mode,
@@ -956,30 +937,25 @@ Task<Fiber<T, E>, Never> forkTaskIn<T, E>(
 
 Task<T, E> accessTaskEnvironment<T, E>(
   Task<T, E> Function(Scope scope, Context context) use,
-) => Task._(_Environment((scope, context, _, _) => use(scope, context)._node));
+) => Task._(_Environment((scope, context, _) => use(scope, context)._node));
 
 Task<Scope, Never> currentTaskRunScope() => const Task._(_RunScope());
 
 // A shared service retains its creation environment without retaining the
-// creating fiber. Context and task-local maps are immutable snapshots.
+// creating fiber. Context retains both services and private local bindings.
 typedef TaskEnvironment = ({
   Context context,
-  Map<TaskLocal<Object?>, Object?> locals,
   void Function(Cause<Object?>) report,
 });
 
 Task<TaskEnvironment, Never> captureTaskEnvironment() => Task._(
-  _Environment((_, context, locals, fiber) {
+  _Environment((_, context, fiber) {
     if (fiber == null) {
       throw StateError(
         'Capturing an environment requires a runtime execution.',
       );
     }
-    return _Success((
-      context: context,
-      locals: locals,
-      report: fiberReport(fiber),
-    ));
+    return _Success((context: context, report: fiberReport(fiber)));
   }),
 );
 
@@ -1012,7 +988,6 @@ FutureOr<_EvaluationResult<T, E>> _evaluate<T, E>(
   CancellationSignal? signal,
   Fiber<Object?, Object?>? fiber,
   required Context context,
-  required Map<TaskLocal<Object?>, Object?> locals,
   required ExecutionMode mode,
 }) {
   var current = task._node;
@@ -1027,7 +1002,6 @@ FutureOr<_EvaluationResult<T, E>> _evaluate<T, E>(
   var currentScope = resourceScope;
   var currentOwnedScope = scope;
   var currentContext = context;
-  var currentLocals = locals;
   Object? value;
   Cause<Object?>? failure;
   var events = const <FailureEvent>[];
@@ -1140,30 +1114,13 @@ FutureOr<_EvaluationResult<T, E>> _evaluate<T, E>(
               cleanupCancellations = const [];
               evaluating = false;
             case _Environment(:final use):
-              current = use(currentScope, currentContext, currentLocals, fiber);
+              current = use(currentScope, currentContext, fiber);
             case _InScope(:final source, scope: final borrowed):
               final release = fiber == null || identical(scope, borrowed)
                   ? null
                   : borrowScopeFiber(borrowed, fiber, untilReleased: true);
               frames.add(_Frame(scope: currentScope, releaseBorrow: release));
               currentScope = borrowed;
-              current = source;
-            case _ReadLocal(:final read):
-              value = read(currentLocals);
-              failure = null;
-              events = const [];
-              cleanupCancellations = const [];
-              evaluating = false;
-            case _ProvideLocal(
-              :final source,
-              :final local,
-              value: final provided,
-            ):
-              frames.add(_Frame(locals: currentLocals));
-              currentLocals = Map.unmodifiable({
-                ...currentLocals,
-                local: provided,
-              });
               current = source;
             case _Service(:final read):
               value = read(currentContext);
@@ -1184,7 +1141,6 @@ FutureOr<_EvaluationResult<T, E>> _evaluate<T, E>(
                 currentOwnedScope,
                 fiber,
                 currentContext,
-                currentLocals,
                 signal,
                 runScope,
                 interruptible,
@@ -1358,8 +1314,7 @@ FutureOr<_EvaluationResult<T, E>> _evaluate<T, E>(
               evaluating = false;
             case _AddFinalizer(:final finalizer):
               final zone = Zone.current;
-              final services = currentContext;
-              final localValues = currentLocals;
+              final environment = currentContext;
               final registrationScope = currentScope;
               final pending = addScopeFinalizer(
                 currentScope,
@@ -1377,8 +1332,7 @@ FutureOr<_EvaluationResult<T, E>> _evaluate<T, E>(
                       task,
                       closingScopes: [...closingScopes, scope],
                       fiber: fiber,
-                      context: services,
-                      locals: localValues,
+                      context: environment,
                       mode: closingMode,
                     ),
                   ),
@@ -1400,16 +1354,14 @@ FutureOr<_EvaluationResult<T, E>> _evaluate<T, E>(
               if (suspended != null) return suspended;
             case _OnExit(:final source, :final cleanup):
               final zone = Zone.current;
-              final services = currentContext;
-              final localValues = currentLocals;
+              final environment = currentContext;
               FutureOr<TaskEvaluation<void, Never>> run(
                 Exit<Object?, Object?> exit,
               ) => zone.run(
                 () => _evaluateCleanup(
                   Task.defer(() => cleanup(exit)),
                   fiber: fiber,
-                  context: services,
-                  locals: localValues,
+                  context: environment,
                   closingScopes: closingScopes,
                   mode: mode,
                 ),
@@ -1595,10 +1547,6 @@ FutureOr<_EvaluationResult<T, E>> _evaluate<T, E>(
         if (frame.scope case final restored?) {
           frame.releaseBorrow?.call();
           currentScope = restored;
-          continue;
-        }
-        if (frame.locals case final restored?) {
-          currentLocals = restored;
           continue;
         }
         if (frame.context case final restored?) {
@@ -1952,7 +1900,6 @@ final class _Fork extends _Node {
     Scope,
     Fiber<Object?, Object?>,
     Context,
-    Map<TaskLocal<Object?>, Object?>,
     CancellationSignal?,
     Scope,
     bool,
@@ -1968,13 +1915,7 @@ final class _Service extends _Node {
 
 final class _Environment extends _Node {
   const _Environment(this.use);
-  final _Node Function(
-    Scope,
-    Context,
-    Map<TaskLocal<Object?>, Object?>,
-    Fiber<Object?, Object?>?,
-  )
-  use;
+  final _Node Function(Scope, Context, Fiber<Object?, Object?>?) use;
 }
 
 final class _RunScope extends _Node {
@@ -1985,18 +1926,6 @@ final class _InScope extends _Node {
   const _InScope(this.source, this.scope);
   final _Node source;
   final Scope scope;
-}
-
-final class _ReadLocal extends _Node {
-  const _ReadLocal(this.read);
-  final Object? Function(Map<TaskLocal<Object?>, Object?>) read;
-}
-
-final class _ProvideLocal extends _Node {
-  const _ProvideLocal(this.source, this.local, this.value);
-  final _Node source;
-  final TaskLocal<Object?> local;
-  final Object? value;
 }
 
 final class _ProvideContext extends _Node {
@@ -2139,7 +2068,6 @@ final class _Frame {
     this.consumesValue = false,
     this.interruptible,
     this.context,
-    this.locals,
     this.scope,
     this.releaseBorrow,
     this.cleanup = false,
@@ -2155,7 +2083,6 @@ final class _Frame {
   failure;
   final bool? interruptible;
   final Context? context;
-  final Map<TaskLocal<Object?>, Object?>? locals;
   final Scope? scope;
   final void Function()? releaseBorrow;
   final bool cleanup;

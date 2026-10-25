@@ -60,6 +60,50 @@ void main() {
     expect(await runtime.runOrThrow(task), ((1, 2, 1, 'outer'), 0));
   });
 
+  test(
+    'service and local providers preserve each other in either order',
+    () async {
+      final service = ServiceKey<String>('service');
+      final local = TaskLocal('default', name: 'service');
+      final seen = <(String, String)>[];
+      final inner = Context.from([service.bind('inner service')]);
+      Task<void, Never> read() => Task.service(service).flatMap(
+        (value) => local.get().map((local) => seen.add((value, local))),
+      );
+      final task = local
+          .locally(
+            'outer local',
+            read()
+                .flatMap(
+                  (_) => local.locally(
+                    'inner local',
+                    read().provideContext(inner),
+                  ),
+                )
+                .flatMap((_) => read())
+                .flatMap(
+                  (_) => local
+                      .locally('inner local', read())
+                      .provideContext(inner),
+                )
+                .flatMap((_) => read()),
+          )
+          .flatMap((_) => read())
+          .provideContext(Context.from([service.bind('outer service')]));
+
+      await runtime.runOrThrow(task);
+
+      expect(seen, [
+        ('outer service', 'outer local'),
+        ('inner service', 'inner local'),
+        ('outer service', 'outer local'),
+        ('inner service', 'inner local'),
+        ('outer service', 'outer local'),
+        ('outer service', 'default'),
+      ]);
+    },
+  );
+
   test('an explicit null overrides a non-null nullable default', () async {
     final local = TaskLocal<String?>('default');
     final absent = TaskLocal<int?>(null);
@@ -86,19 +130,25 @@ void main() {
   });
 
   test('a defect restores the binding before cause recovery', () async {
+    final service = ServiceKey<int>('service');
     final local = TaskLocal('outer');
     final error = StateError('failed');
     final trace = StackTrace.fromString('local callback');
     final task = local
         .locally<String, Never>(
           'inner',
-          Task.sync(() => Error.throwWithStackTrace(error, trace)),
+          Task.sync(() => Error.throwWithStackTrace(error, trace))
+              .provideContext(Context.from([service.bind(2)])),
         )
         .recoverCause<Never>((cause) {
           expect((cause as CauseDefect).error, same(error));
           expect(cause.stackTrace.toString(), '$trace');
-          return local.get();
-        });
+          return Task.service(service).flatMap((value) {
+            expect(value, 1);
+            return local.get();
+          });
+        })
+        .provideContext(Context.from([service.bind(1)]));
 
     expect(await runtime.runOrThrow(task), 'outer');
   });
@@ -287,25 +337,30 @@ void main() {
   test(
     'cancellation cleanup uses its registration binding without leaking it',
     () async {
+      final service = ServiceKey<String>('service');
       final local = TaskLocal('default');
       final gate = _Gate();
       final controller = CancellationController();
       final seen = <String>[];
+      Task<void, Never> capture() => Task.service(service).flatMap(
+        (value) => local.get().map((local) => seen.add('$value/$local')),
+      );
       final task = local
           .locally(
             'inner',
-            Task.addFinalizer(
-              (_) => Task.yieldNow().flatMap((_) => local.get()).map(seen.add),
-            ).flatMap((_) => gate.task),
+            Task.addFinalizer((_) => Task.yieldNow().flatMap((_) => capture()))
+                .flatMap((_) => gate.task),
           )
-          .ensuring(local.get().map(seen.add));
+          .provideContext(Context.from([service.bind('inner')]))
+          .ensuring(capture())
+          .provideContext(Context.from([service.bind('outer')]));
       final running = runtime.run(task, signal: controller.signal);
       await gate.started.future;
 
       controller.requestCancel();
 
       expect(_cause(await running), isA<CauseCancelled>());
-      expect(seen, ['default', 'inner']);
+      expect(seen, ['outer/default', 'inner/inner']);
       expect(await runtime.runOrThrow(local.get()), 'default');
     },
   );

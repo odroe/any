@@ -1,3 +1,4 @@
+import 'context.dart';
 import 'task.dart';
 
 /// A value binding that follows one task execution and its child fibers.
@@ -27,9 +28,12 @@ final class TaskLocal<T> {
   ///
   /// The default is retained by reference and is returned whenever no override is
   /// active. [name] is an optional diagnostic label, not the binding's identity.
-  TaskLocal(T defaultValue, {this.name}) : _defaultValue = defaultValue;
+  TaskLocal(T defaultValue, {this.name})
+    : _defaultValue = defaultValue,
+      _key = ServiceKey<T>(name ?? 'TaskLocal');
 
   final T _defaultValue;
+  final ServiceKey<T> _key;
 
   /// An optional label for diagnostics; it does not determine key identity.
   final String? name;
@@ -38,7 +42,7 @@ final class TaskLocal<T> {
   ///
   /// Uses the constructor's default when no [locally] override is active. An
   /// explicit `null` override is a value, not an absent binding.
-  Task<T, Never> get() => readTaskLocal<T>(this, _defaultValue);
+  Task<T, Never> get() => readTaskLocal(_key, _defaultValue);
 
   /// Runs [task] with a local [value] for this binding.
   ///
@@ -49,5 +53,5 @@ final class TaskLocal<T> {
   /// [value] must match this key's original type, even through a wider type or
   /// `dynamic`. A mismatch throws [TypeError] when [locally] is called.
   Task<R, E> locally<R, E>(T value, Task<R, E> task) =>
-      provideTaskLocal<T, R, E>(this, value, task);
+      task.provideContext(Context.from([_key.bind(value)]));
 }

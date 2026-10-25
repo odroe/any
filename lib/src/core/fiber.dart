@@ -9,7 +9,6 @@ import 'internal/execution_mode.dart';
 import 'option.dart';
 import 'scope.dart';
 import 'task.dart';
-import 'task_local.dart';
 
 /// A handle to one running [Task] and its eventual [Exit].
 ///
@@ -151,7 +150,6 @@ Fiber<T, E> startFiber<T, E>(
   Task<T, E> task, {
   required Scope owner,
   required Context context,
-  Map<TaskLocal<Object?>, Object?> locals = const {},
   required void Function(Cause<Object?> cause) report,
   required bool reportFailure,
   bool inheritHost = true,
@@ -214,7 +212,6 @@ Fiber<T, E> startFiber<T, E>(
               runScope: runScope,
               fiber: fiber,
               context: context,
-              locals: locals,
               mode: mode,
             );
           } catch (error, stackTrace) {
