@@ -193,7 +193,6 @@ final class _SharedFlow<T, E> {
       owner: _work,
       resourceScope: _work,
       context: environment.context,
-      locals: environment.locals,
       report: environment.report,
       reportFailure: false,
       inheritHost: false,

@@ -211,10 +211,9 @@ final class _Run<K, V, E> {
   _Partition<K, V, E>? findPartition(TaskEnvironment environment) {
     for (final partition in partitions) {
       if (contextBindingsIdentical(
-            partition.environment.context,
-            environment.context,
-          ) &&
-          _localsIdentical(partition.environment.locals, environment.locals)) {
+        partition.environment.context,
+        environment.context,
+      )) {
         return partition;
       }
     }
@@ -345,7 +344,6 @@ final class _Run<K, V, E> {
           owner: scope,
           runScope: scope,
           context: environment.context,
-          locals: environment.locals,
           report: environment.report,
           reportFailure: false,
           deferStart: true,
@@ -623,21 +621,6 @@ final class _Call<K, V, E> {
       );
     });
   });
-}
-
-bool _localsIdentical(
-  Map<TaskLocal<Object?>, Object?> left,
-  Map<TaskLocal<Object?>, Object?> right,
-) {
-  if (identical(left, right)) return true;
-  if (left.length != right.length) return false;
-  for (final entry in left.entries) {
-    if (!right.containsKey(entry.key) ||
-        !identical(entry.value, right[entry.key])) {
-      return false;
-    }
-  }
-  return true;
 }
 
 List<Cause<T>> _reasons<T>(Cause<T> cause) => switch (cause) {

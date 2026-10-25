@@ -207,8 +207,8 @@ void main() {
 
   test('task-local overrides isolate both batches and cached values', () async {
     final tenant = TaskLocal<Object?>(null);
-    final a = Object();
-    final b = Object();
+    final a = _Tenant('a');
+    final b = _Tenant('b');
     final calls = <(Object?, List<int>)>[];
     final resolver = RequestResolver<int, Object?, Never>(
       (keys) => tenant.get().map((value) {
@@ -232,6 +232,38 @@ void main() {
       [1],
     ]);
   });
+
+  test(
+    'default reads preserve sharing while explicit defaults isolate it',
+    () async {
+      final defaultValue = Object();
+      final local = TaskLocal(defaultValue);
+      final values = <int>[];
+      var loads = 0;
+      final resolver = RequestResolver<int, int, Never>(
+        (keys) => local.get().map((value) {
+          expect(value, same(defaultValue));
+          final version = ++loads;
+          return [for (final _ in keys) Result.success(version)];
+        }),
+      );
+      await runtime().runOrThrow(
+        resolver
+            .request(1)
+            .map(values.add)
+            .flatMap((_) => local.get())
+            .flatMap((_) => resolver.request(1))
+            .map(values.add)
+            .flatMap((_) => local.locally(defaultValue, resolver.request(1)))
+            .map(values.add)
+            .flatMap((_) => resolver.request(1))
+            .map(values.add),
+      );
+
+      expect(values, [1, 1, 2, 1]);
+      expect(loads, 2);
+    },
+  );
 
   test('batch size and concurrency bound active loaders', () async {
     final calls = <List<int>>[];

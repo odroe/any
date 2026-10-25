@@ -117,7 +117,6 @@ final class SharedResourceState<K, T, E> {
         owner: generation.scope,
         resourceScope: generation.scope,
         context: _environment.context,
-        locals: _environment.locals,
         report: _environment.report,
         reportFailure: false,
         inheritHost: false,
