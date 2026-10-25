@@ -3,6 +3,7 @@ import 'dart:async';
 import 'context.dart';
 import 'exit.dart';
 import 'fiber.dart';
+import 'internal/completion.dart';
 import 'scope.dart';
 import 'task.dart';
 
@@ -191,20 +192,10 @@ final class _BuildSession {
 }
 
 final class _BuildEntry {
-  final ready = Completer<Exit<Fiber<Context, Object?>, Never>>();
+  final ready = Completion<Exit<Fiber<Context, Object?>, Never>>();
 
   Task<Context, E> wait<E>() =>
-      Task.fromCallback<Fiber<Context, Object?>, Never>((complete) {
-            var waiting = true;
-            unawaited(
-              ready.future.then((exit) {
-                if (waiting) complete(exit);
-              }),
-            );
-            return () {
-              waiting = false;
-            };
-          })
+      Task.fromCallback<Fiber<Context, Object?>, Never>(ready.listen)
           .withError<E>()
           .flatMap((fiber) => fiber.join().mapError((error) => error as E));
 }
