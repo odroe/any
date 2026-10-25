@@ -48,6 +48,28 @@ void main() {
   );
 
   test(
+    'the innermost provider wins and inherits other outer services',
+    () async {
+      final port = ServiceKey<int>('port');
+      final host = ServiceKey<String>('host');
+      final runtime = Runtime(context: Context.from([port.bind(443)]));
+      addTearDown(runtime.close);
+
+      final result = await runtime.runOrThrow(
+        Task.service(port)
+            .flatMap((value) => Task.service(host).map((host) => (host, value)))
+            .provideContext(Context.from([port.bind(8080)]))
+            .provideContext(
+              Context.from([port.bind(80), host.bind('localhost')]),
+            ),
+      );
+
+      expect(result, ('localhost', 8080));
+      expect(await runtime.runOrThrow(Task.service(port)), 443);
+    },
+  );
+
+  test(
     'failure recovery outside a local provider sees the outer context',
     () async {
       final key = ServiceKey<int>('service');

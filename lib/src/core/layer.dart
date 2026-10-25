@@ -55,9 +55,11 @@ final class Layer<E> {
   /// by default; [concurrency] allows up to that many branches to build at once.
   /// Nested merges have their own concurrency limits.
   ///
-  /// Output bindings retain declaration order. Duplicate keys fail the build with
-  /// a [DuplicateService] defect. A nonpositive [concurrency] fails with a
-  /// [RangeError] defect before any branch starts.
+  /// Later layers replace earlier bindings for the same key, regardless of
+  /// completion order. Every branch is built normally; replacement does not
+  /// suppress build failures or release acquired resources before their owner
+  /// closes. A nonpositive [concurrency] fails with a [RangeError] defect before
+  /// any branch starts.
   static Layer<E> mergeAll<E>(
     Iterable<Layer<E>> layers, {
     int concurrency = 1,
@@ -93,16 +95,18 @@ extension ServiceLayerOperations<T> on ServiceKey<T> {
 extension LayerOperations<E> on Layer<E> {
   /// Creates a layer containing both this layer's and [other]'s services.
   ///
-  /// The keys must be distinct. See [Layer.mergeAll] for ordering, concurrency,
-  /// and duplicate-key behavior.
+  /// Bindings from [other] replace matching output keys. This does not inject
+  /// dependencies between the layers or rebuild services that already captured
+  /// an earlier binding. See [Layer.mergeAll] for concurrency and resource lifetime.
   Layer<E> merge(Layer<E> other, {int concurrency = 1}) =>
       Layer.mergeAll([this, other], concurrency: concurrency);
 
   /// Supplies [dependencies] to this layer without adding them to its output.
   ///
   /// Dependency bindings replace matching input services; other inputs remain
-  /// available. Shared dependencies are acquired once per build and kept alive
-  /// until the services that use them have been released.
+  /// available. An inner provider takes precedence over an outer provider.
+  /// Shared dependencies are acquired once per build and kept alive until the
+  /// services that use them have been released.
   Layer<E> provide(Layer<E> dependencies) => Layer._(
     (session) => session
         .build(dependencies)

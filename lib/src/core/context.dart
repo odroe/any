@@ -36,15 +36,15 @@ final class ServiceBinding<T> {
 /// An immutable collection of services identified by typed keys.
 ///
 /// Use [read] for required services and [find] for optional ones. [merge] combines
-/// contexts with distinct keys; [replace] changes an existing binding. These
-/// operations return new contexts and leave the original bindings intact.
+/// contexts, and [add] inserts or replaces one binding. Later bindings replace
+/// earlier ones for the same key. These operations leave the inputs intact.
 ///
 /// ```dart
 /// final endpoint = ServiceKey<Uri>('endpoint');
 /// final production = Context.from([
 ///   endpoint.bind(Uri.parse('https://api.example.com')),
 /// ]);
-/// final testing = production.replace(
+/// final testing = production.add(
 ///   endpoint.bind(Uri.parse('http://localhost:8080')),
 /// );
 /// assert(production.read(endpoint).host == 'api.example.com');
@@ -60,15 +60,11 @@ final class Context {
 
   /// Creates a context containing a snapshot of [bindings].
   ///
-  /// Throws [DuplicateService] if a key occurs more than once, even if the values
-  /// are identical. Later changes to the input collection do not affect this
-  /// context.
+  /// The last binding for each key wins. Later changes to the input collection
+  /// do not affect this context.
   factory Context.from(Iterable<ServiceBinding<Object?>> bindings) {
     final services = <ServiceKey<Object?>, Object?>{};
     for (final binding in bindings) {
-      if (services.containsKey(binding.key)) {
-        throw DuplicateService(binding.key);
-      }
       services[binding.key] = binding.value;
     }
     return Context._(services);
@@ -94,30 +90,17 @@ final class Context {
 
   /// Returns a new context containing this context's and [other]'s services.
   ///
-  /// Throws [DuplicateService] if both contain the same key. Use [replace] when
-  /// changing an existing service is intentional.
-  Context merge(Context other) {
-    final services = Map<ServiceKey<Object?>, Object?>.of(_services);
-    for (final entry in other._services.entries) {
-      if (services.containsKey(entry.key)) throw DuplicateService(entry.key);
-      services[entry.key] = entry.value;
-    }
-    return Context._(services);
-  }
+  /// Bindings in [other] replace matching keys in this context. Neither input is
+  /// modified, and service objects retain their identity and existing lifetime.
+  Context merge(Context other) => Context._({..._services, ...other._services});
 
-  /// Returns a context with [binding] replacing its existing service.
+  /// Returns a new context with [binding] inserted or replacing the same key.
   ///
-  /// Throws [MissingService] if this context does not contain the binding's key.
-  Context replace(ServiceBinding<Object?> binding) {
-    if (!_services.containsKey(binding.key)) throw MissingService(binding.key);
-    return Context._({..._services, binding.key: binding.value});
-  }
+  /// Other bindings and this context remain unchanged. A permitted `null` value
+  /// replaces the previous value; it does not remove the binding.
+  Context add(ServiceBinding<Object?> binding) =>
+      Context._({..._services, binding.key: binding.value});
 }
-
-// Explicit local providers replace matching bindings and inherit all others.
-// Keep this operation internal so Context.merge continues to diagnose mistakes.
-Context overlayContexts(Context base, Context provided) =>
-    Context._({...base._services, ...provided._services});
 
 // Service objects can define value equality unrelated to authorization or
 // transaction identity. Request sharing compares bindings by identity only.
@@ -135,7 +118,7 @@ bool contextBindingsIdentical(Context left, Context right) {
 
 /// A missing required service in a [Context].
 ///
-/// Thrown by [Context.read] and [Context.replace] when [key] has no binding.
+/// Thrown by [Context.read] when [key] has no binding.
 final class MissingService implements Exception {
   /// Creates a diagnostic for the absent [key].
   const MissingService(this.key);
@@ -145,20 +128,4 @@ final class MissingService implements Exception {
 
   @override
   String toString() => 'MissingService: No service is bound to "${key.name}".';
-}
-
-/// A duplicate service key in a [Context] operation.
-///
-/// Thrown by [Context.from] and [Context.merge] instead of silently replacing a
-/// binding.
-final class DuplicateService implements Exception {
-  /// Creates a diagnostic for the duplicate [key].
-  const DuplicateService(this.key);
-
-  /// The key that already has a binding.
-  final ServiceKey<Object?> key;
-
-  @override
-  String toString() =>
-      'DuplicateService: A service is already bound to "${key.name}".';
 }

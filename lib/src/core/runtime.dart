@@ -63,16 +63,13 @@ final class Runtime {
   Runtime({
     Context? context,
     void Function(Cause<Object?> cause)? onUnhandledError,
-  }) : _context = overlayContexts(
-         Context.from([
-           Clock.key.bind(Clock()),
-           RandomSource.key.bind(RandomSource()),
-           Logger.key.bind(Logger.noop()),
-           Tracer.key.bind(Tracer.noop()),
-           MetricRegistry.key.bind(MetricRegistry.noop()),
-         ]),
-         context ?? Context.from(const []),
-       ) {
+  }) : _context = Context.from([
+         Clock.key.bind(Clock()),
+         RandomSource.key.bind(RandomSource()),
+         Logger.key.bind(Logger.noop()),
+         Tracer.key.bind(Tracer.noop()),
+         MetricRegistry.key.bind(MetricRegistry.noop()),
+       ]).merge(context ?? Context.from(const [])) {
     final zone = Zone.current;
     _report = (cause) {
       try {
@@ -128,7 +125,7 @@ final class Runtime {
         if (signal?.isCancelled ?? false) {
           failure = Cause.cancelled(signal!.reason);
         } else {
-          runtime._context = overlayContexts(runtime._context, value);
+          runtime._context = runtime._context.merge(value);
           return Exit.success(runtime);
         }
       case ExitFailure(:final cause):

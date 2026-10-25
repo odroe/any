@@ -244,33 +244,87 @@ void main() {
     },
   );
 
-  test('duplicate output releases every acquired service', () async {
-    final key = ServiceKey<int>('duplicate');
-    final released = <int>[];
-    Layer<Never> item(int value) => key.layer(
-      Task.acquireRelease(
-        Task.succeed(value),
-        release: (_, _) => Task.sync(() => released.add(value)),
-      ),
-    );
-    final exit = await create(item(1).merge(item(2)));
-    expect(_defects(_cause(exit)).single.error, isA<DuplicateService>());
-    expect(released, [2, 1]);
-  });
+  test(
+    'output replacement keeps resources and existing dependants alive',
+    () async {
+      final port = ServiceKey<int>('port');
+      final clientKey = ServiceKey<({int port})>('client');
+      final released = <int>[];
+      var builds = 0;
+      Layer<Never> item(int value) => port.layer(
+        Task.acquireRelease(
+          Task.succeed(value),
+          release: (_, _) => Task.sync(() => released.add(value)),
+        ),
+      );
+      final live = item(443);
+      final testing = item(8080);
+      final client = clientKey.layer(
+        Task.service(port).map((value) {
+          builds++;
+          return (port: value);
+        }),
+      );
+      final runtime = _value(
+        await create(client.provide(live).merge(live).merge(testing)),
+      );
+      expect(_value(await runtime.run(Task.service(port))), 8080);
+      expect(_value(await runtime.run(Task.service(clientKey))).port, 443);
+      expect(builds, 1);
+      expect(released, isEmpty);
+      await runtime.close();
+      expect(released, [8080, 443]);
+
+      final testRuntime = _value(
+        await create(client.provide(testing).merge(testing)),
+      );
+      expect(_value(await testRuntime.run(Task.service(port))), 8080);
+      expect(_value(await testRuntime.run(Task.service(clientKey))).port, 8080);
+      expect(builds, 2);
+      expect(released, [8080, 443]);
+      await testRuntime.close();
+      expect(released, [8080, 443, 8080]);
+    },
+  );
 
   test(
-    'repeating an identical output still diagnoses duplicate registration',
+    'repeating an identical output shares one successful construction',
     () async {
-      final key = ServiceKey<int>('duplicate');
+      final key = ServiceKey<int>('shared');
       var builds = 0;
       final shared = key.layer(Task.sync(() => ++builds));
-      expect(
-        _defects(_cause(await create(shared.merge(shared, concurrency: 2))))
-            .single
-            .error,
-        isA<DuplicateService>(),
+      final runtime = _value(
+        await create(shared.merge(shared, concurrency: 2)),
       );
+      expect(_value(await runtime.run(Task.service(key))), 1);
       expect(builds, 1);
+      await runtime.close();
+    },
+  );
+
+  test(
+    'nested layer provision uses the innermost bindings and keeps other inputs',
+    () async {
+      final input = ServiceKey<int>('input');
+      final inherited = ServiceKey<String>('inherited');
+      final output = ServiceKey<(int, String)>('output');
+      final layer = output
+          .layer(
+            Task.service(input).flatMap(
+              (value) => Task.service(inherited).map((other) => (value, other)),
+            ),
+          )
+          .provide(Layer.value(input.bind(2)))
+          .provide(Layer.value(input.bind(3)));
+      final runtime = _value(
+        await create(
+          layer,
+          context: Context.from([input.bind(1), inherited.bind('kept')]),
+        ),
+      );
+      expect(_value(await runtime.run(Task.service(output))), (2, 'kept'));
+      expect(_value(await runtime.run(Task.service(input))), 1);
+      await runtime.close();
     },
   );
 
