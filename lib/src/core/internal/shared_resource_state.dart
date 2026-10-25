@@ -7,6 +7,7 @@ import '../fiber.dart';
 import '../option.dart';
 import '../scope.dart';
 import '../task.dart';
+import 'completion.dart';
 
 // The resource lifecycle used by SharedResource, SharedResourceMap, and Pool.
 final class SharedResourceState<K, T, E> {
@@ -136,7 +137,7 @@ final class SharedResourceState<K, T, E> {
     generation.loaded = result;
     if (generation.closing != null) return;
     if (result.exit is ExitSuccess<T, E>) {
-      generation.publish(result);
+      generation.completion.complete(result);
     } else {
       _beginClose(generation, result.exit);
     }
@@ -207,7 +208,7 @@ final class SharedResourceState<K, T, E> {
           : TaskEvaluation<T, E>.fresh(
               Exit.failure(Cause.cancelled(generation.stopReason)),
             );
-      generation.publish(_append(result, cleanup));
+      generation.completion.complete(_append(result, cleanup));
     }
     _generations.remove(generation);
     generation.removeOwnerDependency();
@@ -381,10 +382,10 @@ final class _Generation<K, T, E> {
   late final void Function() removeOwnerDependency;
   final stopReason = Object();
   final leases = <_Lease<K, T, E>>{};
-  final listeners = <void Function(TaskEvaluation<T, E>)>{};
+  final completion = Completion<TaskEvaluation<T, E>>();
   final faults = <FailureEvent>[];
   TaskEvaluation<T, E>? loaded;
-  TaskEvaluation<T, E>? result;
+  TaskEvaluation<T, E>? get result => completion.value;
   Completer<TaskEvaluation<void, Never>>? closing;
   Completer<void>? empty;
   Exit<Object?, Object?>? ownerExit;
@@ -392,29 +393,9 @@ final class _Generation<K, T, E> {
   var retired = false;
   var claimed = false;
 
-  void publish(TaskEvaluation<T, E> value) {
-    result = value;
-    final callbacks = listeners.toList();
-    listeners.clear();
-    for (final callback in callbacks) {
-      callback(value);
-    }
-  }
-
-  Task<TaskEvaluation<T, E>, Never> awaitResult() =>
-      Task.fromCallback((complete) {
-        void notify(TaskEvaluation<T, E> value) =>
-            complete(Exit.success(value));
-        final ready = result;
-        if (ready == null) {
-          listeners.add(notify);
-        } else {
-          notify(ready);
-        }
-        return () {
-          listeners.remove(notify);
-        };
-      });
+  Task<TaskEvaluation<T, E>, Never> awaitResult() => Task.fromCallback(
+    (complete) => completion.listen((value) => complete(Exit.success(value))),
+  );
 }
 
 final class _Lease<K, T, E> {

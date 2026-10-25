@@ -2,6 +2,7 @@ import 'cause.dart';
 import 'clock.dart';
 import 'exit.dart';
 import 'fiber.dart';
+import 'internal/completion.dart';
 import 'option.dart';
 import 'scope.dart';
 import 'task.dart';
@@ -229,18 +230,14 @@ final class Cache<K, V, E> {
         keep = false;
       }
     }
-    entry.result = result;
     if (keep) {
       _entries.remove(entry.key);
       _entries[entry.key] = entry;
     } else {
       _retire(entry);
+      _occupied.remove(entry);
     }
-    final listeners = entry.listeners.toList();
-    entry.listeners.clear();
-    for (final listener in listeners) {
-      listener(result);
-    }
+    entry.completion.complete(result);
     _drain();
   }
 
@@ -439,28 +436,17 @@ final class _Entry<K, V, E> {
   final K key;
   final stopReason = Object();
   final waiters = <_Request<K, V, E>>{};
-  final listeners = <void Function(TaskEvaluation<V, E>)>{};
+  final completion = Completion<TaskEvaluation<V, E>>();
   Fiber<V, E>? fiber;
-  TaskEvaluation<V, E>? result;
+  TaskEvaluation<V, E>? get result => completion.value;
   Duration? completedAt;
   var starting = false;
   var retired = false;
   var cancelling = false;
 
-  Task<TaskEvaluation<V, E>, Never> awaitResult() =>
-      Task.fromCallback((complete) {
-        void deliver(TaskEvaluation<V, E> result) =>
-            complete(Exit.success(result));
-        final ready = result;
-        if (ready != null) {
-          deliver(ready);
-        } else {
-          listeners.add(deliver);
-        }
-        return () {
-          listeners.remove(deliver);
-        };
-      });
+  Task<TaskEvaluation<V, E>, Never> awaitResult() => Task.fromCallback(
+    (complete) => completion.listen((value) => complete(Exit.success(value))),
+  );
 }
 
 final class _Request<K, V, E> {
