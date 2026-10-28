@@ -20,7 +20,7 @@ void main() {
     () async {
       final runtime = Runtime();
       final defect = StateError('unexpected');
-      final stack = StackTrace.current;
+      final stack = StackTrace.fromString('original defect stack');
       final cause = Cause<String>.combine([
         const Cause.failure('business'),
         Cause.defect(defect, stack),
@@ -32,14 +32,23 @@ void main() {
       await expectLater(
         runtime.runOrThrow(task),
         throwsA(
-          isA<TaskException>().having(
-            (error) => switch (error.cause) {
-              CauseGroup(:final causes) => causes.length,
-              _ => 0,
-            },
-            'complete causes',
-            2,
-          ),
+          isA<TaskException>()
+              .having(
+                (error) => switch (error.cause) {
+                  CauseGroup(:final causes) => causes.length,
+                  _ => 0,
+                },
+                'complete causes',
+                2,
+              )
+              .having(
+                (error) => error.toString(),
+                'diagnostic',
+                'TaskException:\n'
+                    '  Failure: business\n'
+                    '  Defect: Bad state: unexpected\n'
+                    '    original defect stack',
+              ),
         ),
       );
       expect(await runtime.runOrThrow(Task.succeed(42)), 42);

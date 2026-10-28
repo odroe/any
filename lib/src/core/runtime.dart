@@ -388,7 +388,8 @@ final class AsyncTaskException<T, E> implements Exception {
 ///
 /// [Runtime.runOrThrow] and [Runtime.runSyncOrThrow] throw this exception when a
 /// task fails. Inspect [cause] for business errors, defects with their original
-/// stack traces, or cancellation.
+/// stack traces, or cancellation. Printing the exception describes every reason
+/// using [Cause.toString].
 final class TaskException implements Exception {
   /// Creates an exception retaining the complete [cause].
   const TaskException(this.cause);
@@ -397,7 +398,8 @@ final class TaskException implements Exception {
   final Cause<Object?> cause;
 
   @override
-  String toString() => 'TaskException: $cause';
+  String toString() =>
+      'TaskException:\n  ${cause.toString().replaceAll('\n', '\n  ')}';
 }
 
 StackTrace _stackTrace(Cause<Object?> cause) => switch (cause) {
