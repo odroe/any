@@ -8,11 +8,9 @@ Task<T, E> timeoutTask<T, E>(
   required E Function() onTimeout,
 }) => Task.defer(() {
   final expired = Object();
-  return _race(
-    task,
-    duration,
-    expired,
-  ).mapCause((cause) => _translate(cause, expired, onTimeout: onTimeout));
+  return _race(task, duration, expired)
+      .mapCause((cause) => _translate(cause, expired, onTimeout: onTimeout))
+      .mapError((error) => error as E);
 });
 
 Task<T, E> timeoutOrElseTask<T, E>(
@@ -21,12 +19,16 @@ Task<T, E> timeoutOrElseTask<T, E>(
   Task<T, E> Function() fallback,
 ) => Task.defer(() {
   final expired = Object();
-  return _race(task, duration, expired)
-      .recover(
-        (error) =>
-            identical(error, expired) ? Task.defer(fallback) : Task.fail(error),
+  return recoverTaskCause(
+        _race(task, duration, expired),
+        (cause) => switch (cause) {
+          CauseFailure(:final error) when identical(error, expired) =>
+            Task.defer(fallback),
+          _ => null,
+        },
       )
-      .mapCause((cause) => _translate<E>(cause, expired));
+      .mapCause((cause) => _translate(cause, expired))
+      .mapError((error) => error as E);
 });
 
 Task<T, Object?> _race<T, E>(
@@ -40,12 +42,12 @@ Task<T, Object?> _race<T, E>(
   task,
 ]);
 
-Cause<E> _translate<E>(
+Cause<Object?> _translate(
   Cause<Object?> cause,
   Object expired, {
-  E Function()? onTimeout,
+  Object? Function()? onTimeout,
 }) {
-  final reasons = <Cause<E>>[];
+  final reasons = <Cause<Object?>>[];
   for (final reason in switch (cause) {
     CauseGroup(:final causes) => causes,
     _ => [cause],
@@ -53,7 +55,7 @@ Cause<E> _translate<E>(
     switch (reason) {
       case CauseFailure(:final error):
         if (!identical(error, expired)) {
-          reasons.add(Cause.failure(error as E));
+          reasons.add(reason);
         } else if (onTimeout != null) {
           try {
             reasons.add(Cause.failure(onTimeout()));
@@ -73,6 +75,7 @@ Cause<E> _translate<E>(
   }
   // timeoutOrElse recovers a lone expiration marker before reaching here.
   // If cleanup failed, only that marker is removed; defects retain identity
-  // and their occurrence sources through Task.mapCause.
+  // and their occurrence sources through Task.mapCause. Narrow business errors
+  // separately with mapError so their occurrence sources are retained too.
   return Cause.combine(reasons);
 }

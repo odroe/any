@@ -218,21 +218,27 @@ extension ConfigOperations<T> on Config<T> {
   /// Invalid values, source errors, defects, and cancellation remain failures;
   /// a present nullable value remains [OptionSome].
   Config<Option<T>> optional() => Config._(
-    (provider, prefix) => _read(provider, prefix)
-        .map<Option<T>>(Option.some)
-        .recover(
-          (error) => error.isMissing
-              ? Task.succeed(const Option.none())
-              : Task.fail(error),
+    (provider, prefix) => recoverTaskCause(
+      _read(provider, prefix).map<Option<T>>(Option.some),
+      (cause) => switch (cause) {
+        CauseFailure(:final error) when error.isMissing => Task.succeed(
+          const Option.none(),
         ),
+        _ => null,
+      },
+    ),
   );
 
   /// Uses [value] only when every reported problem is a missing value.
   ///
   /// Invalid values and unavailable sources do not fall back to this default.
   Config<T> withDefault(T value) => Config._(
-    (provider, prefix) => _read(provider, prefix).recover(
-      (error) => error.isMissing ? Task.succeed(value) : Task.fail(error),
+    (provider, prefix) => recoverTaskCause(
+      _read(provider, prefix),
+      (cause) => switch (cause) {
+        CauseFailure(:final error) when error.isMissing => Task.succeed(value),
+        _ => null,
+      },
     ),
   );
 

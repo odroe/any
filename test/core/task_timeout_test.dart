@@ -406,6 +406,34 @@ void main() {
     expect(calls, 0);
   });
 
+  test('timeoutOrElse preserves complete non-timeout groups', () async {
+    final error = Object();
+    for (final withCancellation in [false, true]) {
+      final cause = Cause<Object?>.combine([
+        const Cause.failure(null),
+        Cause.failure(error),
+        Cause.failure(error),
+        if (withCancellation) const Cause.cancelled('recorded'),
+      ]);
+      final result = await runtime.run(
+        Task.failCause(cause).timeoutOrElse(
+          deadline,
+          () => fail('The task completed before its deadline.'),
+        ),
+      );
+
+      final reasons = _reasons(_cause(result));
+      expect(reasons, hasLength(withCancellation ? 4 : 3));
+      expect((reasons[0] as CauseFailure<Object?>).error, isNull);
+      expect((reasons[1] as CauseFailure<Object?>).error, same(error));
+      expect((reasons[2] as CauseFailure<Object?>).error, same(error));
+      if (withCancellation) {
+        expect((reasons[3] as CauseCancelled).reason, 'recorded');
+      }
+      expect(clock.pendingCount, 0);
+    }
+  });
+
   test(
     'fallback exceptions become defects and typed fallback errors stay typed',
     () async {

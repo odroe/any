@@ -630,17 +630,12 @@ extension TaskOperations<T, E> on Task<T, E> {
   /// Causes containing a defect or only cancellation propagate unchanged. Owner
   /// cancellation still stops recovery unless masked. Use [recoverCause] to
   /// handle a complete cause explicitly.
-  Task<T, E> recover(Task<T, E> Function(E error) recover) => Task._(
-    _Continue(
-      _node,
-      _Frame(
-        failure: (cause, events, cleanups, _) =>
-            switch (_recoverableFailure(cause)) {
-              CauseFailure(:final error) => recover(error as E)._node,
-              _ => _Failure(cause, events, cleanups),
-            },
-      ),
-    ),
+  Task<T, E> recover(Task<T, E> Function(E error) recover) => recoverTaskCause(
+    this,
+    (cause) => switch (_recoverableFailure(cause)) {
+      CauseFailure(:final error) => recover(error as E),
+      _ => null,
+    },
   );
 
   /// Handles a complete failure cause with a replacement task.
@@ -723,6 +718,22 @@ extension InfallibleTaskOperations<T> on Task<T, Never> {
   /// nor changes its behavior.
   Task<T, F> withError<F>() => this;
 }
+
+// Selective recovery for operators such as timeout and configuration defaults.
+// Returning null preserves the unhandled cause and its failure occurrences.
+Task<T, E> recoverTaskCause<T, E>(
+  Task<T, E> task,
+  Task<T, E>? Function(Cause<E> cause) recover,
+) => Task._(
+  _Continue(
+    task._node,
+    _Frame(
+      failure: (cause, events, cleanups, _) =>
+          recover(_typedCause<E>(cause))?._node ??
+          _Failure(cause, events, cleanups),
+    ),
+  ),
+);
 
 // Internal execution results retain provenance only for the current failure.
 // Capturing or recovering a failure returns success without these events.

@@ -111,7 +111,13 @@ void main() {
     });
   }
 
-  for (final conversion in ['none', 'mapError', 'orDie']) {
+  for (final conversion in [
+    'none',
+    'mapError',
+    'orDie',
+    'timeout',
+    'timeoutOrElse',
+  ]) {
     test(
       'a public child joined into a reported root reports once (conversion: $conversion)',
       () async {
@@ -123,6 +129,14 @@ void main() {
               return switch (conversion) {
                 'mapError' => joined.mapError((error) => 'mapped $error'),
                 'orDie' => joined.orDie(),
+                'timeout' => joined.timeout(
+                  const Duration(days: 1),
+                  onTimeout: () => fail('The deadline must not expire.'),
+                ),
+                'timeoutOrElse' => joined.timeoutOrElse(
+                  const Duration(days: 1),
+                  () => fail('An ordinary failure must not time out.'),
+                ),
                 _ => joined,
               };
             });
