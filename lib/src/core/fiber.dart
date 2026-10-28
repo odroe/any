@@ -38,6 +38,7 @@ final class Fiber<T, E> {
   var _active = true;
   bool _reportFailure;
   var _cleanupOwned = false;
+  var _cancelledByOwner = false;
 
   /// Returns the completed exit, or [OptionNone] if the fiber is still running.
   ///
@@ -263,6 +264,10 @@ void Function(Cause<Object?>) fiberReport(Fiber<Object?, Object?> fiber) =>
 
 bool fiberIsActive(Fiber<Object?, Object?> fiber) => fiber._active;
 
+// Whether scope shutdown made this fiber's first cancellation request.
+bool fiberCancelledByOwner(Fiber<Object?, Object?> fiber) =>
+    fiber._cancelledByOwner;
+
 List<FailureEvent> fiberFailureEvents(Fiber<Object?, Object?> fiber) =>
     fiber._finalEvents;
 
@@ -301,6 +306,9 @@ FutureOr<List<FailureEvent>> stopFiber(
   Object? reason,
 }) {
   fiber._cleanupOwned = true;
+  if (fiber._active && !fiber._controller.signal.isCancelled) {
+    fiber._cancelledByOwner = true;
+  }
   fiber.requestCancel(reason: reason);
   List<FailureEvent> defects() => [
     for (final event in fiber._finalEvents)

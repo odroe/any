@@ -203,6 +203,52 @@ void main() {
     },
   );
 
+  for (final reason in [null, 'explicit stop']) {
+    test(
+      'explicit cancellation before shutdown stays a group failure: $reason',
+      () async {
+        final (runtime, group) = await _group<Never>();
+        final waiter = Runtime();
+        addTearDown(waiter.close);
+        final work = Completer<int>();
+        final member = await runtime.runOrThrow(
+          group.start(_future(work.future), propagateCancellation: true),
+        );
+        member.requestCancel(reason: reason);
+        final waiting = waiter.run(group.join());
+        final closing = runtime.close();
+        work.complete(42);
+
+        expect(await closing, isA<ExitSuccess>());
+        expect((_cause(await waiting) as CauseCancelled).reason, reason);
+      },
+    );
+  }
+
+  test(
+    'shutdown retains cancellation already recorded before pending cleanup',
+    () async {
+      final (runtime, group) = await _group<Never>();
+      final waiter = Runtime();
+      addTearDown(waiter.close);
+      final cleanup = Completer<void>();
+      const original = Cause<Never>.cancelled();
+      await runtime.runOrThrow(
+        group.start(
+          Task.failCause(original).ensuring(_future(cleanup.future)),
+          propagateCancellation: true,
+        ),
+      );
+      final waiting = waiter.run(group.join());
+      final closing = runtime.close();
+      cleanup.complete();
+
+      expect(await closing, isA<ExitSuccess>());
+      final reasons = (_cause(await waiting) as CauseGroup).causes;
+      expect(reasons, [same(original), isA<CauseCancelled>()]);
+    },
+  );
+
   for (final waitForEmpty in [false, true]) {
     test(
       'cancelling a group wait leaves members owned: empty=$waitForEmpty',

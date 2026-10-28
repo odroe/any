@@ -65,6 +65,8 @@ final class FiberGroup<E> {
   /// Pure cancellation is ignored by [join] unless [propagateCancellation] is
   /// true. Cancellation from scope shutdown never introduces a new group failure;
   /// independent errors and cleanup defects in mixed causes are still retained.
+  /// An earlier member cancellation remains effective even if shutdown starts
+  /// before that member finishes its native work or cleanup.
   /// A closed scope rejects the submission with a [StateError] defect.
   Task<Fiber<T, E>, Never> start<T>(
     Task<T, E> task, {
@@ -119,8 +121,11 @@ final class FiberGroup<E> {
         _ => [cause],
       };
       final cancelledOnly = reasons.every((reason) => reason is CauseCancelled);
-      if (!cancelledOnly ||
-          (propagateCancellation && !scopeIsClosing(_scope))) {
+      // A group of cancellations also contains reasons recorded by the task or
+      // its cleanup; only a lone owner-originated request is shutdown alone.
+      final shutdownOnly =
+          cause is CauseCancelled && fiberCancelledByOwner(fiber);
+      if (!cancelledOnly || (propagateCancellation && !shutdownOnly)) {
         final result = TaskEvaluation<void, E>(
           Exit.failure(cause),
           fiberFailureEvents(fiber),
