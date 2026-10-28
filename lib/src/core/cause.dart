@@ -57,6 +57,32 @@ sealed class Cause<E> {
     if (count == 1) return onlyCause!;
     return CauseGroup._(List.unmodifiable(reasons));
   }
+
+  /// Describes every reason, including each defect's stored stack trace.
+  ///
+  /// Groups retain their order and repeated reasons. Error values and
+  /// cancellation reasons use their own string representations; wrappers that
+  /// hide sensitive values are not unwrapped.
+  ///
+  /// The output is for diagnostics, not a serialization format. Match the cause
+  /// variants when inspecting failures programmatically.
+  @override
+  String toString() {
+    switch (this) {
+      case CauseFailure(:final error):
+        return _describe('Failure', error);
+      case CauseDefect(:final error, :final stackTrace):
+        final message = _describe('Defect', error);
+        final stack = stackTrace.toString().trimRight();
+        return stack.isEmpty
+            ? message
+            : '$message\n  ${stack.replaceAll('\n', '\n  ')}';
+      case CauseCancelled(:final reason):
+        return reason == null ? 'Cancelled' : _describe('Cancelled', reason);
+      case CauseGroup(:final causes):
+        return causes.join('\n');
+    }
+  }
 }
 
 /// A business failure containing an error of type [E].
@@ -123,3 +149,6 @@ extension CauseMapping<E> on Cause<E> {
     }
   }
 }
+
+String _describe(String kind, Object? value) =>
+    '$kind: $value'.replaceAll('\n', '\n  ');

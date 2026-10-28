@@ -73,6 +73,34 @@ void main() {
     );
   });
 
+  test('runSyncOrThrow describes the body and cleanup failure', () {
+    final defect = Cause<Never>.defect(
+      StateError('Close failed'),
+      StackTrace.fromString('original cleanup stack'),
+    );
+    final task = Task.fail('Save rejected').ensuring(Task.failCause(defect));
+
+    expect(
+      () => runtime.runSyncOrThrow(task),
+      throwsA(
+        isA<TaskException>()
+            .having(
+              (error) => (error.cause as CauseGroup).causes.last,
+              'cleanup defect',
+              same(defect),
+            )
+            .having(
+              (error) => error.toString(),
+              'diagnostic',
+              'TaskException:\n'
+                  '  Failure: Save rejected\n'
+                  '  Defect: Bad state: Close failed\n'
+                  '    original cleanup stack',
+            ),
+      ),
+    );
+  });
+
   test('cleanup is complete and ordered before the synchronous return', () {
     final events = <String>[];
     final fault = StateError('first cleanup');

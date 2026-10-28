@@ -570,6 +570,13 @@ void main() {
         same(defect),
       ]);
       expect(stacks.single.toString(), 'defect stack');
+      expect(
+        errors.single.toString(),
+        'TaskException:\n'
+        '  Failure: business\n'
+        '  Defect: Bad state: defect\n'
+        '    defect stack',
+      );
     },
   );
 

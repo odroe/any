@@ -39,6 +39,95 @@ void main() {
     );
   });
 
+  group('Cause.toString', () {
+    test('distinguishes failure and cancellation, including null values', () {
+      expect(const Cause.failure('rejected').toString(), 'Failure: rejected');
+      expect(const Cause.failure(null).toString(), 'Failure: null');
+      expect(const Cause.cancelled().toString(), 'Cancelled');
+      expect(
+        const Cause.cancelled('shutdown').toString(),
+        'Cancelled: shutdown',
+      );
+    });
+
+    test('keeps multiline messages and stacks under their own reason', () {
+      final cause = Cause<String>.combine([
+        const Cause.failure('Save rejected\nPlease retry'),
+        Cause.defect(
+          StateError('Close failed\nConnection unavailable'),
+          StackTrace.fromString(
+            'close (connection.dart:10)\nmain (app.dart:5)\n',
+          ),
+        ),
+        const Cause.cancelled('Shutdown\nRequested by user'),
+      ]);
+
+      expect(
+        cause.toString(),
+        'Failure: Save rejected\n'
+        '  Please retry\n'
+        'Defect: Bad state: Close failed\n'
+        '  Connection unavailable\n'
+        '  close (connection.dart:10)\n'
+        '  main (app.dart:5)\n'
+        'Cancelled: Shutdown\n'
+        '  Requested by user',
+      );
+    });
+
+    test('preserves order, repeated errors, and each stored defect stack', () {
+      final error = StateError('same error');
+      final first = StackTrace.fromString('first stack');
+      final second = StackTrace.fromString('second stack');
+      final failure = Cause.failure(error);
+      final cause = Cause.combine([
+        failure,
+        Cause.defect(error, first),
+        Cause.cancelled('stop'),
+        failure,
+        Cause.defect(error, second),
+      ]);
+
+      expect(
+        cause.toString(),
+        'Failure: Bad state: same error\n'
+        'Defect: Bad state: same error\n'
+        '  first stack\n'
+        'Cancelled: stop\n'
+        'Failure: Bad state: same error\n'
+        'Defect: Bad state: same error\n'
+        '  second stack',
+      );
+    });
+
+    test('does not add stack text when the stored trace is empty', () {
+      expect(
+        const Cause.defect('unexpected', StackTrace.empty).toString(),
+        'Defect: unexpected',
+      );
+    });
+
+    test('formats stored diagnostic values without revealing wrapped data', () {
+      final hidden = Redacted((
+        error: StateError('secret error'),
+        stackTrace: StackTrace.fromString('secret stack'),
+      ));
+      final cause = Cause<Redacted<String>>.combine([
+        const Cause.failure(Redacted('secret business error')),
+        Cause.defect(hidden, StackTrace.fromString('safe diagnostic stack')),
+        const Cause.cancelled(Redacted('secret cancellation')),
+      ]);
+
+      expect(
+        cause.toString(),
+        'Failure: Redacted(<redacted>)\n'
+        'Defect: Redacted(<redacted>)\n'
+        '  safe diagnostic stack\n'
+        'Cancelled: Redacted(<redacted>)',
+      );
+    });
+  });
+
   group('Cause.combine', () {
     test('rejects empty input', () {
       expect(() => Cause<String>.combine([]), throwsArgumentError);
