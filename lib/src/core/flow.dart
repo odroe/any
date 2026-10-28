@@ -516,7 +516,7 @@ extension FlowOperations<T, E> on Flow<T, E> {
   ///
   /// Internal producer cleanup finishes before recovery, except for transport
   /// resources still retained downstream. User resources remain in the consuming
-  /// task's scope. Immediate cleanup failure prevents recovery; deferred cleanup
+  /// task's scope. Immediate cleanup defects prevent recovery; deferred cleanup
   /// failures propagate to the consumer and cannot be recovered here.
   Flow<T, E> recover(Flow<T, E> Function(E error) recover) => Flow._(
     (resources) => accessTaskEnvironment(
