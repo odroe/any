@@ -174,12 +174,20 @@ void main() {
         Never throwing() => Error.throwWithStackTrace(error, stack);
         final Task<int, String> success = Task.succeed(1);
         final Task<int, String> failure = Task.fail('failed');
+        final Task<int, String> grouped = Task.failCause(
+          Cause.combine([
+            const Cause.failure('first'),
+            const Cause.cancelled('recorded'),
+            const Cause.failure('second'),
+          ]),
+        );
         final tasks = <Task<Object?, Object?>>[
           success.map((_) => throwing()),
           success.flatMap((_) => throwing()),
           Task.defer<int, String>(throwing),
           failure.mapError((_) => throwing()),
           failure.recover((_) => throwing()),
+          grouped.recover((_) => throwing()),
           failure.recoverCause((_) => throwing()),
           failure.mapCause((_) => throwing()),
         ];
@@ -214,26 +222,177 @@ void main() {
       },
     );
 
-    test('recover handles exactly one business error', () async {
-      final Task<int, String> task = Task.fail('failed');
-      expect(
-        _value(await _run(task.recover((error) => Task.succeed(error.length)))),
-        6,
-      );
-
-      final causes = <Cause<String>>[
-        Cause.defect(StateError('defect'), StackTrace.current),
-        const Cause.cancelled('explicit'),
-        Cause.combine([const Cause.failure('a'), const Cause.failure('b')]),
-      ];
-      for (final cause in causes) {
-        final Task<int, String> failed = Task.failCause(cause);
-        final exit = await _run(
-          failed.recover((_) => fail('Recovery must not run')),
+    test(
+      'recover handles a business error but bypasses defects and cancellation',
+      () async {
+        final Task<int, String> task = Task.fail('failed');
+        expect(
+          _value(
+            await _run(task.recover((error) => Task.succeed(error.length))),
+          ),
+          6,
         );
-        expect(_cause(exit).runtimeType, cause.runtimeType);
-      }
+
+        final causes = <Cause<String>>[
+          Cause.defect(StateError('defect'), StackTrace.current),
+          const Cause.cancelled('explicit'),
+          Cause.combine([
+            const Cause.cancelled('first'),
+            const Cause.cancelled('second'),
+          ]),
+        ];
+        for (final cause in causes) {
+          final Task<int, String> failed = Task.failCause(cause);
+          final exit = await _run(
+            failed.recover((_) => fail('Recovery must not run')),
+          );
+          expect(_cause(exit), same(cause));
+        }
+      },
+    );
+
+    test(
+      'recover selects the first business value and handles the entire group',
+      () async {
+        for (final first in <String?>['first', null]) {
+          final seen = <String?>[];
+          final Task<int, String?> task = Task.failCause(
+            Cause<String?>.combine([
+              const Cause.cancelled('before'),
+              Cause.failure(first),
+              const Cause.failure('later'),
+              const Cause.cancelled('after'),
+            ]),
+          );
+          final recovered = task.recover((error) {
+            seen.add(error);
+            return Task.succeed(42);
+          });
+
+          expect(_value(await _run(recovered)), 42);
+          expect(seen, [first]);
+        }
+      },
+    );
+
+    test(
+      'a trailing defect, including cleanup, prevents group recovery',
+      () async {
+        final error = StateError('defect');
+        final stack = StackTrace.fromString('preserved defect stack');
+        final defect = CauseDefect(error, stack);
+        final first = Object();
+        final second = Object();
+        final reasons = <Cause<Object>>[
+          Cause.failure(first),
+          const Cause.cancelled('recorded'),
+          Cause.failure(second),
+          defect,
+        ];
+        final cause = Cause.combine(reasons);
+        final Task<int, Object> direct = Task.failCause(cause);
+        final Task<int, Object> beforeCleanup = Task.failCause(
+          Cause.combine(reasons.take(3)),
+        );
+        final tasks = [
+          direct,
+          beforeCleanup.ensuring(Task.failCause<Never>(defect)),
+        ];
+
+        for (final task in tasks) {
+          final exit = await _run(
+            task.recover((_) => fail('A defect must prevent recovery.')),
+          );
+          final retained = (_cause(exit) as CauseGroup<Object>).causes;
+          expect(retained, hasLength(4));
+          expect((retained[0] as CauseFailure<Object>).error, same(first));
+          expect(retained[1], same(reasons[1]));
+          expect((retained[2] as CauseFailure<Object>).error, same(second));
+          expect(retained[3], same(defect));
+          final last = retained.last as CauseDefect;
+          expect(last.error, same(error));
+          expect(last.stackTrace, same(stack));
+        }
+      },
+    );
+
+    test(
+      'a failing recovery replaces the group without recovering itself',
+      () async {
+        var calls = 0;
+        const fallback = Cause<String>.failure('fallback');
+        final Task<int, String> task = Task.failCause(
+          Cause.combine([
+            const Cause.failure('first'),
+            const Cause.cancelled('recorded'),
+            const Cause.failure('second'),
+          ]),
+        );
+        final exit = await _run(
+          task.recover((error) {
+            expect(error, 'first');
+            calls++;
+            return Task.failCause(fallback);
+          }),
+        );
+
+        expect(calls, 1);
+        expect(_cause(exit), same(fallback));
+      },
+    );
+
+    test('recovery does not consume later outer cleanup failures', () async {
+      final cleanup = Cause<Never>.defect(Object(), StackTrace.current);
+      var calls = 0;
+      final Task<int, String> failure = Task.failCause(
+        Cause.combine([
+          const Cause.failure('first'),
+          const Cause.failure('second'),
+        ]),
+      );
+      final task = Task.addFinalizer((_) => Task.failCause(cleanup))
+          .withError<String>()
+          .flatMap(
+            (_) => failure.recover((_) {
+              calls++;
+              return Task.succeed(42);
+            }),
+          );
+
+      expect(_cause(await _run(task)), same(cleanup));
+      expect(calls, 1);
     });
+
+    test(
+      'owner cancellation before or during recovery stops the fallback',
+      () async {
+        for (final cancelInHandler in [false, true]) {
+          final controller = CancellationController();
+          final seen = <String>[];
+          final task =
+              Task.defer<int, String>(() {
+                if (!cancelInHandler) controller.requestCancel(reason: 'owner');
+                return Task.failCause(
+                  Cause.combine([
+                    const Cause.failure('first'),
+                    const Cause.cancelled('recorded'),
+                    const Cause.failure('second'),
+                  ]),
+                );
+              }).recover((error) {
+                seen.add(error);
+                controller.requestCancel(reason: 'owner');
+                return Task.sync(() => fail('The fallback must not start.'));
+              });
+
+          final cause = _cause(
+            await _run(task, signal: controller.signal),
+          ) as CauseCancelled;
+          expect(cause.reason, 'owner');
+          expect(seen, cancelInHandler ? ['first'] : isEmpty);
+        }
+      },
+    );
 
     test('mapError and recoverCause restore typed grouped causes', () async {
       final defect = Cause<int>.defect(

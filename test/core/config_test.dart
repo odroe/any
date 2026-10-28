@@ -220,6 +220,27 @@ void main() {
   });
 
   test(
+    'defaults preserve groups with missing and non-missing causes',
+    () async {
+      final missing = ConfigError.missing(path: ['missing']);
+      final invalid = ConfigError.invalid('Invalid field.', path: ['invalid']);
+      for (final other in <Cause<ConfigError>>[
+        Cause.failure(invalid),
+        const Cause.cancelled('provider cancelled'),
+      ]) {
+        final cause = Cause.combine([Cause.failure(missing), other]);
+        final runner = runtime(_Provider((_) => Task.failCause(cause)));
+        for (final task in <Task<Object?, ConfigError>>[
+          Config.string('key').optional().load(),
+          Config.string('key').withDefault('fallback').load(),
+        ]) {
+          expect(_cause(await runner.run(task)), same(cause));
+        }
+      }
+    },
+  );
+
+  test(
     'source failures retain their paths and do not activate defaults',
     () async {
       final source = StateError('private token');

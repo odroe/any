@@ -117,28 +117,84 @@ void main() {
     expect(predicates, 0);
   });
 
+  test('defect-containing and cancellation-only causes bypass retry', () async {
+    var predicates = 0;
+    for (final cause in <Cause<String>>[
+      Cause.combine([
+        const Cause.failure('a'),
+        const Cause.failure('b'),
+        Cause.defect(StateError('grouped defect'), StackTrace.current),
+      ]),
+      Cause.defect(StateError('defect'), StackTrace.current),
+      const Cause.cancelled('source'),
+    ]) {
+      final flow = Flow.fromTask(Task.failCause(cause)).retry(
+        Schedule.recurs(1),
+        when: (_) {
+          predicates++;
+          return true;
+        },
+      );
+      expect(
+        _causes(_cause(await runtime.run(flow.toList()))).map(_reason),
+        _causes(cause).map(_reason),
+      );
+    }
+    expect(predicates, 0);
+  });
+
   test(
-    'grouped failure, defect, and explicit cancellation bypass retry',
+    'retry predicates select the first grouped error including null',
     () async {
-      var predicates = 0;
-      for (final cause in <Cause<String>>[
-        Cause.combine([const Cause.failure('a'), const Cause.failure('b')]),
-        Cause.defect(StateError('defect'), StackTrace.current),
-        const Cause.cancelled('source'),
-      ]) {
-        final flow = Flow.fromTask(Task.failCause(cause)).retry(
-          Schedule.recurs(1),
-          when: (_) {
-            predicates++;
-            return true;
-          },
-        );
-        expect(
-          _causes(_cause(await runtime.run(flow.toList()))).map(_reason),
-          _causes(cause).map(_reason),
-        );
+      for (final first in <String?>['first', null]) {
+        var attempts = 0;
+        final seen = <String?>[];
+        final flow =
+            Flow.fromTask(
+              Task.defer<int, String?>(() {
+                if (++attempts == 2) return Task.succeed(42);
+                return Task.failCause(
+                  Cause<String?>.combine([
+                    const Cause.cancelled('recorded'),
+                    Cause.failure(first),
+                    const Cause.failure('later'),
+                  ]),
+                );
+              }),
+            ).retry(
+              Schedule.recurs(1),
+              when: (error) {
+                seen.add(error);
+                return true;
+              },
+            );
+
+        expect(_value(await runtime.run(flow.toList())), [42]);
+        expect(seen, [first]);
+        expect(attempts, 2);
       }
-      expect(predicates, 0);
+    },
+  );
+
+  test(
+    'retry exhaustion returns the last attempt\'s first business error',
+    () async {
+      var attempts = 0;
+      final flow = Flow.fromTask(
+        Task.defer<int, String>(() {
+          return Task.failCause(
+            Cause.combine([
+              Cause.failure('attempt ${++attempts}'),
+              const Cause.failure('later'),
+            ]),
+          );
+        }),
+      ).retry(Schedule.recurs(2));
+
+      final cause =
+          _cause(await runtime.run(flow.toList())) as CauseFailure<String>;
+      expect(cause.error, 'attempt 3');
+      expect(attempts, 3);
     },
   );
 
