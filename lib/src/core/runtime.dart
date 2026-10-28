@@ -60,9 +60,36 @@ final class Runtime {
   /// cancellation alone is not reported. Without a handler, a [TaskException]
   /// is reported to the creating [Zone]. Exceptions thrown by the handler are
   /// also reported to that zone and cannot interrupt cleanup.
+  ///
+  /// [onFiberStart] observes each accepted user root that remains unfinished
+  /// after its initial evaluation, before the execution entry point returns.
+  /// Synchronously completed work, rejected requests, child fibers, and internal
+  /// service construction are excluded. The callback runs in the creating
+  /// [Zone]; callback exceptions go to that zone without changing the task's
+  /// result or cleanup. Observation does not change ownership or failure handling.
+  ///
+  /// Combine the hook with [Fiber.onExit] to track work through its cleanup:
+  ///
+  /// ```dart
+  /// // Imports dart:io and package:any/any.dart.
+  /// final pending = <Fiber<Object?, Object?>>{};
+  /// final runtime = Runtime(onFiberStart: (fiber) {
+  ///   pending.add(fiber);
+  ///   fiber.onExit((_) => pending.remove(fiber));
+  /// });
+  /// try {
+  ///   await runtime.runOrThrow(Task.fromFuture(
+  ///     () => File('settings.json').readAsString(),
+  ///     onError: (error, _) => error,
+  ///   ));
+  /// } finally {
+  ///   await runtime.close();
+  /// }
+  /// ```
   Runtime({
     Context? context,
     void Function(Cause<Object?> cause)? onUnhandledError,
+    void Function(Fiber<Object?, Object?> fiber)? onFiberStart,
   }) : _context = Context.from([
          Clock.key.bind(Clock()),
          RandomSource.key.bind(RandomSource()),
@@ -71,6 +98,9 @@ final class Runtime {
          MetricRegistry.key.bind(MetricRegistry.noop()),
        ]).merge(context ?? Context.from(const [])) {
     final zone = Zone.current;
+    _onFiberStart = onFiberStart == null
+        ? null
+        : zone.bindUnaryCallbackGuarded(onFiberStart);
     _report = (cause) {
       try {
         if (onUnhandledError != null) {
@@ -87,6 +117,7 @@ final class Runtime {
   final _scope = createScope();
   Context _context;
   late final void Function(Cause<Object?>) _report;
+  late final void Function(Fiber<Object?, Object?>)? _onFiberStart;
   Future<Exit<void, Never>>? _closing;
 
   /// Creates a runtime that acquires and owns application [services].
@@ -99,20 +130,27 @@ final class Runtime {
   /// Failure or startup cancellation returns an [ExitFailure] after releasing any
   /// acquired resources, preserving cleanup failures in its cause. [signal]
   /// affects startup only; close the returned runtime to stop it after startup.
+  ///
+  /// [onFiberStart] and [onUnhandledError] configure the returned runtime as in
+  /// [Runtime.new]. The internal service-building fiber is not passed to
+  /// [onFiberStart]; subsequent user roots follow the usual notification rule.
   static Future<Exit<Runtime, E>> create<E>(
     Layer<E> services, {
     Context? context,
     CancellationSignal? signal,
     void Function(Cause<Object?> cause)? onUnhandledError,
+    void Function(Fiber<Object?, Object?> fiber)? onFiberStart,
   }) async {
     final runtime = Runtime(
       context: context,
       onUnhandledError: onUnhandledError,
+      onFiberStart: onFiberStart,
     );
     final building = runtime._start(
       buildLayer(services, runtime._scope),
       reportFailure: false,
       signal: signal,
+      notifyStart: false,
     );
     final unsubscribe = signal?.onCancel((reason) {
       unawaited(runtime._beginClose(Exit.failure(Cause.cancelled(reason))));
@@ -196,6 +234,7 @@ final class Runtime {
     CancellationSignal? signal,
     ExecutionMode? mode,
     required bool reportFailure,
+    bool notifyStart = true,
   }) {
     if (_closing != null) {
       return completedFiber(
@@ -206,7 +245,7 @@ final class Runtime {
         reportFailure: reportFailure,
       );
     }
-    return startFiber(
+    final fiber = startFiber(
       task,
       owner: _scope,
       report: _report,
@@ -215,6 +254,10 @@ final class Runtime {
       context: _context,
       mode: mode,
     );
+    if (notifyStart && _onFiberStart != null && fiber.poll() is OptionNone) {
+      _onFiberStart(fiber);
+    }
+    return fiber;
   }
 
   /// Runs [task] and returns its value or complete failure as an [Exit].
