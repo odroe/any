@@ -103,12 +103,10 @@ final class Fiber<T, E> {
     _cleanupCancellations = result.cleanupCancellations;
     _active = false;
     _completion.complete(result.exit);
-    if (_reportFailure && _finalEvents.isNotEmpty) {
-      _zone.run(() => Timer.run(_reportIndependentFailure));
-    }
+    if (_reportFailure) reportFiberFailure(this);
   }
 
-  void _reportIndependentFailure() {
+  void _reportIndependentFailure(Set<FailureSource> excluded) {
     final failures = <Cause<Object?>>[];
     final events = _finalEvents.iterator;
     final cause = (_exit as ExitFailure<T, E>).cause;
@@ -123,6 +121,7 @@ final class Fiber<T, E> {
       }
       events.moveNext();
       final event = events.current;
+      if (excluded.contains(event.source)) continue;
       // Scope shutdown receives cleanup defects through its own result.
       if (_cleanupOwned && reason is CauseDefect) continue;
       if (!event.source.reportedTo.add(_report)) continue;
@@ -159,6 +158,7 @@ Fiber<T, E> startFiber<T, E>(
   Scope? runScope,
   Scope? resourceScope,
   ExecutionMode? mode,
+  void Function(Fiber<T, E> fiber)? onRegistered,
 }) {
   final fiber = Fiber<T, E>._(
     createScope(runtimeId: scopeRuntimeId(owner)),
@@ -233,6 +233,8 @@ Fiber<T, E> startFiber<T, E>(
     }
   }
 
+  // Owners install membership and listeners before synchronous work can finish.
+  onRegistered?.call(fiber);
   if (deferStart || _startupDepth >= _maxStartupDepth) {
     scheduleMicrotask(start);
   } else {
@@ -273,6 +275,18 @@ List<Fiber<Object?, Object?>> currentFibers() =>
 // Runtime.runSync transfers an unfinished execution to runtime supervision.
 void superviseFiber(Fiber<Object?, Object?> fiber) {
   fiber._reportFailure = true;
+}
+
+// Owning combinators can report completed failures outside their result path.
+// Use the same occurrence tracking and shutdown ownership as public forks.
+void reportFiberFailure(
+  Fiber<Object?, Object?> fiber, {
+  Set<FailureSource> excluded = const {},
+}) {
+  if (fiber._finalEvents.isEmpty) return;
+  fiber._zone.run(
+    () => Timer.run(() => fiber._reportIndependentFailure(excluded)),
+  );
 }
 
 Future<Exit<T, E>> fiberCompletion<T, E>(Fiber<T, E> fiber) {

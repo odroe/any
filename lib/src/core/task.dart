@@ -939,6 +939,7 @@ Task<Fiber<T, E>, Never> forkTaskIn<T, E>(
   bool inheritHost = false,
   Scope? resourceScope,
   bool deferStart = true,
+  void Function(Fiber<T, E> fiber)? onRegistered,
 }) => Task._(
   _Fork(
     (_, _, parent, context, _, runScope, _, mode) => startFiber(
@@ -952,6 +953,7 @@ Task<Fiber<T, E>, Never> forkTaskIn<T, E>(
       report: fiberReport(parent),
       reportFailure: false,
       mode: mode,
+      onRegistered: onRegistered,
     ),
   ),
 );

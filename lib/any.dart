@@ -22,6 +22,7 @@ export 'src/core/context.dart'
 export 'src/core/deferred.dart' show Deferred;
 export 'src/core/exit.dart' show Exit, ExitSuccess, ExitFailure, ExitMapping;
 export 'src/core/fiber.dart' show Fiber;
+export 'src/core/fiber_group.dart' show FiberGroup;
 export 'src/core/flow.dart'
     show
         Flow,
