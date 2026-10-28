@@ -142,6 +142,61 @@ void main() {
     expect(reports, hasLength(2));
   });
 
+  test(
+    'group recovery reports only independent and replacement failures',
+    () async {
+      final reported = Completer<void>();
+      final owner = Runtime(
+        onUnhandledError: expectAsync1((cause) {
+          reports.add(cause);
+          if (reports.length == 2) reported.complete();
+        }, count: 2),
+      );
+      addTearDown(owner.close);
+      final group = Cause<String>.combine([
+        const Cause.failure('first'),
+        const Cause.failure('second'),
+      ]);
+      const replacement = Cause<String>.failure('replacement');
+      final Task<int, String> failed = Task.failCause(group);
+      var recovered = 0;
+      var replaced = 0;
+
+      final independent = owner.start(failed);
+      final success = owner.start(
+        failed.recover((_) {
+          recovered++;
+          return Task.succeed(42);
+        }),
+      );
+      final fallback = owner.start(
+        failed.recover((_) {
+          replaced++;
+          return Task.failCause(replacement);
+        }),
+      );
+
+      expect(
+        await owner.runOrThrow(independent.awaitExit()),
+        isA<ExitFailure>(),
+      );
+      expect(await owner.runOrThrow(success.join()), 42);
+      final exit = await owner.runOrThrow(fallback.awaitExit());
+      expect((exit as ExitFailure<int, String>).cause, same(replacement));
+      await reported.future;
+
+      expect(recovered, 1);
+      expect(replaced, 1);
+      expect(reports, hasLength(2));
+      final original = reports.whereType<CauseGroup<Object?>>().single;
+      expect(original.causes, (group as CauseGroup<String>).causes.map(same));
+      expect(
+        reports.whereType<CauseFailure<String>>().single,
+        same(replacement),
+      );
+    },
+  );
+
   test('owning combinators receive failures without worker reports', () async {
     final all = await runtime.run(
       Task.all([Task.fail('first'), Task.fail('second')], concurrency: 2),

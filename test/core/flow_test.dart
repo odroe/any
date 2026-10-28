@@ -302,14 +302,19 @@ void main() {
     'recover preserves prior output and does not recover replacement again',
     () async {
       var recovered = 0;
+      final replacementFailure = Cause<String>.combine([
+        const Cause.failure('second'),
+        const Cause.cancelled('replacement stopped'),
+        const Cause.failure('third'),
+      ]);
       final flow = Flow.fromIterable([1])
           .withError<String>()
           .concat(Flow.fromTask<int, String>(Task.fail('first')))
           .recover((_) {
             recovered++;
-            return Flow.fromIterable([2])
-                .withError<String>()
-                .concat(Flow.fromTask<int, String>(Task.fail('second')));
+            return Flow.fromIterable([2]).withError<String>().concat(
+              Flow.fromTask<int, String>(Task.failCause(replacementFailure)),
+            );
           });
       final values = <int>[];
       final cause = _cause(
@@ -317,10 +322,11 @@ void main() {
           flow.forEach((value) => Task.sync(() => values.add(value))),
         ),
       );
-      expect(
-        cause,
-        isA<CauseFailure<String>>().having((c) => c.error, 'error', 'second'),
-      );
+      final reasons = _reasons(cause);
+      expect(reasons, hasLength(3));
+      expect((reasons[0] as CauseFailure<String>).error, 'second');
+      expect((reasons[1] as CauseCancelled).reason, 'replacement stopped');
+      expect((reasons[2] as CauseFailure<String>).error, 'third');
       expect(values, [1, 2]);
       expect(recovered, 1);
     },
@@ -766,11 +772,23 @@ void main() {
     expect(recovered, isFalse);
   });
 
-  test('recover bypasses grouped failures and explicit cancellation', () async {
+  test('recover bypasses defects and cancellation-only causes', () async {
     var recovered = false;
+    final defect = Cause<String>.defect(
+      StateError('defect'),
+      StackTrace.current,
+    );
     for (final cause in <Cause<String>>[
-      Cause.combine([const Cause.failure('a'), const Cause.failure('b')]),
+      Cause.combine([
+        const Cause.failure('a'),
+        const Cause.failure('b'),
+        defect,
+      ]),
       const Cause.cancelled('explicit'),
+      Cause.combine([
+        const Cause.cancelled('first'),
+        const Cause.cancelled('second'),
+      ]),
     ]) {
       final flow = Flow.fromTask<int, String>(Task.failCause(cause))
           .recover((_) {
@@ -778,19 +796,75 @@ void main() {
             return Flow.fromIterable([2]);
           });
       final actual = _cause(await runtime.run(flow.drain()));
-      expect(
-        _reasons(actual).map(
-          (reason) => switch (reason) {
-            CauseFailure(:final error) => error,
-            CauseCancelled(:final reason) => reason,
-            _ => fail('Unexpected cause: $reason'),
-          },
-        ),
-        cause is CauseGroup ? ['a', 'b'] : ['explicit'],
-      );
+      expect(_reasons(actual), _reasons(cause).map(same));
     }
     expect(recovered, isFalse);
   });
+
+  test(
+    'recover selects the first grouped error and preserves prior values',
+    () async {
+      for (final first in <String?>['first', null]) {
+        final seen = <String?>[];
+        final flow = Flow.fromIterable([1, 2])
+            .withError<String?>()
+            .concat(
+              Flow.fromTask(
+                Task.failCause(
+                  Cause<String?>.combine([
+                    const Cause.cancelled('recorded'),
+                    Cause.failure(first),
+                    const Cause.failure('later'),
+                  ]),
+                ),
+              ),
+            )
+            .recover((error) {
+              seen.add(error);
+              return Flow.fromIterable([99]);
+            });
+
+        expect(_value(await runtime.run(flow.toList())), [1, 2, 99]);
+        expect(seen, [first]);
+      }
+    },
+  );
+
+  test(
+    'source cleanup preserves the full group and prevents recovery',
+    () async {
+      final first = Object();
+      final second = Object();
+      final cleanup = StateError('stream cleanup');
+      final stack = StackTrace.fromString('stream cleanup stack');
+      late StreamController<int> source;
+      source = StreamController<int>(
+        onListen: () => source.add(1),
+        onCancel: () => Error.throwWithStackTrace(cleanup, stack),
+      );
+      addTearDown(source.close);
+      final cause = Cause<Object>.combine([
+        Cause.failure(first),
+        const Cause.cancelled('recorded'),
+        Cause.failure(second),
+      ]);
+      final flow =
+          Flow.fromStream<int, Never>(() => source.stream, onError: _defect)
+              .withError<Object>()
+              .mapTask((_) => Task.failCause(cause))
+              .recover(
+                (_) => fail('The cleanup defect must prevent recovery.'),
+              );
+
+      final reasons = _reasons(_cause(await runtime.run(flow.drain())));
+      expect(reasons, hasLength(4));
+      expect((reasons[0] as CauseFailure<Object>).error, same(first));
+      expect((reasons[1] as CauseCancelled).reason, 'recorded');
+      expect((reasons[2] as CauseFailure<Object>).error, same(second));
+      expect((reasons[3] as CauseDefect).error, same(cleanup));
+      expect((reasons[3] as CauseDefect).stackTrace, same(stack));
+    },
+  );
 
   test(
     'cancellation during acquisition still registers and releases the value',

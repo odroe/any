@@ -414,14 +414,21 @@ void main() {
       final controller = CancellationController();
       var recovered = false;
       final task = Task.uninterruptibleMask<int, String>((restore) {
-        return restore<int, String>(Task.fail<String>('expected'))
-            .recover((error) {
-              controller.requestCancel(reason: error);
-              return Task.sync(() {
-                recovered = true;
-                return 42;
-              });
-            });
+        return restore<int, String>(
+          Task.failCause(
+            Cause.combine([
+              const Cause.failure('expected'),
+              const Cause.cancelled('recorded'),
+              const Cause.failure('later'),
+            ]),
+          ),
+        ).recover((error) {
+          controller.requestCancel(reason: error);
+          return Task.sync(() {
+            recovered = true;
+            return 42;
+          });
+        });
       });
 
       expect(

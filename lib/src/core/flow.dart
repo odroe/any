@@ -507,11 +507,12 @@ extension FlowOperations<T, E> on Flow<T, E> {
         ),
   );
 
-  /// Continues with a replacement flow after one business failure.
+  /// Continues with a replacement flow after a recoverable business failure.
   ///
-  /// Calls [recover] only for a single [CauseFailure]. Defects, cancellation,
-  /// grouped causes, and failures from the replacement flow propagate unchanged.
-  /// Values already delivered are not repeated or undone.
+  /// Uses [TaskOperations.recover] to select the first business error when the
+  /// cause contains no defect. The replacement handles the entire eligible cause,
+  /// including recorded cancellations. Pure cancellation and failures from the
+  /// replacement propagate unchanged. Already delivered values are not repeated.
   ///
   /// Internal producer cleanup finishes before recovery, except for transport
   /// resources still retained downstream. User resources remain in the consuming
@@ -523,29 +524,25 @@ extension FlowOperations<T, E> on Flow<T, E> {
         var replaced = false;
         var current = opened;
         final pull = Task.defer(
-          () => current.pull().recover((error) {
-            if (replaced) return Task.fail(error);
-            final failed = Exit<Object?, E>.failure(Cause.failure(error));
-            // Retire production without waiting on values held downstream.
-            // Immediate cleanup failures join the body before recovery.
-            return current
-                .finish(failed)
-                .withError<E>()
-                .mapCause(
-                  (cause) => Cause.combine([Cause.failure(error), cause]),
-                )
-                .flatMap<Option<T>>((_) => Task.fail(error))
-                .recover((error) {
-                  replaced = true;
-                  return inTaskScope(
-                    recover(error)._open(resources),
-                    owner,
-                  ).flatMap((replacement) {
-                    current = replacement;
-                    return current.pull();
-                  });
-                });
-          }),
+          () => replaced
+              ? current.pull()
+              : current
+                    .pull()
+                    .onExit(
+                      (exit) => exit is ExitFailure
+                          ? current.finish(exit)
+                          : Task.succeed(null),
+                    )
+                    .recover((error) {
+                      replaced = true;
+                      return inTaskScope(
+                        recover(error)._open(resources),
+                        owner,
+                      ).flatMap((replacement) {
+                        current = replacement;
+                        return current.pull();
+                      });
+                    }),
         );
         return FlowCursor(
           pull,

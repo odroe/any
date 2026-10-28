@@ -1,4 +1,3 @@
-import 'cause.dart';
 import 'clock.dart';
 import 'exit.dart';
 import 'flow.dart';
@@ -17,10 +16,13 @@ extension FlowTimingOperations<T, E> on Flow<T, E> {
   /// schedule is checked. Previously emitted values may appear again; consumer
   /// effects are not undone.
   ///
-  /// Only a single [CauseFailure] is retried. Consumer failures, defects,
-  /// cancellation, and grouped causes propagate unchanged. Immediate source
-  /// cleanup failure prevents retry. Resources still used downstream remain alive,
-  /// and any later cleanup failure still fails consumption.
+  /// Uses [TaskOperations.recover] to select the first business error when the
+  /// cause contains no defect, including causes with recorded cancellations.
+  /// [when] receives that error; rejection or policy exhaustion returns it as the
+  /// final failure. Defects and pure cancellation propagate unchanged. Consumer
+  /// failures do not retry the source. Immediate cleanup defects prevent retry;
+  /// resources still used downstream remain alive and later cleanup failures
+  /// still fail consumption.
   ///
   /// Retry delays use [Clock] and [RandomSource] from the consuming task and are
   /// cancellable.
@@ -46,36 +48,32 @@ extension FlowTimingOperations<T, E> on Flow<T, E> {
                     current = opened;
                     return opened.pull();
                   });
-            return next.recover((error) {
-              final exit = Exit<Object?, E>.failure(Cause.failure(error));
-              final retire = current?.finish(exit) ?? Task.succeed(null);
-              return retire
-                  .withError<E>()
-                  .mapCause(
-                    (cause) => Cause.combine([Cause.failure(error), cause]),
-                  )
-                  .flatMap<Option<T>>((_) => Task.fail(error))
-                  .recover(
-                    (error) => Task.defer(() {
-                      if (when != null && !when(error)) return Task.fail(error);
-                      final delay = scheduleDelay(
-                        schedule,
-                        iteration: iteration++,
-                        elapsed: clock.elapsed - started,
-                        random: random,
-                      );
-                      if (delay == null) return Task.fail(error);
-                      current = null;
-                      if (delay == Duration.zero) return pull();
-                      return Task.fromCallback<void, Never>(
-                        (complete) => clock.schedule(
-                          delay,
-                          () => complete(const Exit.success(null)),
-                        ),
-                      ).withError<E>().flatMap((_) => pull());
-                    }),
-                  );
-            });
+            return next
+                .onExit(
+                  (exit) => exit is ExitFailure
+                      ? current?.finish(exit) ?? Task.succeed(null)
+                      : Task.succeed(null),
+                )
+                .recover(
+                  (error) => Task.defer(() {
+                    if (when != null && !when(error)) return Task.fail(error);
+                    final delay = scheduleDelay(
+                      schedule,
+                      iteration: iteration++,
+                      elapsed: clock.elapsed - started,
+                      random: random,
+                    );
+                    if (delay == null) return Task.fail(error);
+                    current = null;
+                    if (delay == Duration.zero) return pull();
+                    return Task.fromCallback<void, Never>(
+                      (complete) => clock.schedule(
+                        delay,
+                        () => complete(const Exit.success(null)),
+                      ),
+                    ).withError<E>().flatMap((_) => pull());
+                  }),
+                );
           });
 
           return FlowCursor(

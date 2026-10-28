@@ -460,9 +460,11 @@ extension TaskOperations<T, E> on Task<T, E> {
   /// Retries recoverable business failures according to [schedule].
   ///
   /// The first attempt starts immediately; `Schedule.recurs(3)` permits three more.
-  /// Only a single business failure is eligible. Defects, cancellation, and grouped
-  /// failures propagate without retry. [when], if supplied, must also return true;
-  /// an exception from it becomes a defect. Exhaustion returns the last failure.
+  /// Uses [recover]'s rule: select the first business error if the cause contains
+  /// no defect. [when], if supplied, receives that error and must return true;
+  /// an exception from it becomes a defect. When [when] returns false or the
+  /// schedule is exhausted, the selected error becomes the final failure.
+  /// Owner cancellation stops further attempts.
   ///
   /// Attempts use the caller's resource scope. Apply [scoped] before [retry] to
   /// release each attempt's resources before retrying. Completion cleanup is
@@ -617,18 +619,26 @@ extension TaskOperations<T, E> on Task<T, E> {
     ),
   );
 
-  /// Handles a single business failure with a replacement task.
+  /// Handles a recoverable business failure with a replacement task.
   ///
-  /// Defects, cancellation, and groups bypass [recover]. Use [recoverCause] to
-  /// handle a complete cause. Owner cancellation stops recovery.
+  /// Calls [recover] once with the first business error in cause order, including
+  /// `null`, provided the cause contains no defect. The replacement task handles
+  /// the entire cause, including other business errors and recorded cancellations.
+  /// Its failure replaces the original cause; a thrown callback becomes a defect.
+  /// This handler does not run again for its own failure.
+  ///
+  /// Causes containing a defect or only cancellation propagate unchanged. Owner
+  /// cancellation still stops recovery unless masked. Use [recoverCause] to
+  /// handle a complete cause explicitly.
   Task<T, E> recover(Task<T, E> Function(E error) recover) => Task._(
     _Continue(
       _node,
       _Frame(
-        failure: (cause, events, cleanups, _) => switch (cause) {
-          CauseFailure(:final error) => recover(error as E)._node,
-          _ => _Failure(cause, events, cleanups),
-        },
+        failure: (cause, events, cleanups, _) =>
+            switch (_recoverableFailure(cause)) {
+              CauseFailure(:final error) => recover(error as E)._node,
+              _ => _Failure(cause, events, cleanups),
+            },
       ),
     ),
   );
@@ -1840,6 +1850,22 @@ Exit<T, E> _appendCleanup<T, E>(Exit<T, E> exit, Cause<Never>? cleanup) {
     ExitSuccess() => Exit.failure(cleanup),
     ExitFailure(:final cause) => Exit.failure(Cause.combine([cause, cleanup])),
   };
+}
+
+CauseFailure<Object?>? _recoverableFailure(Cause<Object?> cause) {
+  switch (cause) {
+    case CauseFailure():
+      return cause;
+    case CauseGroup(:final causes):
+      CauseFailure<Object?>? first;
+      for (final reason in causes) {
+        if (reason is CauseDefect) return null;
+        if (reason is CauseFailure<Object?>) first ??= reason;
+      }
+      return first;
+    default:
+      return null;
+  }
 }
 
 Cause<Object?> _mapErrors(

@@ -57,19 +57,23 @@ void main() {
     expect(await result, isA<ExitSuccess<void, Never>>());
   });
 
-  test(
-    'recurs counts additional retries and returns the final business error',
-    () async {
-      var attempts = 0;
-      final task = Task.defer<int, String>(
-        () => Task.fail('try ${++attempts}'),
+  test('recurs counts retries and returns the first business error of the final attempt', () async {
+    var attempts = 0;
+    final task = Task.defer<int, String>(() {
+      attempts++;
+      return Task.failCause(
+        Cause.combine([
+          Cause.failure('try $attempts'),
+          const Cause.failure('later error'),
+          const Cause.cancelled('recorded cancellation'),
+        ]),
       );
-      final result = await runtime.run(task.retry(Schedule.recurs(3)));
-      expect(attempts, 4);
-      expect((_cause(result) as CauseFailure<String>).error, 'try 4');
-      expect(clock.clock.pendingCount, 0);
-    },
-  );
+    });
+    final result = await runtime.run(task.retry(Schedule.recurs(3)));
+    expect(attempts, 4);
+    expect((_cause(result) as CauseFailure<String>).error, 'try 4');
+    expect(clock.clock.pendingCount, 0);
+  });
 
   test('explicitly scoped retry closes each attempt before another', () async {
     var attempts = 0;
@@ -124,27 +128,48 @@ void main() {
     expect(released, [3, 2, 1]);
   });
 
-  test('retry predicates see only single business failures', () async {
-    var attempts = 0;
-    var predicates = 0;
-    final defect = StateError('body');
-    final task = Task.sync<int>(() {
-      attempts++;
-      throw defect;
-    }).withError<String>();
-    final result = await runtime.run(
-      task.retry(
-        Schedule.recurs(3),
-        when: (_) {
-          predicates++;
-          return true;
-        },
-      ),
-    );
-    expect(attempts, 1);
-    expect(predicates, 0);
-    expect((_cause(result) as CauseDefect).error, same(defect));
-  });
+  test(
+    'retry and its predicate skip defects and cancellation-only causes',
+    () async {
+      final defect = Cause<String>.defect(
+        StateError('body'),
+        StackTrace.current,
+      );
+      for (final cause in <Cause<String>>[
+        defect,
+        const Cause.cancelled('cancelled'),
+        Cause.combine([
+          const Cause.cancelled('first cancellation'),
+          const Cause.cancelled('second cancellation'),
+        ]),
+        Cause.combine([
+          const Cause.failure('first error'),
+          const Cause.cancelled('recorded cancellation'),
+          defect,
+          const Cause.failure('later error'),
+        ]),
+      ]) {
+        var attempts = 0;
+        var predicates = 0;
+        final task = Task.defer<int, String>(() {
+          attempts++;
+          return Task.failCause(cause);
+        });
+        final result = await runtime.run(
+          task.retry(
+            Schedule.recurs(3),
+            when: (_) {
+              predicates++;
+              return true;
+            },
+          ),
+        );
+        expect(attempts, 1);
+        expect(predicates, 0);
+        expect(_cause(result), same(cause));
+      }
+    },
+  );
 
   test(
     'cleanup failure prevents retry and retains the business failure',
@@ -163,50 +188,77 @@ void main() {
     },
   );
 
-  test(
-    'explicit cancellation causes and grouped failures are not retried',
-    () async {
-      for (final cause in <Cause<String>>[
-        Cause.cancelled('cancelled'),
-        Cause.combine([Cause.failure('a'), Cause.failure('b')]),
-      ]) {
-        var calls = 0;
-        final result = await runtime.run(
-          Task.defer<int, String>(() {
-            calls++;
-            return Task.failCause(cause);
-          }).retry(Schedule.recurs(3)),
-        );
-        expect(calls, 1);
-        if (cause case CauseGroup(:final causes)) {
-          expect(
-            (_cause(result) as CauseGroup<String>).causes.map(
-              (cause) => (cause as CauseFailure<String>).error,
-            ),
-            causes.map((cause) => (cause as CauseFailure<String>).error),
-          );
-        } else {
-          expect(_cause(result), same(cause));
-        }
-      }
-    },
-  );
+  test('retry predicates select the first business error including null and recorded cancellation', () async {
+    for (final (cause, selected) in <(Cause<String?>, String?)>[
+      (
+        Cause.combine([
+          const Cause.failure('first'),
+          const Cause.failure('second'),
+        ]),
+        'first',
+      ),
+      (
+        Cause.combine([
+          const Cause.cancelled('before the error'),
+          const Cause<String?>.failure(null),
+          const Cause.failure('later error'),
+          const Cause.cancelled('after the error'),
+        ]),
+        null,
+      ),
+    ]) {
+      var attempts = 0;
+      final observed = <String?>[];
+      final result = await runtime.run(
+        Task.defer<int, String?>(() {
+          attempts++;
+          return attempts == 1 ? Task.failCause(cause) : Task.succeed(42);
+        }).retry(
+          Schedule.recurs(1),
+          when: (error) {
+            observed.add(error);
+            return true;
+          },
+        ),
+      );
+      expect(_value(result), 42);
+      expect(attempts, 2);
+      expect(observed, [selected]);
+    }
+  });
 
-  test(
-    'a false retry predicate stops and a thrown predicate is a defect',
-    () async {
-      final task = Task.fail('failure');
-      final stopped = await runtime.run(
-        task.retry(Schedule.recurs(3), when: (_) => false),
-      );
-      expect((_cause(stopped) as CauseFailure<String>).error, 'failure');
-      final defect = StateError('predicate');
-      final failed = await runtime.run(
-        task.retry(Schedule.recurs(3), when: (_) => throw defect),
-      );
-      expect((_cause(failed) as CauseDefect).error, same(defect));
-    },
-  );
+  test('a false retry predicate returns its selected error and a thrown predicate is a defect', () async {
+    final task = Task.failCause<String?>(
+      Cause.combine([
+        const Cause.cancelled('recorded cancellation'),
+        const Cause.failure(null),
+        const Cause.failure('later error'),
+      ]),
+    );
+    final observed = <String?>[];
+    final stopped = await runtime.run(
+      task.retry(
+        Schedule.recurs(3),
+        when: (error) {
+          observed.add(error);
+          return false;
+        },
+      ),
+    );
+    expect((_cause(stopped) as CauseFailure<String?>).error, isNull);
+    expect(observed, [null]);
+    final defect = StateError('predicate');
+    final failed = await runtime.run(
+      task.retry(
+        Schedule.recurs(3),
+        when: (error) {
+          expect(error, isNull);
+          throw defect;
+        },
+      ),
+    );
+    expect((_cause(failed) as CauseDefect).error, same(defect));
+  });
 
   test(
     'retry waits using exponential delays after completed attempts',
